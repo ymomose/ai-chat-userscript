@@ -668,6 +668,18 @@
   text-decoration: none;
   list-style: none;
 }
+/* Defeat host-page rules that target naked elements (e.g. 'body span' with
+   !important at specificity (0,0,2)) — those would otherwise color our
+   descendants directly, bypassing the inheritance chain from root. Using
+   '#aicx-root *' gets specificity (1,0,0) which beats any non-ID page rule;
+   our .text- / .bg- enforcers (at 1,0,1 + !important) still win over this
+   sweeper for elements that have those utility classes. */
+#aicx-root *,
+#aicx-root *::before,
+#aicx-root *::after {
+  color: inherit !important;
+  background-color: transparent !important;
+}
 :where(
   #aicx-root button,
   #aicx-root input:not([type="checkbox"]):not([type="radio"]),
