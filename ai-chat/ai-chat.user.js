@@ -482,6 +482,8 @@
         ['td', 'border border-zinc-300 dark:border-zinc-600 px-2 py-1 align-top'],
         ['hr', 'my-3 border-zinc-200 dark:border-zinc-700'],
         ['img', 'max-w-full h-auto rounded-md my-2'],
+        ['details', 'my-2 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/50'],
+        ['summary', 'cursor-pointer select-none px-3 py-2 text-xs font-semibold text-zinc-600 dark:text-zinc-300'],
       ];
       for (const [tag, cls] of map) {
         tpl.querySelectorAll(tag).forEach((n) => {
@@ -595,18 +597,27 @@
   text-decoration: none;
   list-style: none;
 }
-:where(#aicx-root button, #aicx-root input, #aicx-root textarea, #aicx-root select) {
+:where(
+  #aicx-root button,
+  #aicx-root input:not([type="checkbox"]):not([type="radio"]),
+  #aicx-root textarea,
+  #aicx-root select
+) {
   font: inherit; color: inherit; background-color: transparent;
   appearance: none; -webkit-appearance: none; outline: none;
 }
-:where(#aicx-root input, #aicx-root textarea, #aicx-root select) {
+:where(
+  #aicx-root input:not([type="checkbox"]):not([type="radio"]),
+  #aicx-root textarea,
+  #aicx-root select
+) {
   border-radius: 8px; padding: 8px 10px;
 }
 /* Prevent iOS Safari auto-zoom on focus: font-size must be >= 16px.
    Scoped to touch devices so desktop layout is unaffected. Uses #aicx-root
    prefix (specificity 1,0,1) so it beats Tailwind's .text-sm / .text-xs. */
 @media (hover: none) and (pointer: coarse) {
-  #aicx-root input,
+  #aicx-root input:not([type="checkbox"]):not([type="radio"]),
   #aicx-root textarea,
   #aicx-root select {
     font-size: 16px;
@@ -1373,13 +1384,16 @@
           if (this.conv === conv) this.renderLastAssistant();
         }
         asstMsg._pending = false;
-        // Append grounding sources (web citations) if any
+        // Append grounding sources (web citations) if any.
+        // Rendered as <details> so the list is collapsed by default — it can
+        // get long and dominate the bubble otherwise.
         if (grounding && grounding.groundingChunks && grounding.groundingChunks.length) {
-          const lines = grounding.groundingChunks
-            .map((c, i) => (c.web && c.web.uri) ? `${i + 1}. [${c.web.title || c.web.uri}](${c.web.uri})` : null)
+          const items = grounding.groundingChunks
+            .map((c) => (c.web && c.web.uri) ? `<li><a href="${esc(c.web.uri)}" target="_blank" rel="noopener noreferrer">${esc(c.web.title || c.web.uri)}</a></li>` : null)
             .filter(Boolean);
-          if (lines.length) {
-            asstMsg.content = (asstMsg.content || '') + `\n\n---\n**ソース:**\n\n${lines.join('\n')}`;
+          if (items.length) {
+            const html = `\n\n<details class="aicx-sources"><summary>ソース (${items.length} 件)</summary>\n<ol>\n${items.join('\n')}\n</ol>\n</details>`;
+            asstMsg.content = (asstMsg.content || '') + html;
             if (this.conv === conv) this.renderLastAssistant();
           }
         }
