@@ -947,7 +947,7 @@
             title: label + (scope === 'global' ? ' (グローバル)' : '')
           });
           b.appendChild(icon(t.icon || 'template', 'w-5 h-5'));
-          b.addEventListener('click', () => { this.closeMenu(); ChatPanel.open({ newChat: true, initialPrompt: t.prompt || '', autoSend: true }); });
+          b.addEventListener('click', () => { this.closeMenu(); ChatPanel.open({ newChat: true, initialPrompt: t.prompt || '', autoSend: true, webSearch: !!t.webSearch }); });
           return b;
         };
         for (const t of globalTpls) bar.appendChild(mkShortcut(t, 'global'));
@@ -987,8 +987,9 @@
       // Defer creating a new conversation until the user actually sends something,
       // to avoid leaving empty conversations in history if they close the panel.
       this.host = host;
-      // Web grounding resets to off for every newly opened chat panel.
-      this.webGrounding = false;
+      // Web grounding defaults to off for every newly opened chat panel,
+      // unless the caller (e.g. a template shortcut) explicitly requests it.
+      this.webGrounding = !!opts.webSearch;
       this.conv = conv;
       this.attachments = [];
 
@@ -1511,6 +1512,14 @@
       b.addEventListener('click', onClick);
       return b;
     },
+    checkbox(label, checked, onChange) {
+      const wrap = el('label', { class: 'flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300 cursor-pointer' });
+      const chk = el('input', { type: 'checkbox', class: 'w-4 h-4' });
+      chk.checked = !!checked;
+      chk.addEventListener('change', () => onChange(chk.checked));
+      wrap.append(chk, el('span', {}, label));
+      return wrap;
+    },
     // Icon picker for templates — shows current icon, opens a grid popover on click.
     iconPicker({ current, onChange }) {
       let selected = current || 'template';
@@ -1764,14 +1773,15 @@
           head.append(del);
           const ta = Form.textarea(t.prompt || '', async (v) => { t.prompt = v; await Store.saveSettings(); }, 3);
           ta.placeholder = 'プロンプトテキスト';
-          row.append(head, ta);
+          const webChk = Form.checkbox('Web 検索 (Grounding) を有効にする', !!t.webSearch, async (v) => { t.webSearch = v; await Store.saveSettings(); });
+          row.append(head, ta, webChk);
           list.append(row);
         }
         if (!tpls.length) list.append(el('p', { class: 'text-xs text-zinc-500' }, 'テンプレートはまだありません。'));
       };
       render();
       const addBtn = Form.btn('+ テンプレートを追加', async () => {
-        tpls.push({ id: uid(), icon: 'template', name: '新規テンプレート', prompt: '' });
+        tpls.push({ id: uid(), icon: 'template', name: '新規テンプレート', prompt: '', webSearch: false });
         await Store.saveSettings();
         render();
       }, 'bg-zinc-100 dark:bg-zinc-800 text-zinc-800 dark:text-zinc-100 w-full');
@@ -1979,14 +1989,15 @@
           head.append(del);
           const ta = Form.textarea(t.prompt || '', async (v) => { t.prompt = v; await Store.saveDomains(); }, 3);
           ta.placeholder = 'プロンプトテキスト';
-          row.append(head, ta);
+          const webChk = Form.checkbox('Web 検索 (Grounding) を有効にする', !!t.webSearch, async (v) => { t.webSearch = v; await Store.saveDomains(); });
+          row.append(head, ta, webChk);
           list.append(row);
         }
         if (!dom.templates.length) list.append(el('p', { class: 'text-xs text-zinc-500' }, 'テンプレートはまだありません。'));
       };
       render();
       const addBtn = Form.btn('+ テンプレートを追加', async () => {
-        dom.templates.push({ id: uid(), icon: 'template', name: '新規テンプレート', prompt: '' });
+        dom.templates.push({ id: uid(), icon: 'template', name: '新規テンプレート', prompt: '', webSearch: false });
         await Store.saveDomains();
         render();
       }, 'bg-zinc-100 dark:bg-zinc-800 text-zinc-800 dark:text-zinc-100 w-full');
