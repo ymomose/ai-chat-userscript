@@ -21,9 +21,9 @@
 // @connect      generativelanguage.googleapis.com
 // @connect      www.googleapis.com
 // @connect      oauth2.googleapis.com
-// @connect      cdn.tailwindcss.com
 // @require      https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js
 // @require      https://cdn.jsdelivr.net/npm/dompurify@3.0.11/dist/purify.min.js
+// @require      https://cdn.tailwindcss.com/3.4.16
 // @noframes
 // ==/UserScript==
 
@@ -527,42 +527,30 @@
   // =========================================================================
   const TailwindBoot = {
     loaded: false,
-    loadingPromise: null,
     load() {
       if (this.loaded) return Promise.resolve();
-      if (this.loadingPromise) return this.loadingPromise;
-      this.loadingPromise = new Promise((resolve, reject) => {
-        const s = document.createElement('script');
-        s.src = 'https://cdn.tailwindcss.com/3.4.16';
-        s.async = true;
-        s.onload = () => {
-          // Play CDN replaces `window.tailwind` with a Proxy on load, so any
-          // pre-set config is wiped. Setting config AFTER onload triggers the
-          // Proxy setter, which schedules the initial CSS generation with our
-          // config — no preflight flash and `darkMode: 'class'` is honored.
-          try {
-            if (window.tailwind) {
-              window.tailwind.config = {
-                darkMode: 'class',
-                corePlugins: { preflight: false },
-                theme: {
-                  extend: {
-                    fontFamily: {
-                      sans: ['system-ui', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Helvetica', 'Arial', 'sans-serif'],
-                      mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Consolas', 'monospace']
-                    }
-                  }
+      // Tailwind Play CDN is loaded via @require, so it executes before this
+      // script runs — bypassing the page's script-src CSP. Setting config here
+      // triggers the Proxy setter installed by the CDN, which schedules the
+      // initial CSS generation with our config.
+      try {
+        if (window.tailwind) {
+          window.tailwind.config = {
+            darkMode: 'class',
+            corePlugins: { preflight: false },
+            theme: {
+              extend: {
+                fontFamily: {
+                  sans: ['system-ui', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Helvetica', 'Arial', 'sans-serif'],
+                  mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Consolas', 'monospace']
                 }
-              };
+              }
             }
-          } catch (e) { console.warn('[aicx] tailwind config failed:', e); }
-          this.loaded = true;
-          resolve();
-        };
-        s.onerror = () => reject(new Error('Failed to load Tailwind CSS CDN'));
-        document.head.appendChild(s);
-      });
-      return this.loadingPromise;
+          };
+        }
+      } catch (e) { console.warn('[aicx] tailwind config failed:', e); }
+      this.loaded = true;
+      return Promise.resolve();
     },
     // Install scoped base styles (mini "preflight" confined to our root) so page CSS
     // can't bleed into our UI, and vice versa.
