@@ -780,7 +780,7 @@
 #aicx-root .aicx-enter-fade { animation: aicx-fade-in 160ms ease-out both; }
 /* Typing dots */
 @keyframes aicx-dot { 0%, 80%, 100% { opacity: .2; transform: translateY(0); } 40% { opacity: 1; transform: translateY(-2px); } }
-#aicx-root .aicx-dot { display:inline-block; width:6px; height:6px; margin:0 2px; background:currentColor; border-radius:50%; animation: aicx-dot 1.2s infinite; }
+#aicx-root .aicx-dot { display:inline-block; width:6px; height:6px; margin:0 2px; background-color: currentColor !important; border-radius:50%; animation: aicx-dot 1.2s infinite; }
 #aicx-root .aicx-dot:nth-child(2){ animation-delay:.15s; }
 #aicx-root .aicx-dot:nth-child(3){ animation-delay:.3s; }
 
