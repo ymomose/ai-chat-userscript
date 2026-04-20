@@ -2019,6 +2019,34 @@
         wrap.append(row);
       }
       box.append(wrap);
+
+      // Bulk action: delete all conversation history across every domain,
+      // while keeping templates / system prompt overrides / settings intact.
+      const totals = Object.values(Store.domains).reduce((a, d) => ({
+        convs: a.convs + ((d.conversations || []).length),
+        domains: a.domains + ((d.conversations || []).length ? 1 : 0)
+      }), { convs: 0, domains: 0 });
+      const bulkWrap = el('div', { class: 'pt-4 mt-2 border-t border-zinc-200 dark:border-zinc-800 space-y-2' });
+      bulkWrap.append(el('p', { class: 'text-xs text-zinc-500' },
+        totals.convs
+          ? `全ドメインの会話履歴: ${totals.convs.toLocaleString()} 件 (${totals.domains} ドメイン)`
+          : '会話履歴はまだありません。'
+      ));
+      const bulkBtn = Form.btn('全ドメインの会話履歴を一括削除', async () => {
+        if (!totals.convs) return;
+        if (!await UI.confirm(`全 ${totals.domains} ドメインの会話履歴 (${totals.convs.toLocaleString()} 件) をすべて削除します。テンプレート・プロンプト上書き・その他設定は残ります。続行しますか?`)) return;
+        for (const host of Object.keys(Store.domains)) {
+          if (Store.domains[host]) Store.domains[host].conversations = [];
+        }
+        await Store.saveDomains();
+        UI.toast(`${totals.convs.toLocaleString()} 件の会話履歴を削除しました`, 'success');
+        this.close();
+        this.open();
+      }, 'bg-red-600 text-white w-full disabled:opacity-50');
+      if (!totals.convs) bulkBtn.disabled = true;
+      bulkWrap.append(bulkBtn);
+      box.append(bulkWrap);
+
       return box;
     },
 
