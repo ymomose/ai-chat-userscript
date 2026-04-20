@@ -718,43 +718,125 @@
 #aicx-root .aicx-dot:nth-child(2){ animation-delay:.15s; }
 #aicx-root .aicx-dot:nth-child(3){ animation-delay:.3s; }
 
-/* -------- Explicit dark-mode overrides --------
-   The Play CDN's dark: variant generation is unreliable when config is set
-   after initial compile, so we emit our own rules. These have specificity
-   (1, 2, 0) via the #aicx-root prefix, which always beats any Tailwind rule
-   Play CDN happens to produce ((0, 2, 0) at best). */
-#aicx-root .dark .dark\\:bg-white { background-color: rgb(255 255 255); }
-#aicx-root .dark .dark\\:bg-zinc-50 { background-color: rgb(250 250 250); }
-#aicx-root .dark .dark\\:bg-zinc-100 { background-color: rgb(244 244 245); }
-#aicx-root .dark .dark\\:bg-zinc-600 { background-color: rgb(82 82 91); }
-#aicx-root .dark .dark\\:bg-zinc-700 { background-color: rgb(63 63 70); }
-#aicx-root .dark .dark\\:bg-zinc-800 { background-color: rgb(39 39 42); }
-#aicx-root .dark .dark\\:bg-zinc-900 { background-color: rgb(24 24 27); }
-#aicx-root .dark .dark\\:bg-indigo-900 { background-color: rgb(49 46 129); }
-#aicx-root .dark .dark\\:bg-red-900\\/30 { background-color: rgb(127 29 29 / 0.3); }
+/* -------- Theme enforcement --------
+   Host-page CSS can override Tailwind utilities via higher specificity
+   or !important. Play CDN's generated rules also don't always survive
+   re-renders when config is set after initial compile. The rules below
+   are scoped to #aicx-root (specificity at least 1,1,1) and marked
+   !important so our light/dark theme always wins. Hover variants are
+   also !important so they beat the !important base rules. */
 
-#aicx-root .dark .dark\\:text-zinc-100 { color: rgb(244 244 245); }
-#aicx-root .dark .dark\\:text-zinc-200 { color: rgb(228 228 231); }
-#aicx-root .dark .dark\\:text-zinc-300 { color: rgb(212 212 216); }
-#aicx-root .dark .dark\\:text-zinc-400 { color: rgb(161 161 170); }
-#aicx-root .dark .dark\\:text-zinc-500 { color: rgb(113 113 122); }
-#aicx-root .dark .dark\\:text-blue-400 { color: rgb(96 165 250); }
-#aicx-root .dark .dark\\:text-indigo-300 { color: rgb(165 180 252); }
-#aicx-root .dark .dark\\:text-indigo-400 { color: rgb(129 140 248); }
-#aicx-root .dark .dark\\:text-red-300 { color: rgb(252 165 165); }
+/* Root-level colors (force against page's body/html inheritance) */
+#aicx-root { color: rgb(24 24 27) !important; }
+#aicx-root .dark { color: rgb(228 228 231) !important; }
 
-#aicx-root .dark .dark\\:border-zinc-600 { border-color: rgb(82 82 91); }
-#aicx-root .dark .dark\\:border-zinc-700 { border-color: rgb(63 63 70); }
-#aicx-root .dark .dark\\:border-zinc-800 { border-color: rgb(39 39 42); }
+/* Light-mode backgrounds */
+#aicx-root .bg-white { background-color: rgb(255 255 255) !important; }
+#aicx-root .bg-zinc-50 { background-color: rgb(250 250 250) !important; }
+#aicx-root .bg-zinc-100 { background-color: rgb(244 244 245) !important; }
+#aicx-root .bg-zinc-200 { background-color: rgb(228 228 231) !important; }
+#aicx-root .bg-zinc-300 { background-color: rgb(212 212 216) !important; }
+#aicx-root .bg-zinc-600 { background-color: rgb(82 82 91) !important; }
+#aicx-root .bg-zinc-700 { background-color: rgb(63 63 70) !important; }
+#aicx-root .bg-zinc-800 { background-color: rgb(39 39 42) !important; }
+#aicx-root .bg-zinc-900 { background-color: rgb(24 24 27) !important; }
+#aicx-root .bg-zinc-800\\/50 { background-color: rgb(39 39 42 / 0.5) !important; }
+#aicx-root .bg-zinc-800\\/60 { background-color: rgb(39 39 42 / 0.6) !important; }
+#aicx-root .bg-indigo-50 { background-color: rgb(238 242 255) !important; }
+#aicx-root .bg-indigo-100 { background-color: rgb(224 231 255) !important; }
+#aicx-root .bg-indigo-600 { background-color: rgb(79 70 229) !important; }
+#aicx-root .bg-indigo-900 { background-color: rgb(49 46 129) !important; }
+#aicx-root .bg-indigo-900\\/40 { background-color: rgb(49 46 129 / 0.4) !important; }
+#aicx-root .bg-red-50 { background-color: rgb(254 242 242) !important; }
+#aicx-root .bg-red-600 { background-color: rgb(220 38 38) !important; }
+#aicx-root .bg-red-900 { background-color: rgb(127 29 29) !important; }
+#aicx-root .bg-red-900\\/30 { background-color: rgb(127 29 29 / 0.3) !important; }
+#aicx-root .bg-emerald-600 { background-color: rgb(5 150 105) !important; }
+#aicx-root .bg-black\\/30 { background-color: rgb(0 0 0 / 0.3) !important; }
+#aicx-root .bg-black\\/40 { background-color: rgb(0 0 0 / 0.4) !important; }
 
-#aicx-root .dark .dark\\:divide-zinc-800 > :not([hidden]) ~ :not([hidden]) { border-color: rgb(39 39 42); }
+/* Light-mode text */
+#aicx-root .text-white { color: rgb(255 255 255) !important; }
+#aicx-root .text-zinc-100 { color: rgb(244 244 245) !important; }
+#aicx-root .text-zinc-200 { color: rgb(228 228 231) !important; }
+#aicx-root .text-zinc-300 { color: rgb(212 212 216) !important; }
+#aicx-root .text-zinc-400 { color: rgb(161 161 170) !important; }
+#aicx-root .text-zinc-500 { color: rgb(113 113 122) !important; }
+#aicx-root .text-zinc-600 { color: rgb(82 82 91) !important; }
+#aicx-root .text-zinc-700 { color: rgb(63 63 70) !important; }
+#aicx-root .text-zinc-800 { color: rgb(39 39 42) !important; }
+#aicx-root .text-zinc-900 { color: rgb(24 24 27) !important; }
+#aicx-root .text-indigo-300 { color: rgb(165 180 252) !important; }
+#aicx-root .text-indigo-400 { color: rgb(129 140 248) !important; }
+#aicx-root .text-indigo-600 { color: rgb(79 70 229) !important; }
+#aicx-root .text-indigo-700 { color: rgb(67 56 202) !important; }
+#aicx-root .text-blue-400 { color: rgb(96 165 250) !important; }
+#aicx-root .text-blue-600 { color: rgb(37 99 235) !important; }
+#aicx-root .text-red-300 { color: rgb(252 165 165) !important; }
+#aicx-root .text-red-500 { color: rgb(239 68 68) !important; }
+#aicx-root .text-red-600 { color: rgb(220 38 38) !important; }
+#aicx-root .text-emerald-600 { color: rgb(5 150 105) !important; }
 
-#aicx-root .dark .dark\\:hover\\:bg-zinc-800:hover { background-color: rgb(39 39 42); }
-#aicx-root .dark .dark\\:hover\\:bg-zinc-800\\/50:hover { background-color: rgb(39 39 42 / 0.5); }
-#aicx-root .dark .dark\\:hover\\:bg-zinc-800\\/60:hover { background-color: rgb(39 39 42 / 0.6); }
-#aicx-root .dark .dark\\:hover\\:bg-indigo-900\\/40:hover { background-color: rgb(49 46 129 / 0.4); }
-#aicx-root .dark .dark\\:hover\\:bg-red-900\\/30:hover { background-color: rgb(127 29 29 / 0.3); }
-#aicx-root .dark .dark\\:hover\\:text-zinc-200:hover { color: rgb(228 228 231); }
+/* Light-mode borders */
+#aicx-root .border-zinc-100 { border-color: rgb(244 244 245) !important; }
+#aicx-root .border-zinc-200 { border-color: rgb(228 228 231) !important; }
+#aicx-root .border-zinc-300 { border-color: rgb(212 212 216) !important; }
+#aicx-root .border-zinc-600 { border-color: rgb(82 82 91) !important; }
+#aicx-root .border-zinc-700 { border-color: rgb(63 63 70) !important; }
+#aicx-root .border-zinc-800 { border-color: rgb(39 39 42) !important; }
+#aicx-root .border-indigo-600 { border-color: rgb(79 70 229) !important; }
+#aicx-root .border-transparent { border-color: transparent !important; }
+#aicx-root .divide-zinc-100 > :not([hidden]) ~ :not([hidden]) { border-color: rgb(244 244 245) !important; }
+
+/* Light-mode hover */
+#aicx-root .hover\\:bg-zinc-50:hover { background-color: rgb(250 250 250) !important; }
+#aicx-root .hover\\:bg-zinc-100:hover { background-color: rgb(244 244 245) !important; }
+#aicx-root .hover\\:bg-zinc-700:hover { background-color: rgb(63 63 70) !important; }
+#aicx-root .hover\\:bg-zinc-800:hover { background-color: rgb(39 39 42) !important; }
+#aicx-root .hover\\:bg-indigo-50:hover { background-color: rgb(238 242 255) !important; }
+#aicx-root .hover\\:bg-red-50:hover { background-color: rgb(254 242 242) !important; }
+#aicx-root .hover\\:text-red-500:hover { color: rgb(239 68 68) !important; }
+#aicx-root .hover\\:text-red-600:hover { color: rgb(220 38 38) !important; }
+#aicx-root .hover\\:text-zinc-700:hover { color: rgb(63 63 70) !important; }
+
+/* Dark-mode backgrounds */
+#aicx-root .dark .dark\\:bg-white { background-color: rgb(255 255 255) !important; }
+#aicx-root .dark .dark\\:bg-zinc-50 { background-color: rgb(250 250 250) !important; }
+#aicx-root .dark .dark\\:bg-zinc-100 { background-color: rgb(244 244 245) !important; }
+#aicx-root .dark .dark\\:bg-zinc-600 { background-color: rgb(82 82 91) !important; }
+#aicx-root .dark .dark\\:bg-zinc-700 { background-color: rgb(63 63 70) !important; }
+#aicx-root .dark .dark\\:bg-zinc-800 { background-color: rgb(39 39 42) !important; }
+#aicx-root .dark .dark\\:bg-zinc-900 { background-color: rgb(24 24 27) !important; }
+#aicx-root .dark .dark\\:bg-zinc-800\\/50 { background-color: rgb(39 39 42 / 0.5) !important; }
+#aicx-root .dark .dark\\:bg-zinc-800\\/60 { background-color: rgb(39 39 42 / 0.6) !important; }
+#aicx-root .dark .dark\\:bg-indigo-900 { background-color: rgb(49 46 129) !important; }
+#aicx-root .dark .dark\\:bg-red-900\\/30 { background-color: rgb(127 29 29 / 0.3) !important; }
+
+/* Dark-mode text */
+#aicx-root .dark .dark\\:text-zinc-100 { color: rgb(244 244 245) !important; }
+#aicx-root .dark .dark\\:text-zinc-200 { color: rgb(228 228 231) !important; }
+#aicx-root .dark .dark\\:text-zinc-300 { color: rgb(212 212 216) !important; }
+#aicx-root .dark .dark\\:text-zinc-400 { color: rgb(161 161 170) !important; }
+#aicx-root .dark .dark\\:text-zinc-500 { color: rgb(113 113 122) !important; }
+#aicx-root .dark .dark\\:text-blue-400 { color: rgb(96 165 250) !important; }
+#aicx-root .dark .dark\\:text-indigo-300 { color: rgb(165 180 252) !important; }
+#aicx-root .dark .dark\\:text-indigo-400 { color: rgb(129 140 248) !important; }
+#aicx-root .dark .dark\\:text-red-300 { color: rgb(252 165 165) !important; }
+
+/* Dark-mode borders */
+#aicx-root .dark .dark\\:border-zinc-600 { border-color: rgb(82 82 91) !important; }
+#aicx-root .dark .dark\\:border-zinc-700 { border-color: rgb(63 63 70) !important; }
+#aicx-root .dark .dark\\:border-zinc-800 { border-color: rgb(39 39 42) !important; }
+#aicx-root .dark .dark\\:divide-zinc-800 > :not([hidden]) ~ :not([hidden]) { border-color: rgb(39 39 42) !important; }
+
+/* Dark-mode hover */
+#aicx-root .dark .dark\\:hover\\:bg-zinc-700:hover { background-color: rgb(63 63 70) !important; }
+#aicx-root .dark .dark\\:hover\\:bg-zinc-800:hover { background-color: rgb(39 39 42) !important; }
+#aicx-root .dark .dark\\:hover\\:bg-zinc-800\\/50:hover { background-color: rgb(39 39 42 / 0.5) !important; }
+#aicx-root .dark .dark\\:hover\\:bg-zinc-800\\/60:hover { background-color: rgb(39 39 42 / 0.6) !important; }
+#aicx-root .dark .dark\\:hover\\:bg-indigo-900\\/40:hover { background-color: rgb(49 46 129 / 0.4) !important; }
+#aicx-root .dark .dark\\:hover\\:bg-red-900\\/30:hover { background-color: rgb(127 29 29 / 0.3) !important; }
+#aicx-root .dark .dark\\:hover\\:text-zinc-200:hover { color: rgb(228 228 231) !important; }
 `;
       const style = document.createElement('style');
       style.id = 'aicx-base';
