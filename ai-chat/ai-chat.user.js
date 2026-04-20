@@ -24,10 +24,11 @@
 // @require      https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js
 // @require      https://cdn.jsdelivr.net/npm/dompurify@3.0.11/dist/purify.min.js
 // @require      https://cdn.tailwindcss.com/3.4.16
+// @require      https://cdn.jsdelivr.net/npm/@mozilla/readability@0.5.0/Readability.js
 // @noframes
 // ==/UserScript==
 
-/* global marked, DOMPurify */
+/* global marked, DOMPurify, Readability */
 (() => {
   'use strict';
   if (window.top !== window.self) return; // ignore iframes
@@ -140,7 +141,12 @@
     lastBackupAt: 0,
     buttonPos: null, // { x, y } fraction of viewport
     chatHeightPct: 70, // chat sheet height as percentage of viewport
-    globalTemplates: [] // array of { id, name, prompt } usable on any domain
+    globalTemplates: [], // array of { id, name, prompt } usable on any domain
+    // How to extract page text for AI context:
+    //   'auto'  : Mozilla Readability → falls back to 'clean' if it yields nothing
+    //   'clean' : heuristic — strip header/footer/nav/aside/[aria-hidden]/[hidden]
+    //   'raw'   : legacy — strip only script/style/svg/iframe/video/audio/canvas
+    pageExtractMode: 'auto'
   };
 
   const Store = {
@@ -187,6 +193,13 @@
       const d = this.domains[host];
       const override = d && d.systemPrompt && d.systemPrompt.trim();
       return override || this.settings.globalSystemPrompt || '';
+    },
+    resolvePageExtractMode(host) {
+      host = host || getDomain();
+      const d = this.domains[host];
+      const dMode = d && d.pageExtractMode;
+      if (dMode && dMode !== 'inherit') return dMode;
+      return this.settings.pageExtractMode || 'auto';
     }
   };
 
@@ -408,25 +421,83 @@
   // 6. Page context extractor
   // =========================================================================
   const Page = {
+    // Base strip list — tags whose visible text is either noise or unparseable
+    // regardless of extraction mode.
+    BASE_STRIP: 'script,style,noscript,svg,iframe,video,audio,canvas,template',
+    // Additional selectors for 'clean' mode: chrome elements whose text is
+    // almost always navigation / boilerplate, plus elements the page has
+    // declared as hidden via aria/hidden.
+    CHROME_STRIP: [
+      'header', 'footer', 'nav', 'aside',
+      '[role="navigation"]', '[role="banner"]', '[role="contentinfo"]', '[role="complementary"]', '[role="search"]',
+      '[aria-hidden="true"]', '[hidden]'
+    ].join(','),
+    MAX_TEXT: 20000,
+
     snapshot() {
       const selection = (window.getSelection && String(window.getSelection())) || '';
       const title = document.title || '';
       const metaDesc = (document.querySelector('meta[name="description"]') || {}).content || '';
       const url = location.href;
 
-      // main content: try article / main / body in that order, strip scripts/styles
-      const root = document.querySelector('article') || document.querySelector('main') || document.body;
+      const mode = Store.resolvePageExtractMode();
       let text = '';
-      if (root) {
-        const clone = root.cloneNode(true);
-        clone.querySelectorAll('script,style,noscript,svg,iframe,video,audio,canvas').forEach((n) => n.remove());
-        text = (clone.innerText || '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+      let effectiveMode = mode;
+
+      if (mode === 'auto') {
+        text = this._extractReadability();
+        if (!text) { effectiveMode = 'clean'; text = this._extractHeuristic(true); }
+      } else if (mode === 'clean') {
+        text = this._extractHeuristic(true);
+      } else {
+        text = this._extractHeuristic(false);
       }
-      // Cap to ~20k chars to keep prompt bounded
-      const MAX = 20000;
-      if (text.length > MAX) text = text.slice(0, MAX) + '\n...[truncated]';
-      return { url, title, metaDesc, selection: selection.slice(0, 4000), text };
+
+      if (text.length > this.MAX_TEXT) text = text.slice(0, this.MAX_TEXT) + '\n...[truncated]';
+      return { url, title, metaDesc, selection: selection.slice(0, 4000), text, mode: effectiveMode };
     },
+
+    // Remove the overlay's own DOM from a cloned tree so the chat UI text
+    // (user messages, assistant replies, settings labels, etc.) doesn't get
+    // fed back into itself as "page context". Without this, typing into the
+    // composer and then asking about the page leaks the chat itself into
+    // the prompt on the next turn.
+    _stripSelf(clone) {
+      if (!clone || !clone.querySelectorAll) return;
+      clone.querySelectorAll('#aicx-root').forEach((n) => n.remove());
+    },
+
+    // Try Mozilla Readability on a cloned document. Returns '' if the library
+    // is unavailable, throws, or yields a suspiciously short result.
+    _extractReadability() {
+      try {
+        if (typeof Readability === 'undefined') return '';
+        const docClone = document.cloneNode(true);
+        this._stripSelf(docClone);
+        const article = new Readability(docClone).parse();
+        if (!article) return '';
+        const t = (article.textContent || '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+        // Readability sometimes picks a tiny unrelated node on SPA / doc sites;
+        // treat <200 chars as "failed" so callers can fall back.
+        return t.length >= 200 ? t : '';
+      } catch (e) {
+        console.warn('[aicx] Readability failed:', e);
+        return '';
+      }
+    },
+
+    // Heuristic extraction. When `stripChrome` is true, also removes
+    // header/nav/footer/aside/aria-hidden/hidden elements.
+    _extractHeuristic(stripChrome) {
+      const root = document.querySelector('article') || document.querySelector('main') || document.body;
+      if (!root) return '';
+      const clone = root.cloneNode(true);
+      this._stripSelf(clone);
+      clone.querySelectorAll(this.BASE_STRIP).forEach((n) => n.remove());
+      if (stripChrome) clone.querySelectorAll(this.CHROME_STRIP).forEach((n) => n.remove());
+      return (clone.innerText || '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+    },
+
     formatForPrompt(snap) {
       const parts = [
         `# Current Page Context`,
@@ -1113,6 +1184,10 @@
         updateWebBtn();
       });
 
+      const btnCtx = el('button', { class: 'w-10 h-10 shrink-0 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 flex items-center justify-center aicx-tap', type: 'button', 'aria-label': 'コンテキストを確認', title: 'AI に送られるページコンテキストをプレビュー' });
+      btnCtx.appendChild(icon('summary'));
+      btnCtx.addEventListener('click', () => this.showContextPreview());
+
       const spacer = el('div', { class: 'flex-1' });
 
       const btnSend = el('button', { class: 'w-10 h-10 shrink-0 rounded-full bg-indigo-600 text-white flex items-center justify-center disabled:opacity-50 aicx-tap', 'aria-label': '送信' });
@@ -1123,7 +1198,7 @@
       btnStop.appendChild(icon('stop'));
       btnStop.addEventListener('click', () => this.stop());
 
-      btnRow.append(btnAttach, btnCamera, btnWeb, spacer, btnSend, btnStop, fileInput, cameraInput);
+      btnRow.append(btnAttach, btnCamera, btnWeb, btnCtx, spacer, btnSend, btnStop, fileInput, cameraInput);
       composer.append(attBar, ta, btnRow);
 
       sheet.append(resizeHandle, header, list, composer);
@@ -1222,6 +1297,87 @@
         chip.appendChild(x);
         bar.appendChild(chip);
       });
+    },
+
+    showContextPreview() {
+      let snap;
+      try {
+        snap = Page.snapshot();
+      } catch (e) {
+        UI.toast('コンテキストの取得に失敗しました: ' + (e && e.message || e), 'error');
+        return;
+      }
+      const MODE_LABEL = {
+        auto: '自動 (Readability)',
+        clean: 'クリーン (chrome 除外)',
+        raw: 'ほぼそのまま'
+      };
+      const modeLabel = MODE_LABEL[snap.mode] || snap.mode;
+      const systemPrompt = Store.resolveSystemPrompt(this.host);
+      const promptText = Page.formatForPrompt(snap);
+
+      const kv = (k, v) => el('div', { class: 'flex gap-2 text-xs' }, [
+        el('span', { class: 'shrink-0 w-24 text-zinc-500 dark:text-zinc-400' }, k),
+        el('span', { class: 'flex-1 break-all text-zinc-800 dark:text-zinc-200' }, v)
+      ]);
+      const preBlock = (text) => el('pre', {
+        class: 'whitespace-pre-wrap break-words text-[11px] font-mono bg-zinc-50 dark:bg-zinc-800 rounded-lg p-3 max-h-64 overflow-auto text-zinc-800 dark:text-zinc-200'
+      }, text || '(空)');
+      const section = (label, child) => el('section', { class: 'space-y-1' }, [
+        el('h3', { class: 'text-[11px] uppercase tracking-wider text-zinc-500 dark:text-zinc-400 font-semibold' }, label),
+        child
+      ]);
+
+      const close = el('button', { class: 'w-9 h-9 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 flex items-center justify-center aicx-tap', 'aria-label': '閉じる', type: 'button' });
+      close.appendChild(icon('close'));
+      const { panel, body } = Form.sheet({
+        title: 'コンテキスト プレビュー',
+        onClose: () => panel.remove()
+      });
+      close.addEventListener('click', () => panel.remove());
+
+      // Summary (mode + stats)
+      const stats = el('div', { class: 'space-y-1 p-3 rounded-lg bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-700' }, [
+        kv('抽出モード', modeLabel),
+        kv('本文文字数', `${snap.text.length.toLocaleString()} 文字${snap.text.endsWith('...[truncated]') ? ' (打ち切り)' : ''}`),
+        kv('選択文字数', `${snap.selection.length.toLocaleString()} 文字`),
+        kv('添付ファイル', this.attachments.length ? this.attachments.map((a) => a.name).join(', ') : 'なし')
+      ]);
+      body.append(section('概要', stats));
+
+      // Page meta
+      body.append(section('ページ情報', el('div', { class: 'space-y-1' }, [
+        kv('URL', snap.url),
+        kv('Title', snap.title || '(なし)'),
+        kv('Description', snap.metaDesc || '(なし)')
+      ])));
+
+      // Selection
+      if (snap.selection) body.append(section('選択中のテキスト', preBlock(snap.selection)));
+
+      // Extracted text
+      body.append(section('抽出された本文', preBlock(snap.text)));
+
+      // System prompt
+      body.append(section('システムプロンプト', preBlock(systemPrompt || '(なし)')));
+
+      // Full prompt (what actually gets sent as context)
+      body.append(section('送信される Page Context (整形済み)', preBlock(promptText)));
+
+      // Actions
+      const actions = el('div', { class: 'flex gap-2 pt-2' });
+      const copyBtn = Form.btn('本文をコピー', async () => {
+        const ok = await copyToClipboard(snap.text);
+        UI.toast(ok ? 'コピーしました' : 'コピーに失敗しました', ok ? 'success' : 'error');
+      }, 'bg-zinc-200 dark:bg-zinc-700 text-zinc-800 dark:text-zinc-100');
+      const copyAllBtn = Form.btn('プロンプト全体をコピー', async () => {
+        const ok = await copyToClipboard(promptText);
+        UI.toast(ok ? 'コピーしました' : 'コピーに失敗しました', ok ? 'success' : 'error');
+      }, 'bg-indigo-600 text-white');
+      actions.append(copyBtn, copyAllBtn);
+      body.append(actions);
+
+      UI.root.appendChild(panel);
     },
 
     render() {
@@ -1534,6 +1690,16 @@
       wrap.append(chk, el('span', {}, label));
       return wrap;
     },
+    select(options, value, onChange) {
+      const sel = el('select', { class: 'w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg text-sm px-3 py-2' });
+      for (const opt of options) {
+        const o = el('option', { value: opt.value }, opt.label);
+        if (opt.value === value) o.selected = true;
+        sel.append(o);
+      }
+      sel.addEventListener('change', () => onChange(sel.value));
+      return sel;
+    },
     // Icon picker for templates — shows current icon, opens a grid popover on click.
     iconPicker({ current, onChange }) {
       let selected = current || 'template';
@@ -1673,7 +1839,7 @@
           body.append(this.sectionAPI(), this.sectionTheme(), this.sectionAbout());
           break;
         case 'prompts':
-          body.append(this.sectionGlobalPrompt(), this.sectionGlobalTemplates());
+          body.append(this.sectionGlobalPrompt(), this.sectionPageExtract(), this.sectionGlobalTemplates());
           break;
         case 'domains':
           body.append(this.sectionDomains());
@@ -1753,6 +1919,22 @@
       box.append(Form.sectionTitle('グローバル システムプロンプト'));
       box.append(el('p', { class: 'text-xs text-zinc-500' }, '全ドメインで共通して使われます。ドメインごとの上書きは「ドメイン」タブから行えます。'));
       box.append(Form.textarea(Store.settings.globalSystemPrompt, (v) => { Store.settings.globalSystemPrompt = v; Store.saveSettings(); }, 5));
+      return box;
+    },
+
+    sectionPageExtract() {
+      const box = el('section', { class: 'space-y-2' });
+      box.append(Form.sectionTitle('ページ本文の抽出方法'));
+      box.append(el('p', { class: 'text-xs text-zinc-500' }, 'AI に送るページのコンテキスト抽出方法を選びます。ドメインごとに個別設定することもできます。'));
+      const opts = [
+        { value: 'auto', label: '自動 (Readability で本文抽出 · 推奨)' },
+        { value: 'clean', label: 'クリーン (ヘッダー/ナビ/フッター/サイドバー等を除外)' },
+        { value: 'raw', label: 'ほぼそのまま (スクリプト/スタイル等のみ除外)' }
+      ];
+      box.append(Form.select(opts, Store.settings.pageExtractMode || 'auto', (v) => {
+        Store.settings.pageExtractMode = v;
+        Store.saveSettings();
+      }));
       return box;
     },
 
@@ -1951,6 +2133,7 @@
 
       body.append(
         this.sectionPrompt(host),
+        this.sectionPageExtract(host),
         this.sectionTemplates(host),
         this.sectionConversations(host),
         this.sectionDanger(host)
@@ -1973,6 +2156,24 @@
       const ta = Form.textarea(dom.systemPrompt || '', async (v) => { dom.systemPrompt = v; await Store.saveDomains(); }, 4);
       ta.placeholder = '(空欄でグローバル設定を使用)';
       box.append(ta);
+      return box;
+    },
+
+    sectionPageExtract(host) {
+      const box = el('section', { class: 'space-y-2' });
+      box.append(Form.sectionTitle('ページ本文の抽出方法'));
+      box.append(el('p', { class: 'text-xs text-zinc-500' }, 'このドメインでの抽出方法を個別に指定できます。既定ではグローバル設定を使用します。'));
+      const dom = Store.getDomain(host);
+      const opts = [
+        { value: 'inherit', label: 'グローバル設定を使用' },
+        { value: 'auto', label: '自動 (Readability で本文抽出)' },
+        { value: 'clean', label: 'クリーン (ヘッダー/ナビ/フッター/サイドバー等を除外)' },
+        { value: 'raw', label: 'ほぼそのまま (スクリプト/スタイル等のみ除外)' }
+      ];
+      box.append(Form.select(opts, dom.pageExtractMode || 'inherit', async (v) => {
+        dom.pageExtractMode = v;
+        await Store.saveDomains();
+      }));
       return box;
     },
 
