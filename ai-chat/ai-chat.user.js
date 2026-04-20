@@ -102,6 +102,27 @@
     return n;
   };
   const clear = (node) => { while (node.firstChild) node.removeChild(node.firstChild); };
+  const copyToClipboard = async (text) => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch { /* fall through */ }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      ta.setSelectionRange(0, ta.value.length);
+      const ok = document.execCommand && document.execCommand('copy');
+      ta.remove();
+      return !!ok;
+    } catch { return false; }
+  };
 
   // =========================================================================
   // 3. Storage + data model
@@ -117,7 +138,9 @@
     driveTokenExp: 0,
     driveFileId: '',
     lastBackupAt: 0,
-    buttonPos: null // { x, y } fraction of viewport
+    buttonPos: null, // { x, y } fraction of viewport
+    chatHeightPct: 70, // chat sheet height as percentage of viewport
+    globalTemplates: [] // array of { id, name, prompt } usable on any domain
   };
 
   const Store = {
@@ -208,7 +231,7 @@
       return contents;
     },
 
-    async *streamGenerate({ apiKey, model, messages, systemPrompt, signal }) {
+    async *streamGenerate({ apiKey, model, messages, systemPrompt, tools, onMetadata, signal }) {
       if (!apiKey) throw new Error('API キーが設定されていません。設定画面から登録してください。');
       if (!model) throw new Error('モデルが選択されていません。');
       const url = `${API_BASE}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`;
@@ -219,6 +242,7 @@
       if (systemPrompt && systemPrompt.trim()) {
         body.systemInstruction = { role: 'user', parts: [{ text: systemPrompt }] };
       }
+      if (tools && tools.length) body.tools = tools;
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -253,6 +277,9 @@
             const parts2 = cand && cand.content && cand.content.parts;
             if (parts2) {
               for (const p of parts2) if (p.text) yield p.text;
+            }
+            if (cand && cand.groundingMetadata && typeof onMetadata === 'function') {
+              try { onMetadata(cand.groundingMetadata); } catch {}
             }
             if (cand && cand.finishReason && cand.finishReason !== 'STOP' && cand.finishReason !== 'FINISH_REASON_UNSPECIFIED') {
               // Safety block or length cap — surface to user via a tail message
@@ -504,26 +531,34 @@
     load() {
       if (this.loaded) return Promise.resolve();
       if (this.loadingPromise) return this.loadingPromise;
-      // Pre-configure before the Play CDN script evaluates
-      window.tailwind = window.tailwind || {};
-      window.tailwind.config = {
-        darkMode: 'class',
-        important: '#aicx-root',
-        corePlugins: { preflight: false },
-        theme: {
-          extend: {
-            fontFamily: {
-              sans: ['system-ui', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Helvetica', 'Arial', 'sans-serif'],
-              mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Consolas', 'monospace']
-            }
-          }
-        }
-      };
       this.loadingPromise = new Promise((resolve, reject) => {
         const s = document.createElement('script');
         s.src = 'https://cdn.tailwindcss.com/3.4.16';
         s.async = true;
-        s.onload = () => { this.loaded = true; resolve(); };
+        s.onload = () => {
+          // Play CDN replaces `window.tailwind` with a Proxy on load, so any
+          // pre-set config is wiped. Setting config AFTER onload triggers the
+          // Proxy setter, which schedules the initial CSS generation with our
+          // config — no preflight flash and `darkMode: 'class'` is honored.
+          try {
+            if (window.tailwind) {
+              window.tailwind.config = {
+                darkMode: 'class',
+                corePlugins: { preflight: false },
+                theme: {
+                  extend: {
+                    fontFamily: {
+                      sans: ['system-ui', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Helvetica', 'Arial', 'sans-serif'],
+                      mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Consolas', 'monospace']
+                    }
+                  }
+                }
+              };
+            }
+          } catch (e) { console.warn('[aicx] tailwind config failed:', e); }
+          this.loaded = true;
+          resolve();
+        };
         s.onerror = () => reject(new Error('Failed to load Tailwind CSS CDN'));
         document.head.appendChild(s);
       });
@@ -556,7 +591,9 @@
   color: inherit;
 }
 #aicx-root .dark { color: rgb(228,228,231); }
-#aicx-root *, #aicx-root *::before, #aicx-root *::after {
+/* Element-level reset wrapped in :where() so specificity is 0.
+   Tailwind utilities (specificity 0,1,0) always override these resets. */
+:where(#aicx-root *, #aicx-root *::before, #aicx-root *::after) {
   box-sizing: border-box;
   margin: 0;
   padding: 0;
@@ -565,27 +602,31 @@
   font-size: inherit;
   line-height: inherit;
   color: inherit;
-  background: transparent;
+  background-color: transparent;
+  background-image: none;
   text-decoration: none;
   list-style: none;
 }
-#aicx-root button, #aicx-root input, #aicx-root textarea, #aicx-root select {
-  font: inherit; color: inherit; background: transparent;
+:where(#aicx-root button, #aicx-root input, #aicx-root textarea, #aicx-root select) {
+  font: inherit; color: inherit; background-color: transparent;
   appearance: none; -webkit-appearance: none; outline: none;
 }
-#aicx-root input, #aicx-root textarea, #aicx-root select {
+:where(#aicx-root input, #aicx-root textarea, #aicx-root select) {
   border-radius: 8px; padding: 8px 10px;
 }
-#aicx-root button { cursor: pointer; touch-action: manipulation; }
-#aicx-root img { max-width: 100%; height: auto; display: block; }
-#aicx-root svg { display: inline-block; vertical-align: middle; }
+:where(#aicx-root button) { cursor: pointer; touch-action: manipulation; }
+:where(#aicx-root img) { max-width: 100%; height: auto; display: block; }
+:where(#aicx-root svg) { display: inline-block; vertical-align: middle; }
+:where(#aicx-root textarea) { resize: none; }
+/* Functional utilities (not intended to be overridden by Tailwind) */
 #aicx-root [data-active="true"] { pointer-events: auto; }
 #aicx-root .aicx-panel { pointer-events: auto; }
 #aicx-root .aicx-scroll { -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
 #aicx-root .aicx-tap { touch-action: manipulation; user-select: none; -webkit-user-select: none; }
-#aicx-root textarea { resize: none; }
-/* Viewport helpers */
-#aicx-root .aicx-full { height: 100dvh; max-height: 100dvh; }
+/* aicx-full wrapped in :where() so sm:h-[...] can override it at breakpoints */
+:where(#aicx-root .aicx-full) { height: 100dvh; max-height: 100dvh; }
+/* Resize handle */
+#aicx-root .aicx-resize { touch-action: none; cursor: ns-resize; user-select: none; -webkit-user-select: none; }
 /* Sheet enter animation */
 @keyframes aicx-slide-up { from { transform: translateY(12px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
 @keyframes aicx-fade-in { from { opacity: 0; } to { opacity: 1; } }
@@ -596,6 +637,44 @@
 #aicx-root .aicx-dot { display:inline-block; width:6px; height:6px; margin:0 2px; background:currentColor; border-radius:50%; animation: aicx-dot 1.2s infinite; }
 #aicx-root .aicx-dot:nth-child(2){ animation-delay:.15s; }
 #aicx-root .aicx-dot:nth-child(3){ animation-delay:.3s; }
+
+/* -------- Explicit dark-mode overrides --------
+   The Play CDN's dark: variant generation is unreliable when config is set
+   after initial compile, so we emit our own rules. These have specificity
+   (1, 2, 0) via the #aicx-root prefix, which always beats any Tailwind rule
+   Play CDN happens to produce ((0, 2, 0) at best). */
+#aicx-root .dark .dark\\:bg-white { background-color: rgb(255 255 255); }
+#aicx-root .dark .dark\\:bg-zinc-50 { background-color: rgb(250 250 250); }
+#aicx-root .dark .dark\\:bg-zinc-100 { background-color: rgb(244 244 245); }
+#aicx-root .dark .dark\\:bg-zinc-600 { background-color: rgb(82 82 91); }
+#aicx-root .dark .dark\\:bg-zinc-700 { background-color: rgb(63 63 70); }
+#aicx-root .dark .dark\\:bg-zinc-800 { background-color: rgb(39 39 42); }
+#aicx-root .dark .dark\\:bg-zinc-900 { background-color: rgb(24 24 27); }
+#aicx-root .dark .dark\\:bg-indigo-900 { background-color: rgb(49 46 129); }
+#aicx-root .dark .dark\\:bg-red-900\\/30 { background-color: rgb(127 29 29 / 0.3); }
+
+#aicx-root .dark .dark\\:text-zinc-100 { color: rgb(244 244 245); }
+#aicx-root .dark .dark\\:text-zinc-200 { color: rgb(228 228 231); }
+#aicx-root .dark .dark\\:text-zinc-300 { color: rgb(212 212 216); }
+#aicx-root .dark .dark\\:text-zinc-400 { color: rgb(161 161 170); }
+#aicx-root .dark .dark\\:text-zinc-500 { color: rgb(113 113 122); }
+#aicx-root .dark .dark\\:text-blue-400 { color: rgb(96 165 250); }
+#aicx-root .dark .dark\\:text-indigo-300 { color: rgb(165 180 252); }
+#aicx-root .dark .dark\\:text-indigo-400 { color: rgb(129 140 248); }
+#aicx-root .dark .dark\\:text-red-300 { color: rgb(252 165 165); }
+
+#aicx-root .dark .dark\\:border-zinc-600 { border-color: rgb(82 82 91); }
+#aicx-root .dark .dark\\:border-zinc-700 { border-color: rgb(63 63 70); }
+#aicx-root .dark .dark\\:border-zinc-800 { border-color: rgb(39 39 42); }
+
+#aicx-root .dark .dark\\:divide-zinc-800 > :not([hidden]) ~ :not([hidden]) { border-color: rgb(39 39 42); }
+
+#aicx-root .dark .dark\\:hover\\:bg-zinc-800:hover { background-color: rgb(39 39 42); }
+#aicx-root .dark .dark\\:hover\\:bg-zinc-800\\/50:hover { background-color: rgb(39 39 42 / 0.5); }
+#aicx-root .dark .dark\\:hover\\:bg-zinc-800\\/60:hover { background-color: rgb(39 39 42 / 0.6); }
+#aicx-root .dark .dark\\:hover\\:bg-indigo-900\\/40:hover { background-color: rgb(49 46 129 / 0.4); }
+#aicx-root .dark .dark\\:hover\\:bg-red-900\\/30:hover { background-color: rgb(127 29 29 / 0.3); }
+#aicx-root .dark .dark\\:hover\\:text-zinc-200:hover { color: rgb(228 228 231); }
 `;
       const style = document.createElement('style');
       style.id = 'aicx-base';
@@ -607,6 +686,11 @@
   // =========================================================================
   // 10. Icons (inline SVG)
   // =========================================================================
+  const TEMPLATE_ICONS = [
+    'template', 'chat', 'search', 'edit', 'star', 'bookmark',
+    'bolt', 'code', 'sparkles', 'question', 'folder', 'tag',
+    'heart', 'list', 'translate', 'summary', 'web'
+  ];
   const icon = (name, cls = 'w-5 h-5') => {
     const paths = {
       chat:    '<path d="M4 5.5A2.5 2.5 0 0 1 6.5 3h11A2.5 2.5 0 0 1 20 5.5v8A2.5 2.5 0 0 1 17.5 16H11l-4.5 3.5V16H6.5A2.5 2.5 0 0 1 4 13.5v-8Z" stroke="currentColor" stroke-width="1.6" fill="none"/>',
@@ -627,6 +711,22 @@
       user:    '<circle cx="12" cy="8" r="4" stroke="currentColor" stroke-width="1.6" fill="none"/><path d="M4 20a8 8 0 0 1 16 0" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round"/>',
       bot:     '<rect x="4" y="6" width="16" height="12" rx="3" stroke="currentColor" stroke-width="1.6" fill="none"/><circle cx="9" cy="12" r="1.2" fill="currentColor"/><circle cx="15" cy="12" r="1.2" fill="currentColor"/><path d="M12 2v4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>',
       drag:    '<circle cx="9" cy="6" r="1.4" fill="currentColor"/><circle cx="15" cy="6" r="1.4" fill="currentColor"/><circle cx="9" cy="12" r="1.4" fill="currentColor"/><circle cx="15" cy="12" r="1.4" fill="currentColor"/><circle cx="9" cy="18" r="1.4" fill="currentColor"/><circle cx="15" cy="18" r="1.4" fill="currentColor"/>',
+      web:     '<circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.6" fill="none"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18" stroke="currentColor" stroke-width="1.6" fill="none"/>',
+      copy:    '<rect x="9" y="9" width="11" height="11" rx="2" stroke="currentColor" stroke-width="1.6" fill="none"/><path d="M5 15V6a2 2 0 0 1 2-2h9" stroke="currentColor" stroke-width="1.6" fill="none"/>',
+      search:  '<circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="1.6" fill="none"/><path d="M20 20l-4.35-4.35" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>',
+      edit:    '<path d="M12 20h9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4 12.5-12.5Z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linejoin="round"/>',
+      star:    '<path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2Z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linejoin="round"/>',
+      bookmark:'<path d="M6 3h12a1 1 0 0 1 1 1v18l-7-5-7 5V4a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linejoin="round"/>',
+      bolt:    '<path d="M13 2 3 14h7l-1 8 10-12h-7l1-8Z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linejoin="round"/>',
+      code:    '<path d="M8 6l-6 6 6 6M16 6l6 6-6 6" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
+      sparkles:'<path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M5.6 18.4l2.8-2.8M15.6 8.4l2.8-2.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" fill="none"/>',
+      question:'<circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.6" fill="none"/><path d="M9.5 9a2.5 2.5 0 0 1 5 0c0 1.5-2.5 2-2.5 3.5M12 17v.01" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round"/>',
+      folder:  '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linejoin="round"/>',
+      tag:     '<path d="M3 3h8l10 10-8 8L3 11V3Z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linejoin="round"/><circle cx="7.5" cy="7.5" r="1" fill="currentColor"/>',
+      heart:   '<path d="M20.8 4.6a5.5 5.5 0 0 0-8.8-1.4L12 3.8l-.1-.1a5.5 5.5 0 0 0-8.8 6.6l.8.9 8.1 8.5 8-8.5.7-.9a5.5 5.5 0 0 0 .1-6.7Z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linejoin="round"/>',
+      list:    '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
+      translate: '<path d="M4 5h8M8 2v3M6 5c0 4 3 7 7 9M14 14c-4 0-7-3-7-7" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round"/><path d="M13 22l5-11 5 11M14 18h8" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
+      summary: '<path d="M6 3h9l5 5v13a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z" stroke="currentColor" stroke-width="1.6" fill="none"/><path d="M15 3v5h5M9 13h7M9 17h5" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round"/>',
     };
     const svg = el('span', { class: 'inline-flex items-center justify-center ' + cls });
     svg.innerHTML = `<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" width="100%" height="100%" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || ''}</svg>`;
@@ -701,6 +801,7 @@
       this.host = el('div', { id: 'aicx-fab', class: 'fixed aicx-panel aicx-tap', style: { zIndex: 10, touchAction: 'none' } });
       this.btn = el('button', {
         class: 'w-14 h-14 rounded-full shadow-lg bg-gradient-to-br from-indigo-500 to-violet-600 text-white flex items-center justify-center active:scale-95 transition',
+        type: 'button',
         'aria-label': 'AI チャットを開く'
       });
       this.btn.appendChild(icon('chat', 'w-7 h-7'));
@@ -708,7 +809,9 @@
       UI.root.appendChild(this.host);
       this.applyPosition();
       this.bindDrag();
-      this.btn.addEventListener('click', (e) => {
+      // Click listener on HOST (not btn): setPointerCapture on host causes the
+      // click event to target the host itself, so a listener on btn never fires.
+      this.host.addEventListener('click', (e) => {
         if (this.suppressClick) { this.suppressClick = false; return; }
         e.preventDefault();
         this.toggleMenu();
@@ -753,14 +856,20 @@
         this.host.removeEventListener('pointerup', onUp);
         this.host.removeEventListener('pointercancel', onUp);
         try { this.host.releasePointerCapture(pointerId); } catch {}
+        const wasMoved = moved;
         pointerId = null;
-        if (moved) {
+        moved = false;
+        this.dragging = false;
+        if (wasMoved) {
           this.suppressClick = true;
           this.savePosition(parseFloat(this.host.style.left), parseFloat(this.host.style.top));
+          // Clear stale suppress flag so the next real click isn't swallowed.
+          setTimeout(() => { this.suppressClick = false; }, 300);
         }
-        this.dragging = false;
       };
       this.host.addEventListener('pointerdown', (e) => {
+        // Only primary mouse button (ignore right-click / middle-click on desktop)
+        if (e.pointerType === 'mouse' && e.button !== 0) return;
         pointerId = e.pointerId;
         startX = e.clientX; startY = e.clientY;
         const r = this.host.getBoundingClientRect();
@@ -784,8 +893,7 @@
     openMenu() {
       const host = getDomain();
       const domain = Store.getDomain(host);
-      const recent = (domain.conversations || []).slice(0, 5);
-      const templates = domain.templates || [];
+      const recent = (domain.conversations || []).slice(0, 3);
 
       // Position menu near button but within viewport
       const r = this.host.getBoundingClientRect();
@@ -799,7 +907,7 @@
       });
 
       const row = (iconName, label, onClick, extra='') => {
-        const b = el('button', { class: `w-full flex items-center gap-3 px-4 py-3 text-left text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800 aicx-tap ${extra}` });
+        const b = el('button', { class: `w-full flex items-center gap-3 px-4 py-3 text-left text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800 aicx-tap ${extra}`, type: 'button' });
         b.append(icon(iconName, 'w-4 h-4 text-zinc-500'), el('span', { class: 'flex-1 truncate' }, label));
         b.addEventListener('click', () => { this.closeMenu(); onClick(); });
         return b;
@@ -814,16 +922,6 @@
       menu.appendChild(row('plus', '新規 AI チャット', () => ChatPanel.open({ newChat: true })));
       menu.appendChild(row('history', '会話履歴', () => HistoryPanel.open()));
 
-      // Templates section
-      if (templates.length) {
-        menu.appendChild(el('div', { class: 'px-4 pt-2 pb-1 text-xs uppercase tracking-wide text-zinc-500 dark:text-zinc-400' }, 'テンプレート'));
-        templates.slice(0, 8).forEach((t) => {
-          menu.appendChild(row('template', t.name || '(無題)', () => ChatPanel.open({ newChat: true, initialPrompt: t.prompt })));
-        });
-      } else {
-        menu.appendChild(el('div', { class: 'px-4 py-2 text-xs text-zinc-400' }, 'テンプレート: 設定画面で追加できます'));
-      }
-
       // Recent section
       if (recent.length) {
         menu.appendChild(el('div', { class: 'px-4 pt-2 pb-1 text-xs uppercase tracking-wide text-zinc-500 dark:text-zinc-400' }, '最近の会話'));
@@ -836,6 +934,28 @@
       // Footer
       menu.appendChild(el('div', { class: 'border-t border-zinc-100 dark:border-zinc-800 mt-1' }));
       menu.appendChild(row('gear', '設定', () => SettingsPanel.open()));
+
+      // Shortcut bar — template icons at the bottom of the menu
+      const globalTpls = Store.settings.globalTemplates || [];
+      const domainTpls = domain.templates || [];
+      if (globalTpls.length || domainTpls.length) {
+        const bar = el('div', { class: 'border-t border-zinc-100 dark:border-zinc-800 p-2 flex items-center gap-1 overflow-x-auto' });
+        const mkShortcut = (t, scope) => {
+          const label = t.name || '(無題)';
+          const b = el('button', {
+            class: `w-9 h-9 shrink-0 rounded-full flex items-center justify-center aicx-tap transition ${scope === 'global' ? 'text-indigo-600 dark:text-indigo-300 hover:bg-indigo-50 dark:hover:bg-indigo-900/40' : 'text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800'}`,
+            type: 'button',
+            'aria-label': label,
+            title: label + (scope === 'global' ? ' (グローバル)' : '')
+          });
+          b.appendChild(icon(t.icon || 'template', 'w-5 h-5'));
+          b.addEventListener('click', () => { this.closeMenu(); ChatPanel.open({ newChat: true, initialPrompt: t.prompt || '', autoSend: true }); });
+          return b;
+        };
+        for (const t of globalTpls) bar.appendChild(mkShortcut(t, 'global'));
+        for (const t of domainTpls) bar.appendChild(mkShortcut(t, 'domain'));
+        menu.appendChild(bar);
+      }
 
       this.menuEl = menu;
       UI.root.appendChild(menu);
@@ -869,38 +989,64 @@
       // Defer creating a new conversation until the user actually sends something,
       // to avoid leaving empty conversations in history if they close the panel.
       this.host = host;
+      // Web grounding resets to off for every newly opened chat panel.
+      this.webGrounding = false;
       this.conv = conv;
       this.attachments = [];
 
-      const panel = el('div', { class: 'fixed inset-0 aicx-panel aicx-enter-fade flex items-end sm:items-stretch justify-center', style: { zIndex: 30 } });
+      const panel = el('div', { class: 'fixed inset-0 aicx-panel aicx-enter-fade flex items-end justify-center', style: { zIndex: 30 } });
       const overlay = el('div', { class: 'absolute inset-0 bg-black/30' });
       overlay.addEventListener('click', () => this.close());
 
+      const heightPct = Math.max(25, Math.min(100, Number(Store.settings.chatHeightPct) || 70));
       const sheet = el('div', {
-        class: 'relative bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 w-full sm:max-w-xl sm:mx-auto sm:my-4 sm:rounded-2xl rounded-t-2xl shadow-2xl flex flex-col aicx-enter-sheet aicx-full sm:h-[calc(100dvh-2rem)] overflow-hidden',
-        style: { paddingBottom: 'env(safe-area-inset-bottom, 0px)' }
+        class: 'relative bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 w-full sm:max-w-xl sm:mb-4 sm:rounded-2xl rounded-t-2xl shadow-2xl flex flex-col aicx-enter-sheet overflow-hidden',
+        style: {
+          height: `${heightPct}dvh`,
+          maxHeight: 'calc(100dvh - env(safe-area-inset-top, 0px))',
+          paddingBottom: 'env(safe-area-inset-bottom, 0px)'
+        }
       });
 
+      // Resize handle (drag to change sheet height)
+      const resizeHandle = el('div', {
+        class: 'shrink-0 py-2 flex items-center justify-center aicx-resize',
+        role: 'separator',
+        'aria-label': '高さを変更',
+        'aria-orientation': 'horizontal'
+      });
+      resizeHandle.appendChild(el('div', { class: 'w-10 h-1 rounded-full bg-zinc-300 dark:bg-zinc-600' }));
+      this.bindResize(resizeHandle, sheet);
+
       // Header
-      const header = el('div', { class: 'shrink-0 px-4 py-3 border-b border-zinc-200 dark:border-zinc-800 flex items-center gap-3' });
-      const title = el('div', { class: 'flex-1 min-w-0' });
+      const header = el('div', { class: 'shrink-0 px-4 pb-3 border-b border-zinc-200 dark:border-zinc-800 flex items-center gap-1' });
+      const title = el('div', { class: 'flex-1 min-w-0 mr-2' });
       const titleTop = el('div', { class: 'text-sm font-semibold truncate' }, (conv && conv.title) || '新しい会話');
       const titleSub = el('div', { class: 'text-[11px] text-zinc-500 dark:text-zinc-400 truncate' }, `${host} · ${Store.settings.model || '(モデル未選択)'}`);
       title.append(titleTop, titleSub);
-      const closeBtn = el('button', { class: 'w-9 h-9 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 flex items-center justify-center aicx-tap', 'aria-label': '閉じる' });
+
+      const btnNewChat = el('button', { class: 'w-9 h-9 shrink-0 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 flex items-center justify-center aicx-tap', 'aria-label': '新規チャット', title: '新規チャット' });
+      btnNewChat.appendChild(icon('plus'));
+      btnNewChat.addEventListener('click', () => this.open());
+
+      const btnHistory = el('button', { class: 'w-9 h-9 shrink-0 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 flex items-center justify-center aicx-tap', 'aria-label': '会話履歴', title: '会話履歴' });
+      btnHistory.appendChild(icon('history'));
+      btnHistory.addEventListener('click', () => HistoryPanel.open());
+
+      const closeBtn = el('button', { class: 'w-9 h-9 shrink-0 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 flex items-center justify-center aicx-tap', 'aria-label': '閉じる' });
       closeBtn.appendChild(icon('close'));
       closeBtn.addEventListener('click', () => this.close());
-      header.append(title, closeBtn);
+
+      header.append(title, btnNewChat, btnHistory, closeBtn);
 
       // Messages
       const list = el('div', { class: 'flex-1 aicx-scroll overflow-y-auto p-4 space-y-3' });
 
-      // Composer
-      const composer = el('div', { class: 'shrink-0 border-t border-zinc-200 dark:border-zinc-800 p-3 bg-white dark:bg-zinc-900' });
-      const attBar = el('div', { class: 'flex flex-wrap gap-2 mb-2 empty:hidden' });
-      const inputRow = el('div', { class: 'flex items-end gap-2' });
+      // Composer: textarea on top, button row below
+      const composer = el('div', { class: 'shrink-0 border-t border-zinc-200 dark:border-zinc-800 p-3 bg-white dark:bg-zinc-900 flex flex-col gap-2' });
+      const attBar = el('div', { class: 'flex flex-wrap gap-2 empty:hidden' });
       const ta = el('textarea', {
-        class: 'flex-1 min-h-[40px] max-h-40 px-3 py-2 rounded-2xl bg-zinc-100 dark:bg-zinc-800 text-sm',
+        class: 'w-full min-h-[40px] max-h-40 px-3 py-2 rounded-2xl bg-zinc-100 dark:bg-zinc-800 text-sm',
         placeholder: 'メッセージを入力 (Shift+Enter で改行)',
         rows: '1'
       });
@@ -916,22 +1062,48 @@
       });
       if (opts.initialPrompt) {
         ta.value = opts.initialPrompt;
-        setTimeout(() => { ta.dispatchEvent(new Event('input')); ta.focus(); }, 0);
+        setTimeout(() => {
+          ta.dispatchEvent(new Event('input'));
+          if (opts.autoSend && ta.value.trim()) {
+            this.send();
+          } else {
+            ta.focus();
+          }
+        }, 0);
       }
 
-      // Attach buttons
+      // File / camera inputs (hidden)
       const fileInput = el('input', { type: 'file', multiple: true, class: 'hidden' });
       fileInput.addEventListener('change', (e) => this.handleFiles(e.target.files));
       const cameraInput = el('input', { type: 'file', accept: 'image/*', capture: 'environment', class: 'hidden' });
       cameraInput.addEventListener('change', (e) => this.handleFiles(e.target.files));
 
-      const btnAttach = el('button', { class: 'w-10 h-10 shrink-0 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 flex items-center justify-center aicx-tap', 'aria-label': '添付' });
+      // Button row (below textarea)
+      const btnRow = el('div', { class: 'flex items-center gap-2' });
+
+      const btnAttach = el('button', { class: 'w-10 h-10 shrink-0 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 flex items-center justify-center aicx-tap', 'aria-label': 'ファイル添付', title: 'ファイル添付' });
       btnAttach.appendChild(icon('attach'));
       btnAttach.addEventListener('click', () => fileInput.click());
 
-      const btnCamera = el('button', { class: 'w-10 h-10 shrink-0 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 flex items-center justify-center aicx-tap', 'aria-label': 'カメラ撮影' });
+      const btnCamera = el('button', { class: 'w-10 h-10 shrink-0 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 flex items-center justify-center aicx-tap', 'aria-label': 'カメラ撮影', title: 'カメラ撮影' });
       btnCamera.appendChild(icon('camera'));
       btnCamera.addEventListener('click', () => cameraInput.click());
+
+      const btnWeb = el('button', { class: '', type: 'button', 'aria-label': 'Web 検索 (Grounding)', 'aria-pressed': 'false', title: 'Gemini の Google 検索 Grounding を有効/無効 (このチャット内のみ)' });
+      btnWeb.appendChild(icon('web'));
+      const updateWebBtn = () => {
+        const on = !!this.webGrounding;
+        btnWeb.setAttribute('aria-pressed', on ? 'true' : 'false');
+        btnWeb.className = `h-10 shrink-0 rounded-full flex items-center justify-center gap-1 px-3 aicx-tap transition ${on ? 'bg-indigo-600 text-white' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300'}`;
+      };
+      updateWebBtn();
+      btnWeb.appendChild(el('span', { class: 'text-xs font-medium' }, 'Web'));
+      btnWeb.addEventListener('click', () => {
+        this.webGrounding = !this.webGrounding;
+        updateWebBtn();
+      });
+
+      const spacer = el('div', { class: 'flex-1' });
 
       const btnSend = el('button', { class: 'w-10 h-10 shrink-0 rounded-full bg-indigo-600 text-white flex items-center justify-center disabled:opacity-50 aicx-tap', 'aria-label': '送信' });
       btnSend.appendChild(icon('send'));
@@ -941,13 +1113,14 @@
       btnStop.appendChild(icon('stop'));
       btnStop.addEventListener('click', () => this.stop());
 
-      inputRow.append(btnAttach, btnCamera, ta, btnSend, btnStop, fileInput, cameraInput);
-      composer.append(attBar, inputRow);
+      btnRow.append(btnAttach, btnCamera, btnWeb, spacer, btnSend, btnStop, fileInput, cameraInput);
+      composer.append(attBar, ta, btnRow);
 
-      sheet.append(header, list, composer);
+      sheet.append(resizeHandle, header, list, composer);
       panel.append(overlay, sheet);
       UI.root.appendChild(panel);
       this.panel = panel;
+      this.sheet = sheet;
       this.els = { list, ta, btnSend, btnStop, attBar, titleTop };
 
       // Render initial messages
@@ -957,9 +1130,48 @@
       setTimeout(() => ta.focus(), 50);
     },
 
+    bindResize(handle, sheet) {
+      let startY = 0, startHpx = 0, pointerId = null;
+      const onMove = (e) => {
+        if (e.pointerId !== pointerId) return;
+        e.preventDefault();
+        const dy = e.clientY - startY;
+        // Sheet is anchored at bottom: dragging up (negative dy) grows height.
+        const newH = startHpx - dy;
+        const vh = window.innerHeight;
+        const minH = Math.max(180, vh * 0.25);
+        const maxH = vh;
+        sheet.style.height = `${Math.max(minH, Math.min(maxH, newH))}px`;
+      };
+      const onUp = (e) => {
+        if (e.pointerId !== pointerId) return;
+        handle.removeEventListener('pointermove', onMove);
+        handle.removeEventListener('pointerup', onUp);
+        handle.removeEventListener('pointercancel', onUp);
+        try { handle.releasePointerCapture(pointerId); } catch {}
+        pointerId = null;
+        const vh = window.innerHeight;
+        const pct = Math.max(25, Math.min(100, Math.round(sheet.offsetHeight / vh * 100)));
+        Store.settings.chatHeightPct = pct;
+        Store.saveSettings();
+        // Convert back to percentage-based so it tracks viewport changes afterward
+        sheet.style.height = `${pct}dvh`;
+      };
+      handle.addEventListener('pointerdown', (e) => {
+        pointerId = e.pointerId;
+        startY = e.clientY;
+        startHpx = sheet.offsetHeight;
+        try { handle.setPointerCapture(pointerId); } catch {}
+        handle.addEventListener('pointermove', onMove);
+        handle.addEventListener('pointerup', onUp);
+        handle.addEventListener('pointercancel', onUp);
+      });
+    },
+
     close() {
       if (this.aborter) { try { this.aborter.abort(); } catch {} this.aborter = null; }
       if (this.panel) { this.panel.remove(); this.panel = null; }
+      this.sheet = null;
       this.conv = null;
       this.attachments = [];
     },
@@ -1015,12 +1227,11 @@
 
     renderMessage(m) {
       const isUser = m.role === 'user';
-      const wrap = el('div', { class: `flex gap-2 ${isUser ? 'justify-end' : 'justify-start'}` });
-      const avatar = el('div', { class: `w-7 h-7 shrink-0 rounded-full flex items-center justify-center ${isUser ? 'bg-indigo-100 text-indigo-600 dark:bg-indigo-900 dark:text-indigo-300 order-last' : 'bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-300'}` });
-      avatar.appendChild(icon(isUser ? 'user' : 'bot', 'w-4 h-4'));
-      const bubble = el('div', { class: `max-w-[80%] rounded-2xl px-3 py-2 text-sm ${isUser ? 'bg-indigo-600 text-white' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100'}` });
+
+      // Build attachments block (if any)
+      let atts = null;
       if (m.attachments && m.attachments.length) {
-        const atts = el('div', { class: 'flex flex-wrap gap-2 mb-1' });
+        atts = el('div', { class: `flex flex-wrap gap-2 ${isUser ? 'justify-end' : ''} mb-1` });
         for (const a of m.attachments) {
           if (a.mimeType && a.mimeType.startsWith('image/')) {
             atts.appendChild(el('img', { src: a.dataUrl, class: 'max-w-[160px] max-h-[160px] rounded-lg object-cover' }));
@@ -1028,18 +1239,61 @@
             atts.appendChild(el('div', { class: 'text-xs opacity-80 flex items-center gap-1' }, [icon('attach', 'w-3 h-3'), a.name]));
           }
         }
-        bubble.appendChild(atts);
       }
-      const body = el('div', { class: 'aicx-md' });
+
       if (isUser) {
-        body.className = 'whitespace-pre-wrap break-words';
+        // User: right-aligned bubble, preserves whitespace
+        const wrap = el('div', { class: 'flex flex-col items-end' });
+        const bubble = el('div', { class: 'max-w-[85%] rounded-2xl px-3 py-2 text-sm bg-indigo-600 text-white' });
+        if (atts) bubble.appendChild(atts);
+        const body = el('div', { class: 'whitespace-pre-wrap break-words' });
         body.textContent = m.content || '';
-      } else {
-        body.innerHTML = MD.render(m.content || (m._pending ? '<span class="aicx-dot"></span><span class="aicx-dot"></span><span class="aicx-dot"></span>' : ''));
+        bubble.appendChild(body);
+        wrap.appendChild(bubble);
+        const actions = this.renderActions(m);
+        if (actions) wrap.appendChild(actions);
+        return wrap;
       }
-      bubble.appendChild(body);
-      wrap.append(avatar, bubble);
+
+      // Assistant: full-width plain markdown, no bubble, no avatar
+      const wrap = el('div', { class: 'w-full text-sm break-words' });
+      if (atts) wrap.appendChild(atts);
+      const body = el('div', { class: 'aicx-md' });
+      body.innerHTML = MD.render(m.content || (m._pending ? '<span class="aicx-dot"></span><span class="aicx-dot"></span><span class="aicx-dot"></span>' : ''));
+      wrap.appendChild(body);
+      const actions = this.renderActions(m);
+      if (actions) wrap.appendChild(actions);
       return wrap;
+    },
+
+    // Per-message action bar. Designed to host multiple buttons — append more
+    // children to the returned bar as new features are added.
+    renderActions(m) {
+      if (m._pending) return null;
+      const text = m.content || '';
+      const hasAtts = m.attachments && m.attachments.length;
+      if (!text.trim() && !hasAtts) return null;
+      const isUser = m.role === 'user';
+      const bar = el('div', {
+        class: `flex gap-1 mt-1.5 flex-wrap ${isUser ? 'justify-end' : 'justify-start'}`,
+        'data-aicx-actions': ''
+      });
+      bar.appendChild(this._actionButton('copy', 'コピー', async () => {
+        const ok = await copyToClipboard(text);
+        UI.toast(ok ? 'コピーしました' : 'コピーに失敗しました', ok ? 'success' : 'error');
+      }));
+      return bar;
+    },
+
+    _actionButton(iconName, label, onClick) {
+      const b = el('button', {
+        class: 'text-xs px-2 py-1 rounded-md text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-700 dark:hover:text-zinc-200 aicx-tap inline-flex items-center gap-1 transition',
+        'aria-label': label,
+        title: label
+      });
+      b.append(icon(iconName, 'w-3.5 h-3.5'), el('span', {}, label));
+      b.addEventListener('click', onClick);
+      return b;
     },
 
     async send() {
@@ -1097,11 +1351,20 @@
 
       try {
         let acc = '';
+        // Google Search grounding (requires Gemini 2.0+ for `googleSearch`; 1.5 uses `googleSearchRetrieval`)
+        let tools;
+        if (this.webGrounding) {
+          const m = Store.settings.model || '';
+          tools = /\b1\.[05]\b/.test(m) ? [{ googleSearchRetrieval: {} }] : [{ googleSearch: {} }];
+        }
+        let grounding = null;
         const stream = Gemini.streamGenerate({
           apiKey: Store.settings.apiKey,
           model: Store.settings.model,
           messages: apiMessages,
           systemPrompt: Store.resolveSystemPrompt(host),
+          tools,
+          onMetadata: (meta) => { grounding = meta; },
           signal: aborter.signal
         });
         for await (const chunk of stream) {
@@ -1111,6 +1374,16 @@
           if (this.conv === conv) this.renderLastAssistant();
         }
         asstMsg._pending = false;
+        // Append grounding sources (web citations) if any
+        if (grounding && grounding.groundingChunks && grounding.groundingChunks.length) {
+          const lines = grounding.groundingChunks
+            .map((c, i) => (c.web && c.web.uri) ? `${i + 1}. [${c.web.title || c.web.uri}](${c.web.uri})` : null)
+            .filter(Boolean);
+          if (lines.length) {
+            asstMsg.content = (asstMsg.content || '') + `\n\n---\n**ソース:**\n\n${lines.join('\n')}`;
+            if (this.conv === conv) this.renderLastAssistant();
+          }
+        }
       } catch (err) {
         asstMsg._pending = false;
         if (err && err.name === 'AbortError') {
@@ -1212,37 +1485,10 @@
   // =========================================================================
   // 15. UI: Settings Panel
   // =========================================================================
-  const SettingsPanel = {
-    panel: null,
-    models: null,
-    open() {
-      this.close();
-      const panel = el('div', { class: 'fixed inset-0 aicx-panel aicx-enter-fade flex items-end sm:items-stretch justify-center', style: { zIndex: 30 } });
-      const overlay = el('div', { class: 'absolute inset-0 bg-black/30' });
-      overlay.addEventListener('click', () => this.close());
-
-      const sheet = el('div', {
-        class: 'relative bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 w-full sm:max-w-lg sm:mx-auto sm:my-4 sm:rounded-2xl rounded-t-2xl shadow-2xl flex flex-col aicx-enter-sheet aicx-full sm:h-[calc(100dvh-2rem)] overflow-hidden',
-        style: { paddingBottom: 'env(safe-area-inset-bottom, 0px)' }
-      });
-
-      const header = el('div', { class: 'shrink-0 px-4 py-3 border-b border-zinc-200 dark:border-zinc-800 flex items-center gap-2' });
-      const back = el('button', { class: 'w-9 h-9 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 flex items-center justify-center aicx-tap' });
-      back.appendChild(icon('close'));
-      back.addEventListener('click', () => this.close());
-      header.append(el('div', { class: 'flex-1 text-sm font-semibold' }, '設定'), back);
-
-      const body = el('div', { class: 'flex-1 aicx-scroll overflow-y-auto p-4 space-y-6' });
-
-      body.append(this.sectionAPI(), this.sectionPrompts(), this.sectionTemplates(), this.sectionHistory(), this.sectionBackup(), this.sectionTheme(), this.sectionAbout());
-
-      sheet.append(header, body);
-      panel.append(overlay, sheet);
-      UI.root.appendChild(panel);
-      this.panel = panel;
-    },
-    close() { if (this.panel) { this.panel.remove(); this.panel = null; } },
-
+  // -------------------------------------------------------------------------
+  // Form helpers (shared by Settings / Domain panels)
+  // -------------------------------------------------------------------------
+  const Form = {
     sectionTitle(t) {
       return el('h3', { class: 'text-xs uppercase tracking-wider text-zinc-500 dark:text-zinc-400 font-semibold' }, t);
     },
@@ -1263,18 +1509,167 @@
       return t;
     },
     btn(text, onClick, cls = 'bg-indigo-600 text-white') {
-      const b = el('button', { class: `px-3 py-2 rounded-lg text-sm aicx-tap ${cls}` }, text);
+      const b = el('button', { class: `px-3 py-2 rounded-lg text-sm aicx-tap ${cls}`, type: 'button' }, text);
       b.addEventListener('click', onClick);
       return b;
+    },
+    // Icon picker for templates — shows current icon, opens a grid popover on click.
+    iconPicker({ current, onChange }) {
+      let selected = current || 'template';
+      const wrap = el('div', { class: 'relative inline-block shrink-0' });
+      const trigger = el('button', {
+        class: 'w-10 h-10 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800 hover:bg-zinc-100 dark:hover:bg-zinc-700 flex items-center justify-center aicx-tap text-zinc-600 dark:text-zinc-300',
+        type: 'button',
+        'aria-label': 'アイコンを選択',
+        title: 'アイコンを選択'
+      });
+      const paintTrigger = () => { clear(trigger); trigger.appendChild(icon(selected, 'w-5 h-5')); };
+      paintTrigger();
+      let popover = null;
+      const closePop = () => {
+        if (popover) { popover.remove(); popover = null; }
+        document.removeEventListener('pointerdown', onDoc, true);
+      };
+      const onDoc = (e) => { if (!wrap.contains(e.target)) closePop(); };
+      const openPop = () => {
+        if (popover) { closePop(); return; }
+        popover = el('div', {
+          class: 'absolute z-20 mt-1 left-0 p-2 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 shadow-xl',
+          style: { top: '100%', minWidth: '244px' }
+        });
+        const grid = el('div', { class: 'grid grid-cols-6 gap-1' });
+        for (const name of TEMPLATE_ICONS) {
+          const active = name === selected;
+          const cell = el('button', {
+            class: `w-9 h-9 rounded flex items-center justify-center aicx-tap transition ${active ? 'bg-indigo-100 dark:bg-indigo-900 text-indigo-600 dark:text-indigo-300' : 'text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800'}`,
+            type: 'button',
+            'aria-label': name,
+            title: name
+          });
+          cell.appendChild(icon(name, 'w-4 h-4'));
+          cell.addEventListener('click', () => {
+            selected = name;
+            paintTrigger();
+            try { onChange(selected); } catch {}
+            closePop();
+          });
+          grid.appendChild(cell);
+        }
+        popover.appendChild(grid);
+        wrap.appendChild(popover);
+        setTimeout(() => document.addEventListener('pointerdown', onDoc, true), 0);
+      };
+      trigger.addEventListener('click', openPop);
+      wrap.appendChild(trigger);
+      return wrap;
+    },
+    // Sheet skeleton: returns { panel, sheet, body } with header already mounted.
+    // `title` may be a string or HTMLElement. `subheader` (optional) is rendered
+    // between the header and the scrollable body (useful for tab bars).
+    sheet({ title, onBack, onClose, leading, trailing, subheader, maxWidth = 'sm:max-w-lg' }) {
+      const panel = el('div', { class: 'fixed inset-0 aicx-panel aicx-enter-fade flex items-end sm:items-stretch justify-center', style: { zIndex: 30 } });
+      const overlay = el('div', { class: 'absolute inset-0 bg-black/30' });
+      overlay.addEventListener('click', () => { (onBack || onClose || (() => panel.remove()))(); });
+      const sheet = el('div', {
+        class: `relative bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 w-full ${maxWidth} sm:mx-auto sm:my-4 sm:rounded-2xl rounded-t-2xl shadow-2xl flex flex-col aicx-enter-sheet aicx-full sm:h-[calc(100dvh-2rem)] overflow-hidden`,
+        style: { paddingBottom: 'env(safe-area-inset-bottom, 0px)' }
+      });
+      const header = el('div', { class: 'shrink-0 px-4 py-3 border-b border-zinc-200 dark:border-zinc-800 flex items-center gap-2' });
+      if (leading) header.appendChild(leading);
+      const titleEl = (typeof title === 'string')
+        ? el('div', { class: 'flex-1 text-sm font-semibold truncate' }, title)
+        : title;
+      header.appendChild(titleEl);
+      if (trailing) header.appendChild(trailing);
+      if (onClose) {
+        const close = el('button', { class: 'w-9 h-9 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 flex items-center justify-center aicx-tap', 'aria-label': '閉じる' });
+        close.appendChild(icon('close'));
+        close.addEventListener('click', onClose);
+        header.appendChild(close);
+      }
+      const body = el('div', { class: 'flex-1 aicx-scroll overflow-y-auto p-4 space-y-6' });
+      sheet.append(header);
+      if (subheader) sheet.append(subheader);
+      sheet.append(body);
+      panel.append(overlay, sheet);
+      return { panel, sheet, body };
+    }
+  };
+
+  const SettingsPanel = {
+    panel: null,
+    models: null,
+    activeTab: 'general',
+
+    TABS: [
+      { id: 'general', label: '一般' },
+      { id: 'prompts', label: 'プロンプト' },
+      { id: 'domains', label: 'ドメイン' },
+      { id: 'backup',  label: 'バックアップ' }
+    ],
+
+    open() {
+      this.close();
+
+      const tabBar = el('div', { class: 'flex border-b border-zinc-200 dark:border-zinc-800 shrink-0 overflow-x-auto' });
+      const tabButtons = {};
+      const updateTabStyles = () => {
+        for (const [id, btn] of Object.entries(tabButtons)) {
+          const active = this.activeTab === id;
+          btn.className = `flex-1 min-w-[80px] px-3 py-2.5 text-sm whitespace-nowrap border-b-2 transition aicx-tap ${active ? 'border-indigo-600 text-indigo-600 dark:text-indigo-400 font-medium' : 'border-transparent text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200'}`;
+        }
+      };
+
+      const { panel, body } = Form.sheet({
+        title: '設定',
+        onClose: () => this.close(),
+        subheader: tabBar
+      });
+
+      for (const t of this.TABS) {
+        const btn = el('button', { role: 'tab', 'aria-selected': 'false' }, t.label);
+        tabButtons[t.id] = btn;
+        btn.addEventListener('click', () => {
+          this.activeTab = t.id;
+          updateTabStyles();
+          this.renderTab(body);
+          body.scrollTop = 0;
+        });
+        tabBar.append(btn);
+      }
+      updateTabStyles();
+      this.renderTab(body);
+
+      UI.root.appendChild(panel);
+      this.panel = panel;
+    },
+    close() { if (this.panel) { this.panel.remove(); this.panel = null; } },
+
+    renderTab(body) {
+      clear(body);
+      switch (this.activeTab) {
+        case 'general':
+          body.append(this.sectionAPI(), this.sectionTheme(), this.sectionAbout());
+          break;
+        case 'prompts':
+          body.append(this.sectionGlobalPrompt(), this.sectionGlobalTemplates());
+          break;
+        case 'domains':
+          body.append(this.sectionDomains());
+          break;
+        case 'backup':
+          body.append(this.sectionBackup());
+          break;
+      }
     },
 
     sectionAPI() {
       const box = el('section', { class: 'space-y-3' });
-      box.append(this.sectionTitle('Gemini API'));
+      box.append(Form.sectionTitle('Gemini API'));
 
       const keyWrap = el('div');
-      keyWrap.append(this.label('API キー'));
-      const keyInput = this.input(Store.settings.apiKey, (v) => { Store.settings.apiKey = v.trim(); Store.saveSettings(); updateModelOpts(); }, { type: 'password', placeholder: 'AIza...' });
+      keyWrap.append(Form.label('API キー'));
+      const keyInput = Form.input(Store.settings.apiKey, (v) => { Store.settings.apiKey = v.trim(); Store.saveSettings(); updateModelOpts(); }, { type: 'password', placeholder: 'AIza...' });
       keyWrap.append(keyInput);
       keyWrap.append(el('p', { class: 'text-[11px] text-zinc-500 mt-1' }, [
         'キーは ',
@@ -1284,10 +1679,10 @@
       box.append(keyWrap);
 
       const modelWrap = el('div');
-      modelWrap.append(this.label('モデル'));
+      modelWrap.append(Form.label('モデル'));
       const row = el('div', { class: 'flex gap-2' });
       const sel = el('select', { class: 'flex-1 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg text-sm px-3 py-2' });
-      const refreshBtn = this.btn('再取得', () => updateModelOpts(true), 'bg-zinc-200 dark:bg-zinc-700 text-zinc-800 dark:text-zinc-100');
+      const refreshBtn = Form.btn('再取得', () => updateModelOpts(true), 'bg-zinc-200 dark:bg-zinc-700 text-zinc-800 dark:text-zinc-100');
       refreshBtn.prepend(icon('refresh', 'w-3 h-3 mr-1 inline'));
       row.append(sel, refreshBtn);
       modelWrap.append(row);
@@ -1316,15 +1711,13 @@
         }
         clear(sel);
         const ids = new Set();
-        // Include current model even if not in list
         if (Store.settings.model && !this.models.some((m) => m.id === Store.settings.model)) {
           sel.appendChild(el('option', { value: Store.settings.model }, Store.settings.model));
           ids.add(Store.settings.model);
         }
         for (const m of this.models) {
           if (ids.has(m.id)) continue;
-          const opt = el('option', { value: m.id }, `${m.display} (${m.id})`);
-          sel.appendChild(opt);
+          sel.appendChild(el('option', { value: m.id }, `${m.display} (${m.id})`));
         }
         sel.value = Store.settings.model || '';
       };
@@ -1334,143 +1727,100 @@
       return box;
     },
 
-    sectionPrompts() {
-      const box = el('section', { class: 'space-y-3' });
-      box.append(this.sectionTitle('システムプロンプト'));
-
-      box.append(this.label('グローバル (全ドメイン共通)'));
-      box.append(this.textarea(Store.settings.globalSystemPrompt, (v) => { Store.settings.globalSystemPrompt = v; Store.saveSettings(); }, 4));
-
-      const domains = Store.usedDomains();
-      box.append(this.label('ドメイン別オーバーライド'));
-      if (!domains.length) {
-        box.append(el('p', { class: 'text-xs text-zinc-500' }, 'AI チャットを使用したことのあるドメインで設定できます。'));
-      } else {
-        const sel = el('select', { class: 'w-full bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg text-sm px-3 py-2 mb-2' });
-        for (const d of domains) sel.appendChild(el('option', { value: d }, d));
-        sel.value = domains.includes(getDomain()) ? getDomain() : domains[0];
-        const ta = this.textarea(Store.getDomain(sel.value).systemPrompt || '', (v) => { Store.getDomain(sel.value).systemPrompt = v; Store.saveDomains(); }, 3);
-        ta.placeholder = '(空欄でグローバル設定を使用)';
-        sel.addEventListener('change', () => { ta.value = Store.getDomain(sel.value).systemPrompt || ''; });
-        box.append(sel, ta);
-      }
+    sectionGlobalPrompt() {
+      const box = el('section', { class: 'space-y-2' });
+      box.append(Form.sectionTitle('グローバル システムプロンプト'));
+      box.append(el('p', { class: 'text-xs text-zinc-500' }, '全ドメインで共通して使われます。ドメインごとの上書きは「ドメイン」タブから行えます。'));
+      box.append(Form.textarea(Store.settings.globalSystemPrompt, (v) => { Store.settings.globalSystemPrompt = v; Store.saveSettings(); }, 5));
       return box;
     },
 
-    sectionTemplates() {
+    sectionGlobalTemplates() {
       const box = el('section', { class: 'space-y-2' });
-      box.append(this.sectionTitle('テンプレート (ドメイン別)'));
-      const host = getDomain();
-      const domain = Store.getDomain(host);
-      box.append(el('p', { class: 'text-xs text-zinc-500' }, `対象: ${host}`));
+      box.append(Form.sectionTitle('グローバル テンプレート'));
+      box.append(el('p', { class: 'text-xs text-zinc-500' }, '全ドメインのオーバーレイメニューから呼び出せるプロンプトです。ドメイン固有のテンプレートは「ドメイン」タブから設定できます。'));
+
+      Store.settings.globalTemplates = Store.settings.globalTemplates || [];
+      const tpls = Store.settings.globalTemplates;
 
       const list = el('div', { class: 'space-y-2' });
       const render = () => {
         clear(list);
-        for (const t of domain.templates) {
+        for (const t of tpls) {
           const row = el('div', { class: 'p-2 rounded-lg border border-zinc-200 dark:border-zinc-700 space-y-2' });
           const head = el('div', { class: 'flex gap-2' });
-          const nameInput = this.input(t.name || '', (v) => { t.name = v; Store.saveDomains(); }, { placeholder: '名前' });
-          const del = el('button', { class: 'w-9 h-9 rounded-lg text-zinc-500 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-900/30 flex items-center justify-center aicx-tap' });
+          head.append(
+            Form.iconPicker({ current: t.icon || 'template', onChange: async (v) => { t.icon = v; await Store.saveSettings(); } }),
+            Form.input(t.name || '', async (v) => { t.name = v; await Store.saveSettings(); }, { placeholder: '名前' })
+          );
+          const del = el('button', { class: 'w-9 h-9 shrink-0 rounded-lg text-zinc-500 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-900/30 flex items-center justify-center aicx-tap', type: 'button', 'aria-label': 'テンプレート削除' });
           del.appendChild(icon('trash', 'w-4 h-4'));
           del.addEventListener('click', async () => {
             if (await UI.confirm(`テンプレート「${t.name || ''}」を削除しますか?`)) {
-              domain.templates = domain.templates.filter((x) => x.id !== t.id);
-              await Store.saveDomains();
+              const idx = tpls.findIndex((x) => x.id === t.id);
+              if (idx >= 0) tpls.splice(idx, 1);
+              await Store.saveSettings();
               render();
             }
           });
-          head.append(nameInput, del);
-          const ta = this.textarea(t.prompt || '', (v) => { t.prompt = v; Store.saveDomains(); }, 3);
+          head.append(del);
+          const ta = Form.textarea(t.prompt || '', async (v) => { t.prompt = v; await Store.saveSettings(); }, 3);
           ta.placeholder = 'プロンプトテキスト';
           row.append(head, ta);
           list.append(row);
         }
-        if (!domain.templates.length) list.append(el('p', { class: 'text-xs text-zinc-500' }, 'テンプレートはまだありません。'));
+        if (!tpls.length) list.append(el('p', { class: 'text-xs text-zinc-500' }, 'テンプレートはまだありません。'));
       };
       render();
-      const addBtn = this.btn('+ テンプレートを追加', async () => {
-        domain.templates.push({ id: uid(), name: '新規テンプレート', prompt: '' });
-        await Store.saveDomains();
+      const addBtn = Form.btn('+ テンプレートを追加', async () => {
+        tpls.push({ id: uid(), icon: 'template', name: '新規テンプレート', prompt: '' });
+        await Store.saveSettings();
         render();
       }, 'bg-zinc-100 dark:bg-zinc-800 text-zinc-800 dark:text-zinc-100 w-full');
       box.append(list, addBtn);
       return box;
     },
 
-    sectionHistory() {
+    sectionDomains() {
       const box = el('section', { class: 'space-y-2' });
-      box.append(this.sectionTitle('会話履歴 (ドメイン別)'));
-      const domains = Object.keys(Store.domains).filter((d) => Store.domains[d].conversations && Store.domains[d].conversations.length).sort();
-      if (!domains.length) {
-        box.append(el('p', { class: 'text-xs text-zinc-500' }, '会話履歴はまだありません。'));
-        return box;
-      }
+      box.append(Form.sectionTitle('ドメイン別設定'));
+      box.append(el('p', { class: 'text-xs text-zinc-500' }, 'ドメインを選択すると、そのドメインのシステムプロンプト上書き・テンプレート・会話履歴を編集できます。'));
+
+      const current = getDomain();
+      const others = Object.keys(Store.domains).filter((d) => d !== current).sort();
+      const ordered = [current, ...others];
+
       const wrap = el('div', { class: 'divide-y divide-zinc-100 dark:divide-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg overflow-hidden' });
-      for (const d of domains) {
-        const dom = Store.domains[d];
-        const row = el('div', { class: 'flex items-center justify-between px-3 py-2 gap-2' });
-        row.append(el('div', { class: 'flex-1 min-w-0' }, [
-          el('div', { class: 'text-sm font-medium truncate' }, d),
-          el('div', { class: 'text-xs text-zinc-500' }, `${dom.conversations.length} 件`)
-        ]));
-        const view = this.btn('閲覧', () => { this.close(); location.host === d ? HistoryPanel.open() : this.openReadonly(d); }, 'bg-zinc-200 dark:bg-zinc-700 text-zinc-800 dark:text-zinc-100');
-        const del = el('button', { class: 'w-9 h-9 rounded-lg text-zinc-500 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-900/30 flex items-center justify-center aicx-tap' });
-        del.appendChild(icon('trash', 'w-4 h-4'));
-        del.addEventListener('click', async () => {
-          if (await UI.confirm(`${d} の全ての会話を削除しますか?`)) {
-            dom.conversations = [];
-            await Store.saveDomains();
-            row.remove();
-          }
+      for (const d of ordered) {
+        const dom = Store.domains[d] || {};
+        const convs = (dom.conversations || []).length;
+        const tpls = (dom.templates || []).length;
+        const hasPrompt = !!(dom.systemPrompt && String(dom.systemPrompt).trim());
+        const isCurrent = d === current;
+        const row = el('button', { class: 'w-full flex items-center gap-3 px-3 py-3 text-left hover:bg-zinc-50 dark:hover:bg-zinc-800/60 aicx-tap' });
+        const main = el('div', { class: 'flex-1 min-w-0' });
+        const nameRow = el('div', { class: 'text-sm font-medium truncate flex items-center gap-2' });
+        nameRow.append(el('span', { class: 'truncate' }, d));
+        if (isCurrent) nameRow.append(el('span', { class: 'text-[10px] px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-900 text-indigo-700 dark:text-indigo-300 shrink-0' }, '現在'));
+        const bits = [];
+        if (convs) bits.push(`${convs} 件の会話`);
+        if (tpls) bits.push(`${tpls} テンプレート`);
+        if (hasPrompt) bits.push('プロンプト上書き');
+        main.append(nameRow, el('div', { class: 'text-xs text-zinc-500 truncate' }, bits.length ? bits.join(' · ') : '未設定'));
+        row.append(main, el('span', { class: 'text-zinc-400 text-lg leading-none' }, '›'));
+        row.addEventListener('click', () => {
+          this.close();
+          DomainPanel.open(d, () => this.open());
         });
-        row.append(view, del);
         wrap.append(row);
       }
       box.append(wrap);
       return box;
     },
 
-    openReadonly(domain) {
-      const dom = Store.domains[domain];
-      const panel = el('div', { class: 'fixed inset-0 aicx-panel aicx-enter-fade flex items-end sm:items-stretch justify-center', style: { zIndex: 40 } });
-      const overlay = el('div', { class: 'absolute inset-0 bg-black/40' });
-      overlay.addEventListener('click', () => panel.remove());
-      const sheet = el('div', {
-        class: 'relative bg-white dark:bg-zinc-900 w-full sm:max-w-md sm:mx-auto sm:my-4 sm:rounded-2xl rounded-t-2xl shadow-2xl flex flex-col aicx-enter-sheet aicx-full sm:h-[calc(100dvh-2rem)] overflow-hidden'
-      });
-      const header = el('div', { class: 'shrink-0 px-4 py-3 border-b border-zinc-200 dark:border-zinc-800 flex items-center gap-2' });
-      const close = el('button', { class: 'w-9 h-9 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 flex items-center justify-center' });
-      close.appendChild(icon('close'));
-      close.addEventListener('click', () => panel.remove());
-      header.append(el('div', { class: 'flex-1 text-sm font-semibold truncate' }, domain), close);
-      const list = el('div', { class: 'flex-1 aicx-scroll overflow-y-auto divide-y divide-zinc-100 dark:divide-zinc-800' });
-      for (const c of dom.conversations) {
-        const row = el('div', { class: 'p-3' });
-        row.append(
-          el('div', { class: 'text-sm font-medium truncate' }, c.title || '(無題)'),
-          el('div', { class: 'text-xs text-zinc-500' }, `${fmtDate(c.updatedAt || c.createdAt)} · ${c.messages.filter((m) => m.role !== 'system').length} msg`)
-        );
-        const actions = el('div', { class: 'flex gap-2 mt-2' });
-        const del = this.btn('削除', async () => {
-          if (await UI.confirm('この会話を削除しますか?')) {
-            dom.conversations = dom.conversations.filter((x) => x.id !== c.id);
-            await Store.saveDomains();
-            row.remove();
-          }
-        }, 'bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-300');
-        actions.append(del);
-        row.append(actions);
-        list.append(row);
-      }
-      sheet.append(header, list);
-      panel.append(overlay, sheet);
-      UI.root.appendChild(panel);
-    },
-
     sectionBackup() {
       const box = el('section', { class: 'space-y-3' });
-      box.append(this.sectionTitle('Google Drive バックアップ'));
+      box.append(Form.sectionTitle('Google Drive バックアップ'));
 
       const info = el('div', { class: 'text-xs text-zinc-500 space-y-1' });
       info.append(el('p', {}, '設定と会話履歴を Google Drive の「App Data」領域に保存します。'));
@@ -1483,8 +1833,8 @@
       info.append(el('p', {}, '3. 下のフィールドにクライアント ID を貼り付け、「接続」を押す。'));
       box.append(info);
 
-      box.append(this.label('OAuth クライアント ID'));
-      box.append(this.input(Store.settings.driveClientId, (v) => { Store.settings.driveClientId = v.trim(); Store.saveSettings(); }, { placeholder: 'xxxxx.apps.googleusercontent.com' }));
+      box.append(Form.label('OAuth クライアント ID'));
+      box.append(Form.input(Store.settings.driveClientId, (v) => { Store.settings.driveClientId = v.trim(); Store.saveSettings(); }, { placeholder: 'xxxxx.apps.googleusercontent.com' }));
 
       const statusLine = el('div', { class: 'text-xs' });
       const updateStatus = () => {
@@ -1499,21 +1849,21 @@
       box.append(statusLine);
 
       const row = el('div', { class: 'flex flex-wrap gap-2' });
-      row.append(this.btn('接続', async () => {
+      row.append(Form.btn('接続', async () => {
         if (!Store.settings.driveClientId) { UI.toast('クライアント ID を入力してください', 'error'); return; }
         if (!await UI.confirm('Google 認証のため現在のページを離れます。入力中のフォーム等があれば保存してください。続行しますか?')) return;
         try { Drive.startOAuth(Store.settings.driveClientId); } catch (e) { UI.toast(e.message, 'error'); }
       }));
-      row.append(this.btn('今すぐバックアップ', async () => {
+      row.append(Form.btn('今すぐバックアップ', async () => {
         try { await Drive.upload(); UI.toast('バックアップしました', 'success'); updateStatus(); }
         catch (e) { UI.toast(e.message, 'error'); }
       }, 'bg-emerald-600 text-white'));
-      row.append(this.btn('Drive から復元', async () => {
+      row.append(Form.btn('Drive から復元', async () => {
         if (!await UI.confirm('現在の設定/履歴を上書きします。続行しますか?')) return;
         try { await Drive.download(); UI.toast('復元しました', 'success'); this.close(); this.open(); }
         catch (e) { UI.toast(e.message, 'error'); }
       }, 'bg-zinc-200 dark:bg-zinc-700 text-zinc-800 dark:text-zinc-100'));
-      row.append(this.btn('切断', async () => { await Drive.signOut(); updateStatus(); }, 'bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200'));
+      row.append(Form.btn('切断', async () => { await Drive.signOut(); updateStatus(); }, 'bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200'));
       box.append(row);
 
       const autoWrap = el('label', { class: 'flex items-center gap-2 text-sm' });
@@ -1528,7 +1878,7 @@
 
     sectionTheme() {
       const box = el('section', { class: 'space-y-2' });
-      box.append(this.sectionTitle('テーマ'));
+      box.append(Form.sectionTitle('テーマ'));
       const row = el('div', { class: 'flex gap-2' });
       const rerender = () => {
         clear(row);
@@ -1546,8 +1896,170 @@
 
     sectionAbout() {
       const box = el('section', { class: 'space-y-1' });
-      box.append(this.sectionTitle('情報'));
+      box.append(Form.sectionTitle('情報'));
       box.append(el('p', { class: 'text-xs text-zinc-500' }, 'AI Chat Overlay v0.1.0 · Tailwind CSS · Gemini API · Google Drive'));
+      return box;
+    }
+  };
+
+  // =========================================================================
+  // 15.5 DomainPanel — per-domain settings (opened from SettingsPanel)
+  // =========================================================================
+  const DomainPanel = {
+    panel: null,
+    returnTo: null,
+    open(host, returnTo) {
+      this.close();
+      this.returnTo = returnTo || null;
+
+      // Header: back arrow + domain title
+      const back = el('button', { class: 'w-9 h-9 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 flex items-center justify-center aicx-tap', 'aria-label': '戻る' });
+      back.appendChild(icon('back'));
+      back.addEventListener('click', () => this.close());
+      const title = el('div', { class: 'flex-1 min-w-0' }, [
+        el('div', { class: 'text-[11px] text-zinc-500 dark:text-zinc-400' }, 'ドメイン設定'),
+        el('div', { class: 'text-sm font-semibold truncate' }, host)
+      ]);
+
+      const { panel, body } = Form.sheet({
+        leading: back,
+        title,
+        onBack: () => this.close()
+      });
+
+      body.append(
+        this.sectionPrompt(host),
+        this.sectionTemplates(host),
+        this.sectionConversations(host),
+        this.sectionDanger(host)
+      );
+
+      UI.root.appendChild(panel);
+      this.panel = panel;
+    },
+    close() {
+      if (this.panel) { this.panel.remove(); this.panel = null; }
+      const cb = this.returnTo; this.returnTo = null;
+      if (cb) cb();
+    },
+
+    sectionPrompt(host) {
+      const box = el('section', { class: 'space-y-2' });
+      box.append(Form.sectionTitle('システムプロンプト上書き'));
+      box.append(el('p', { class: 'text-xs text-zinc-500' }, '空欄の場合はグローバル設定が使われます。'));
+      const dom = Store.getDomain(host);
+      const ta = Form.textarea(dom.systemPrompt || '', async (v) => { dom.systemPrompt = v; await Store.saveDomains(); }, 4);
+      ta.placeholder = '(空欄でグローバル設定を使用)';
+      box.append(ta);
+      return box;
+    },
+
+    sectionTemplates(host) {
+      const box = el('section', { class: 'space-y-2' });
+      box.append(Form.sectionTitle('テンプレート'));
+      box.append(el('p', { class: 'text-xs text-zinc-500' }, 'オーバーレイメニューから呼び出せるプロンプトです。'));
+      const dom = Store.getDomain(host);
+      const list = el('div', { class: 'space-y-2' });
+      const render = () => {
+        clear(list);
+        for (const t of dom.templates) {
+          const row = el('div', { class: 'p-2 rounded-lg border border-zinc-200 dark:border-zinc-700 space-y-2' });
+          const head = el('div', { class: 'flex gap-2' });
+          head.append(
+            Form.iconPicker({ current: t.icon || 'template', onChange: async (v) => { t.icon = v; await Store.saveDomains(); } }),
+            Form.input(t.name || '', async (v) => { t.name = v; await Store.saveDomains(); }, { placeholder: '名前' })
+          );
+          const del = el('button', { class: 'w-9 h-9 shrink-0 rounded-lg text-zinc-500 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-900/30 flex items-center justify-center aicx-tap', type: 'button', 'aria-label': 'テンプレート削除' });
+          del.appendChild(icon('trash', 'w-4 h-4'));
+          del.addEventListener('click', async () => {
+            if (await UI.confirm(`テンプレート「${t.name || ''}」を削除しますか?`)) {
+              dom.templates = dom.templates.filter((x) => x.id !== t.id);
+              await Store.saveDomains();
+              render();
+            }
+          });
+          head.append(del);
+          const ta = Form.textarea(t.prompt || '', async (v) => { t.prompt = v; await Store.saveDomains(); }, 3);
+          ta.placeholder = 'プロンプトテキスト';
+          row.append(head, ta);
+          list.append(row);
+        }
+        if (!dom.templates.length) list.append(el('p', { class: 'text-xs text-zinc-500' }, 'テンプレートはまだありません。'));
+      };
+      render();
+      const addBtn = Form.btn('+ テンプレートを追加', async () => {
+        dom.templates.push({ id: uid(), icon: 'template', name: '新規テンプレート', prompt: '' });
+        await Store.saveDomains();
+        render();
+      }, 'bg-zinc-100 dark:bg-zinc-800 text-zinc-800 dark:text-zinc-100 w-full');
+      box.append(list, addBtn);
+      return box;
+    },
+
+    sectionConversations(host) {
+      const box = el('section', { class: 'space-y-2' });
+      box.append(Form.sectionTitle('会話履歴'));
+      const dom = Store.getDomain(host);
+      const list = el('div', { class: 'divide-y divide-zinc-100 dark:divide-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg overflow-hidden' });
+      const render = () => {
+        clear(list);
+        if (!dom.conversations.length) {
+          list.append(el('p', { class: 'text-xs text-zinc-500 p-3' }, 'このドメインでの会話はまだありません。'));
+          return;
+        }
+        for (const c of dom.conversations) {
+          const row = el('div', { class: 'flex items-start gap-2 p-3' });
+          const main = el('div', { class: 'flex-1 min-w-0' });
+          const preview = (c.messages.find((m) => m.role === 'user') || {}).content || '';
+          main.append(
+            el('div', { class: 'text-sm font-medium truncate' }, c.title || preview.slice(0, 50) || '(無題)'),
+            el('div', { class: 'text-xs text-zinc-500 truncate' }, `${fmtDate(c.updatedAt || c.createdAt)} · ${c.messages.filter((m) => m.role !== 'system').length} msg`)
+          );
+          if (preview && preview !== c.title) {
+            main.append(el('div', { class: 'text-xs text-zinc-400 dark:text-zinc-500 mt-1 line-clamp-2 break-words' }, preview.slice(0, 160)));
+          }
+          const actions = el('div', { class: 'flex flex-col gap-1 shrink-0' });
+          if (host === getDomain()) {
+            const open = el('button', { class: 'w-8 h-8 rounded-lg text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800 flex items-center justify-center aicx-tap', 'aria-label': '会話を開く', title: '会話を開く' });
+            open.appendChild(icon('chat', 'w-4 h-4'));
+            open.addEventListener('click', () => {
+              this.returnTo = null; // don't reopen settings after opening chat
+              this.close();
+              SettingsPanel.close();
+              ChatPanel.open({ conversationId: c.id });
+            });
+            actions.append(open);
+          }
+          const del = el('button', { class: 'w-8 h-8 rounded-lg text-zinc-400 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-900/30 flex items-center justify-center aicx-tap', 'aria-label': '削除' });
+          del.appendChild(icon('trash', 'w-4 h-4'));
+          del.addEventListener('click', async () => {
+            if (await UI.confirm('この会話を削除しますか?')) {
+              dom.conversations = dom.conversations.filter((x) => x.id !== c.id);
+              await Store.saveDomains();
+              render();
+            }
+          });
+          actions.append(del);
+          row.append(main, actions);
+          list.append(row);
+        }
+      };
+      render();
+      box.append(list);
+      return box;
+    },
+
+    sectionDanger(host) {
+      const box = el('section', { class: 'space-y-2' });
+      box.append(Form.sectionTitle('危険な操作'));
+      const btn = Form.btn('このドメインの全データを削除', async () => {
+        if (!await UI.confirm(`${host} の会話・テンプレート・プロンプト設定を全て削除します。続行しますか?`)) return;
+        delete Store.domains[host];
+        await Store.saveDomains();
+        UI.toast('削除しました', 'success');
+        this.close();
+      }, 'bg-red-600 text-white w-full');
+      box.append(btn);
       return box;
     }
   };
