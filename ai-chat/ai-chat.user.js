@@ -445,11 +445,16 @@
     ].join(','),
     MAX_TEXT: 20000,
 
-    snapshot() {
+    async snapshot() {
       const selection = (window.getSelection && String(window.getSelection())) || '';
       const title = document.title || '';
       const metaDesc = (document.querySelector('meta[name="description"]') || {}).content || '';
       const url = location.href;
+
+      // Prime (once) the raw-HTML cache used to recover tweet embeds that
+      // got replaced by cross-origin iframes. Await here so the first
+      // snapshot already includes tweets; subsequent calls hit the cache.
+      await this.primeRawDoc();
 
       const mode = Store.resolvePageExtractMode();
       let text = '';
@@ -477,6 +482,71 @@
       return { url, title, metaDesc, selection: selection.slice(0, 4000), text, mode: effectiveMode };
     },
 
+    // Fetch the current page as raw HTML and parse it into a detached
+    // Document we can query later. Used to recover text from embeds
+    // (e.g. <blockquote class="twitter-tweet">) that were swapped out for
+    // cross-origin iframes by third-party widget scripts. Idempotent.
+    _rawDocPromise: null,
+    _rawDoc: null,
+    _tweetMap: null,
+    primeRawDoc() {
+      if (this._rawDocPromise) return this._rawDocPromise;
+      this._rawDocPromise = (async () => {
+        try {
+          const res = await fetch(location.href, { credentials: 'include', cache: 'force-cache' });
+          const buf = await res.arrayBuffer();
+          // Honour the page's character set (EUC-JP / Shift_JIS / UTF-8, ...);
+          // fetch().text() assumes UTF-8 and mojibakes non-UTF-8 pages.
+          const charset = (document.characterSet || 'utf-8').toLowerCase();
+          let decoded;
+          try { decoded = new TextDecoder(charset).decode(buf); }
+          catch { decoded = new TextDecoder('utf-8').decode(buf); }
+          this._rawDoc = new DOMParser().parseFromString(decoded, 'text/html');
+          this._buildTweetMap();
+        } catch (e) {
+          // Best-effort enhancement — silent failure is fine.
+        }
+      })();
+      return this._rawDocPromise;
+    },
+
+    // Build a `tweetId → text` map from the cached raw doc. Each tweet's ID
+    // comes from the status URL inside its <blockquote class="twitter-tweet">;
+    // the same ID sits on the iframe's data-tweet-id in the live DOM, which
+    // is how we later match them up for in-place replacement.
+    _buildTweetMap() {
+      this._tweetMap = new Map();
+      if (!this._rawDoc) return;
+      for (const bq of this._rawDoc.querySelectorAll('blockquote.twitter-tweet')) {
+        const link = [...bq.querySelectorAll('a[href]')]
+          .find((a) => /(?:twitter|x)\.com\/[^/]+\/status\/\d+/.test(a.href));
+        const m = link && link.href.match(/status\/(\d+)/);
+        if (!m) continue;
+        const text = (bq.textContent || '').replace(/\s+/g, ' ').trim();
+        if (text.length >= 10) this._tweetMap.set(m[1], text);
+      }
+    },
+
+    // Replace rendered Twitter embed wrappers inside a clone with a div
+    // containing the tweet's text, preserving the position in the document
+    // so the embed reads inline with surrounding article content instead
+    // of being appended at the end.
+    _inlineEmbeds(clone) {
+      if (!clone || !clone.querySelectorAll) return;
+      if (!this._tweetMap || !this._tweetMap.size) return;
+      for (const wrapper of clone.querySelectorAll('.twitter-tweet-rendered')) {
+        const iframe = wrapper.querySelector('iframe[data-tweet-id]');
+        const id = iframe && iframe.getAttribute('data-tweet-id');
+        const text = id && this._tweetMap.get(id);
+        if (!text) continue;
+        const replacement = clone.ownerDocument.createElement('div');
+        // Surround with blank lines so paragraph splitters in downstream
+        // merge logic treat the embed as its own block.
+        replacement.textContent = '\n[X/Twitter embed] ' + text + '\n';
+        wrapper.replaceWith(replacement);
+      }
+    },
+
     // Remove the overlay's own DOM from a cloned tree so the chat UI text
     // (user messages, assistant replies, settings labels, etc.) doesn't get
     // fed back into itself as "page context". Without this, typing into the
@@ -494,6 +564,7 @@
         if (typeof Readability === 'undefined') return '';
         const docClone = document.cloneNode(true);
         this._stripSelf(docClone);
+        this._inlineEmbeds(docClone);
         const article = new Readability(docClone).parse();
         if (!article) return '';
         const t = (article.textContent || '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
@@ -520,6 +591,7 @@
       if (!root) return '';
       const clone = root.cloneNode(true);
       this._stripSelf(clone);
+      this._inlineEmbeds(clone);
       clone.querySelectorAll(this.BASE_STRIP).forEach((n) => n.remove());
       if (stripLevel === 'clean') clone.querySelectorAll(this.CHROME_STRIP).forEach((n) => n.remove());
       else if (stripLevel === 'permissive') clone.querySelectorAll(this.CHROME_STRIP_PERMISSIVE).forEach((n) => n.remove());
@@ -1465,10 +1537,10 @@
       });
     },
 
-    showContextPreview() {
+    async showContextPreview() {
       let snap;
       try {
-        snap = Page.snapshot();
+        snap = await Page.snapshot();
       } catch (e) {
         UI.toast('コンテキストの取得に失敗しました: ' + (e && e.message || e), 'error');
         return;
@@ -1673,7 +1745,7 @@
 
       // Build message list for API
       const apiMessages = [];
-      const snap = Page.snapshot();
+      const snap = await Page.snapshot();
       if (firstMessage) {
         apiMessages.push({ role: 'user', content: Page.formatForPrompt(snap) });
         apiMessages.push({ role: 'assistant', content: '(context received)' });
@@ -2511,6 +2583,10 @@
     await TailwindBoot.load().catch((e) => console.warn('[aicx] Tailwind load failed:', e));
     UI.init();
     OverlayButton.init();
+    // Prefetch raw HTML in the background so embed recovery (Twitter/X etc.)
+    // is ready by the time the user sends their first message. Fire-and-
+    // forget; snapshot() will also await this promise if still pending.
+    Page.primeRawDoc();
   }
 
   if (document.readyState === 'loading') {
