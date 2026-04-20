@@ -424,12 +424,23 @@
     // Base strip list — tags whose visible text is either noise or unparseable
     // regardless of extraction mode.
     BASE_STRIP: 'script,style,noscript,svg,iframe,video,audio,canvas,template',
-    // Additional selectors for 'clean' mode: chrome elements whose text is
-    // almost always navigation / boilerplate, plus elements the page has
-    // declared as hidden via aria/hidden.
+    // Strict chrome strip for 'clean' mode: removes navigation/boilerplate
+    // plus <aside>/<footer>/complementary roles. Note this also strips
+    // comment widgets on sites (e.g. Yahoo News) that wrap comments in
+    // <aside>; users who want comments should pick 'auto' mode which uses
+    // the permissive strip below.
     CHROME_STRIP: [
       'header', 'footer', 'nav', 'aside',
       '[role="navigation"]', '[role="banner"]', '[role="contentinfo"]', '[role="complementary"]', '[role="search"]',
+      '[aria-hidden="true"]', '[hidden]'
+    ].join(','),
+    // Permissive chrome strip for 'auto' mode's heuristic supplement:
+    // keeps <aside>, <footer>, and complementary roles so comments and
+    // related-content sections (which frequently live there) survive. Only
+    // strips clear site chrome + aria-hidden.
+    CHROME_STRIP_PERMISSIVE: [
+      'header', 'nav',
+      '[role="navigation"]', '[role="banner"]', '[role="search"]',
       '[aria-hidden="true"]', '[hidden]'
     ].join(','),
     MAX_TEXT: 20000,
@@ -445,12 +456,21 @@
       let effectiveMode = mode;
 
       if (mode === 'auto') {
-        text = this._extractReadability();
-        if (!text) { effectiveMode = 'clean'; text = this._extractHeuristic(true); }
+        // Permissive heuristic from <main> as primary — this captures the
+        // article body plus side content (comments, related articles) that
+        // Readability aggressively strips. Readability is used only as a
+        // supplement: if it produces text not already in the heuristic,
+        // that extra text is appended. On news sites like Yahoo, Readability
+        // often misfires and picks a sidebar widget as the "article", so
+        // using it as primary is unreliable.
+        const heurText = this._extractHeuristic('permissive', true);
+        const readText = this._extractReadability();
+        text = this._mergeAutoTexts(heurText, readText);
+        if (!text) { effectiveMode = 'clean'; text = this._extractHeuristic('clean'); }
       } else if (mode === 'clean') {
-        text = this._extractHeuristic(true);
+        text = this._extractHeuristic('clean');
       } else {
-        text = this._extractHeuristic(false);
+        text = this._extractHeuristic('raw');
       }
 
       if (text.length > this.MAX_TEXT) text = text.slice(0, this.MAX_TEXT) + '\n...[truncated]';
@@ -486,16 +506,50 @@
       }
     },
 
-    // Heuristic extraction. When `stripChrome` is true, also removes
-    // header/nav/footer/aside/aria-hidden/hidden elements.
-    _extractHeuristic(stripChrome) {
-      const root = document.querySelector('article') || document.querySelector('main') || document.body;
+    // Heuristic extraction.
+    //   stripLevel: 'clean' | 'permissive' | 'raw'
+    //   preferMain: when true, pick <main> first (gets article + comments +
+    //     related), then fall back to <article>. Default false keeps the old
+    //     article-first behavior for 'clean' / 'raw' modes.
+    _extractHeuristic(stripLevel, preferMain) {
+      const article = document.querySelector('article');
+      const main = document.querySelector('main');
+      const root = preferMain
+        ? (main || article || document.body)
+        : (article || main || document.body);
       if (!root) return '';
       const clone = root.cloneNode(true);
       this._stripSelf(clone);
       clone.querySelectorAll(this.BASE_STRIP).forEach((n) => n.remove());
-      if (stripChrome) clone.querySelectorAll(this.CHROME_STRIP).forEach((n) => n.remove());
+      if (stripLevel === 'clean') clone.querySelectorAll(this.CHROME_STRIP).forEach((n) => n.remove());
+      else if (stripLevel === 'permissive') clone.querySelectorAll(this.CHROME_STRIP_PERMISSIVE).forEach((n) => n.remove());
       return (clone.innerText || '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+    },
+
+    // Merge a primary text (typically permissive heuristic from <main>) with
+    // a secondary text (typically Readability). Paragraphs from secondary
+    // that are already contained in primary are skipped; genuinely new
+    // paragraphs get appended under a separator. This lets auto mode fall
+    // back gracefully when Readability misfires — the primary already has
+    // the article + side content, and the secondary only contributes when
+    // it found something primary missed.
+    _mergeAutoTexts(primary, secondary) {
+      if (!primary) return secondary || '';
+      if (!secondary) return primary;
+
+      const primCondensed = primary.replace(/\s+/g, '');
+      const sigOf = (s) => s.slice(0, Math.min(50, s.length));
+      const extras = [];
+      for (const para of secondary.split(/\n{2,}/)) {
+        const cond = para.replace(/\s+/g, '');
+        if (!cond) continue;
+        const needle = sigOf(cond);
+        if (needle.length >= 10 && primCondensed.includes(needle)) continue;
+        extras.push(para);
+      }
+      const extra = extras.join('\n\n').trim();
+      if (!extra) return primary;
+      return primary + '\n\n---\n\n' + extra;
     },
 
     formatForPrompt(snap) {
