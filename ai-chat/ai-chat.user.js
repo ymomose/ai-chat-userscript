@@ -602,6 +602,16 @@
 :where(#aicx-root input, #aicx-root textarea, #aicx-root select) {
   border-radius: 8px; padding: 8px 10px;
 }
+/* Prevent iOS Safari auto-zoom on focus: font-size must be >= 16px.
+   Scoped to touch devices so desktop layout is unaffected. Uses #aicx-root
+   prefix (specificity 1,0,1) so it beats Tailwind's .text-sm / .text-xs. */
+@media (hover: none) and (pointer: coarse) {
+  #aicx-root input,
+  #aicx-root textarea,
+  #aicx-root select {
+    font-size: 16px;
+  }
+}
 :where(#aicx-root button) { cursor: pointer; touch-action: manipulation; }
 :where(#aicx-root img) { max-width: 100%; height: auto; display: block; }
 :where(#aicx-root svg) { display: inline-block; vertical-align: middle; }
