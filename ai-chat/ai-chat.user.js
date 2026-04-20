@@ -1251,7 +1251,25 @@
       const header = el('div', { class: 'shrink-0 px-4 pb-3 border-b border-zinc-200 dark:border-zinc-800 flex items-center gap-1' });
       const title = el('div', { class: 'flex-1 min-w-0 mr-2' });
       const titleTop = el('div', { class: 'text-sm font-semibold truncate' }, (conv && conv.title) || '新しい会話');
-      const titleSub = el('div', { class: 'text-[11px] text-zinc-500 dark:text-zinc-400 truncate' }, `${host} · ${Store.settings.model || '(モデル未選択)'}`);
+      const titleSub = el('div', { class: 'text-[11px] text-zinc-500 dark:text-zinc-400 flex items-center gap-1 min-w-0' });
+      // Rebuild the subtitle from the stored pageUrl/pageTitle on the conv
+      // (set at first-send time) so reopening a stored conversation on a
+      // different page still shows the page it was originally about.
+      const updateTitleSub = () => {
+        clear(titleSub);
+        const pageUrl = (this.conv && this.conv.pageUrl) || location.href;
+        const pageTitle = (this.conv && this.conv.pageTitle) || document.title || pageUrl;
+        const link = el('a', {
+          href: pageUrl, target: '_blank', rel: 'noopener noreferrer',
+          class: 'truncate hover:underline text-zinc-600 dark:text-zinc-300 min-w-0',
+          title: pageUrl
+        }, pageTitle);
+        link.addEventListener('click', (e) => e.stopPropagation());
+        const tail = el('span', { class: 'shrink-0 text-zinc-500 dark:text-zinc-400' },
+          ` · ${Store.settings.model || '(モデル未選択)'}`);
+        titleSub.append(link, tail);
+      };
+      updateTitleSub();
       title.append(titleTop, titleSub);
 
       const btnNewChat = el('button', { class: 'w-9 h-9 shrink-0 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 flex items-center justify-center aicx-tap', 'aria-label': '新規チャット', title: '新規チャット' });
@@ -1354,7 +1372,7 @@
       UI.root.appendChild(panel);
       this.panel = panel;
       this.sheet = sheet;
-      this.els = { list, ta, btnSend, btnStop, attBar, titleTop };
+      this.els = { list, ta, btnSend, btnStop, attBar, titleTop, updateTitleSub };
 
       // Render initial messages
       this.render();
@@ -1617,8 +1635,15 @@
       if (!text && atts.length === 0) return;
       if (!Store.settings.apiKey) { UI.toast('API キーを設定してください', 'error'); SettingsPanel.open(); return; }
 
-      // Lazily create the conversation on first send
-      if (!this.conv) this.conv = Store.newConversation(this.host);
+      // Lazily create the conversation on first send, snapshotting the page
+      // URL/title at creation time so the chat header keeps showing the
+      // original page even after navigation or when reopened from history.
+      if (!this.conv) {
+        this.conv = Store.newConversation(this.host);
+        this.conv.pageUrl = location.href;
+        this.conv.pageTitle = document.title || '';
+        if (this.els && this.els.updateTitleSub) this.els.updateTitleSub();
+      }
 
       // Snapshot locals so this run isn't affected if user closes/opens another panel mid-stream
       const host = this.host;
