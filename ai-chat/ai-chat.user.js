@@ -806,10 +806,57 @@
       // initial CSS generation with our config.
       try {
         if (window.tailwind) {
+          // Replace Tailwind's default rem-based scales with em-based ones.
+          // Rationale: `rem` resolves against the host page's <html>
+          // font-size. When a site sets `html { font-size: 10px !important }`
+          // (common reset pattern), every w-*/h-*/p-*/rounded-* utility
+          // inside our overlay shrinks with it — e.g. a w-4 icon becomes
+          // 10px instead of 16px. `em` resolves against the element's own
+          // font-size, which we pin to 14px at #aicx-root (and enforce on
+          // text-* utilities below), so em values are immune to host CSS.
+          const emSpacing = {
+            '0': '0px', 'px': '1px',
+            '0.5': '0.125em', '1': '0.25em', '1.5': '0.375em', '2': '0.5em',
+            '2.5': '0.625em', '3': '0.75em', '3.5': '0.875em', '4': '1em',
+            '5': '1.25em', '6': '1.5em', '7': '1.75em', '8': '2em',
+            '9': '2.25em', '10': '2.5em', '11': '2.75em', '12': '3em',
+            '14': '3.5em', '16': '4em', '20': '5em', '24': '6em',
+            '28': '7em', '32': '8em', '36': '9em', '40': '10em',
+            '44': '11em', '48': '12em', '52': '13em', '56': '14em',
+            '60': '15em', '64': '16em', '72': '18em', '80': '20em', '96': '24em'
+          };
           window.tailwind.config = {
             darkMode: 'class',
             corePlugins: { preflight: false },
             theme: {
+              spacing: emSpacing,
+              borderRadius: {
+                'none': '0px',
+                'sm': '0.125em',
+                DEFAULT: '0.25em',
+                'md': '0.375em',
+                'lg': '0.5em',
+                'xl': '0.75em',
+                '2xl': '1em',
+                '3xl': '1.5em',
+                'full': '9999px'
+              },
+              fontSize: {
+                'xs':   ['0.75em',  { lineHeight: '1em' }],
+                'sm':   ['0.875em', { lineHeight: '1.25em' }],
+                'base': ['1em',     { lineHeight: '1.5em' }],
+                'lg':   ['1.125em', { lineHeight: '1.75em' }],
+                'xl':   ['1.25em',  { lineHeight: '1.75em' }],
+                '2xl':  ['1.5em',   { lineHeight: '2em' }],
+                '3xl':  ['1.875em', { lineHeight: '2.25em' }],
+                '4xl':  ['2.25em',  { lineHeight: '2.5em' }]
+              },
+              lineHeight: {
+                'none': '1', 'tight': '1.25', 'snug': '1.375',
+                'normal': '1.5', 'relaxed': '1.625', 'loose': '2',
+                '3': '0.75em', '4': '1em', '5': '1.25em', '6': '1.5em',
+                '7': '1.75em', '8': '2em', '9': '2.25em', '10': '2.5em'
+              },
               extend: {
                 fontFamily: {
                   sans: ['system-ui', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Helvetica', 'Arial', 'sans-serif'],
@@ -1310,7 +1357,7 @@
 
       const row = (iconName, label, onClick, extra='') => {
         const b = el('button', { class: `w-full flex items-center gap-3 px-4 py-3 text-left text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800 aicx-tap ${extra}`, type: 'button' });
-        b.append(icon(iconName, 'w-4 h-4 text-zinc-500'), el('span', { class: 'flex-1 truncate' }, label));
+        b.append(icon(iconName, 'w-5 h-5 text-zinc-500'), el('span', { class: 'flex-1 truncate' }, label));
         b.addEventListener('click', () => { this.closeMenu(); onClick(); });
         return b;
       };
@@ -2025,7 +2072,7 @@
       overlay.addEventListener('click', () => this.close());
 
       const sheet = el('div', {
-        class: 'relative bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 w-full sm:max-w-md sm:mx-auto sm:my-4 sm:rounded-2xl rounded-t-2xl shadow-2xl flex flex-col aicx-enter-sheet aicx-full sm:h-[calc(100dvh-2rem)] overflow-hidden',
+        class: 'relative bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 w-full sm:max-w-md sm:mx-auto sm:my-4 sm:rounded-2xl rounded-t-2xl shadow-2xl flex flex-col aicx-enter-sheet aicx-full sm:h-[calc(100dvh-2em)] overflow-hidden',
         style: { paddingBottom: 'env(safe-area-inset-bottom, 0px)' }
       });
 
@@ -2182,7 +2229,7 @@
       const overlay = el('div', { class: 'absolute inset-0 bg-black/30' });
       overlay.addEventListener('click', () => { (onBack || onClose || (() => panel.remove()))(); });
       const sheet = el('div', {
-        class: `relative bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 w-full ${maxWidth} sm:mx-auto sm:my-4 sm:rounded-2xl rounded-t-2xl shadow-2xl flex flex-col aicx-enter-sheet aicx-full sm:h-[calc(100dvh-2rem)] overflow-hidden`,
+        class: `relative bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 w-full ${maxWidth} sm:mx-auto sm:my-4 sm:rounded-2xl rounded-t-2xl shadow-2xl flex flex-col aicx-enter-sheet aicx-full sm:h-[calc(100dvh-2em)] overflow-hidden`,
         style: { paddingBottom: 'env(safe-area-inset-bottom, 0px)' }
       });
       const header = el('div', { class: 'shrink-0 px-4 py-3 border-b border-zinc-200 dark:border-zinc-800 flex items-center gap-2' });
