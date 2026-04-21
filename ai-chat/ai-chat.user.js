@@ -631,9 +631,59 @@
         `Title: ${snap.title}`
       ];
       if (snap.metaDesc) parts.push(`Description: ${snap.metaDesc}`);
-      if (snap.selection) parts.push(`\nSelected text:\n"""\n${snap.selection}\n"""`);
+      // Selection is intentionally NOT included here; it is attached per-message
+      // to `userMsg.selection` (see ChatPanel.send) so every message the user
+      // sends can carry its own highlighted excerpt, and so the quoted text
+      // appears visibly in the chat bubble.
       if (snap.text) parts.push(`\nPage text:\n"""\n${snap.text}\n"""`);
       return parts.join('\n');
+    }
+  };
+
+  // =========================================================================
+  // 6b. Page selection tracker
+  // =========================================================================
+  // Tracks the user's most recent non-empty text selection made *outside* the
+  // overlay UI, so ChatPanel.send() can attach it to the outgoing message as
+  // highlighted context. We listen on `selectionchange` instead of reading
+  // `window.getSelection()` at send-time because focusing the composer
+  // textarea on mobile typically collapses the page selection before send()
+  // runs.
+  const Selection = {
+    _last: '',
+    _listeners: new Set(),
+    init() {
+      const onChange = () => {
+        try {
+          const sel = window.getSelection && window.getSelection();
+          if (!sel) return;
+          const text = String(sel);
+          // Empty selections fire on focus/caret moves — don't clobber the
+          // stored page selection just because the user tapped into a field.
+          if (!text) return;
+          const node = sel.anchorNode;
+          const anchor = node && (node.nodeType === 3 ? node.parentNode : node);
+          if (anchor && UI.rootEl && UI.rootEl.contains(anchor)) return;
+          const next = text.slice(0, 4000);
+          if (next === this._last) return;
+          this._last = next;
+          this._notify();
+        } catch {}
+      };
+      document.addEventListener('selectionchange', onChange);
+    },
+    get() { return this._last; },
+    clear() {
+      if (!this._last) return;
+      this._last = '';
+      this._notify();
+    },
+    subscribe(fn) {
+      this._listeners.add(fn);
+      return () => this._listeners.delete(fn);
+    },
+    _notify() {
+      for (const fn of this._listeners) { try { fn(this._last); } catch {} }
     }
   };
 
@@ -1363,6 +1413,7 @@
 
       // Composer: textarea on top, button row below
       const composer = el('div', { class: 'shrink-0 border-t border-zinc-200 dark:border-zinc-800 p-3 bg-white dark:bg-zinc-900 flex flex-col gap-2' });
+      const selBar = el('div', { class: 'empty:hidden' });
       const attBar = el('div', { class: 'flex flex-wrap gap-2 empty:hidden' });
       const ta = el('textarea', {
         class: 'w-full min-h-[40px] max-h-40 px-3 py-2 rounded-2xl bg-zinc-100 dark:bg-zinc-800 text-sm',
@@ -1437,14 +1488,19 @@
       btnStop.addEventListener('click', () => this.stop());
 
       btnRow.append(btnAttach, btnCamera, btnWeb, btnCtx, spacer, btnSend, btnStop, fileInput, cameraInput);
-      composer.append(attBar, ta, btnRow);
+      composer.append(selBar, attBar, ta, btnRow);
 
       sheet.append(resizeHandle, header, list, composer);
       panel.append(overlay, sheet);
       UI.root.appendChild(panel);
       this.panel = panel;
       this.sheet = sheet;
-      this.els = { list, ta, btnSend, btnStop, attBar, titleTop, updateTitleSub };
+      this.els = { list, ta, btnSend, btnStop, attBar, selBar, titleTop, updateTitleSub };
+
+      // Reflect the tracked page selection in the composer chip, and re-render
+      // whenever the user changes their selection while the panel is open.
+      this.renderSelectionChip();
+      this._selUnsub = Selection.subscribe(() => this.renderSelectionChip());
 
       // Render initial messages
       this.render();
@@ -1494,9 +1550,41 @@
     close() {
       if (this.aborter) { try { this.aborter.abort(); } catch {} this.aborter = null; }
       if (this.panel) { this.panel.remove(); this.panel = null; }
+      if (this._selUnsub) { try { this._selUnsub(); } catch {} this._selUnsub = null; }
       this.sheet = null;
       this.conv = null;
       this.attachments = [];
+    },
+
+    renderSelectionChip() {
+      const bar = this.els && this.els.selBar;
+      if (!bar) return;
+      clear(bar);
+      const text = Selection.get();
+      if (!text) return;
+      const chip = el('div', {
+        class: 'flex items-start gap-2 p-2 rounded-lg border-l-4 border-indigo-500 bg-indigo-50 dark:bg-indigo-900/40 text-xs'
+      });
+      const icoWrap = el('div', { class: 'shrink-0 text-indigo-600 dark:text-indigo-300 pt-0.5' });
+      icoWrap.appendChild(icon('edit', 'w-3.5 h-3.5'));
+      const col = el('div', { class: 'flex-1 min-w-0' });
+      col.appendChild(el('div', {
+        class: 'text-[10px] uppercase tracking-wider font-semibold text-indigo-700 dark:text-indigo-300'
+      }, `選択中のテキスト · ${text.length.toLocaleString()} 文字`));
+      const preview = text.length > 160 ? text.slice(0, 160) + '…' : text;
+      col.appendChild(el('div', {
+        class: 'mt-0.5 text-zinc-700 dark:text-zinc-200 whitespace-pre-wrap break-words line-clamp-3'
+      }, preview));
+      const dismiss = el('button', {
+        class: 'shrink-0 w-6 h-6 rounded-full text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800 flex items-center justify-center aicx-tap',
+        'aria-label': '選択を外す',
+        title: '選択をクリア',
+        type: 'button'
+      });
+      dismiss.appendChild(icon('close', 'w-3 h-3'));
+      dismiss.addEventListener('click', () => Selection.clear());
+      chip.append(icoWrap, col, dismiss);
+      bar.appendChild(chip);
     },
 
     stop() {
@@ -1553,6 +1641,10 @@
       const modeLabel = MODE_LABEL[snap.mode] || snap.mode;
       const systemPrompt = Store.resolveSystemPrompt(this.host);
       const promptText = Page.formatForPrompt(snap);
+      // Selection shown in the preview comes from the live tracker (what will
+      // actually be attached on the next send), not from the one-shot snapshot
+      // which may already have been collapsed by focusing the preview button.
+      const trackedSelection = Selection.get() || snap.selection || '';
 
       const kv = (k, v) => el('div', { class: 'flex gap-2 text-xs' }, [
         el('span', { class: 'shrink-0 w-24 text-zinc-500 dark:text-zinc-400' }, k),
@@ -1578,7 +1670,7 @@
       const stats = el('div', { class: 'space-y-1 p-3 rounded-lg bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-700' }, [
         kv('抽出モード', modeLabel),
         kv('本文文字数', `${snap.text.length.toLocaleString()} 文字${snap.text.endsWith('...[truncated]') ? ' (打ち切り)' : ''}`),
-        kv('選択文字数', `${snap.selection.length.toLocaleString()} 文字`),
+        kv('選択文字数', `${trackedSelection.length.toLocaleString()} 文字`),
         kv('添付ファイル', this.attachments.length ? this.attachments.map((a) => a.name).join(', ') : 'なし')
       ]);
       body.append(section('概要', stats));
@@ -1590,8 +1682,8 @@
         kv('Description', snap.metaDesc || '(なし)')
       ])));
 
-      // Selection
-      if (snap.selection) body.append(section('選択中のテキスト', preBlock(snap.selection)));
+      // Selection (attached per-message, not embedded in page context)
+      if (trackedSelection) body.append(section('選択中のテキスト (次回送信時に添付)', preBlock(trackedSelection)));
 
       // Extracted text
       body.append(section('抽出された本文', preBlock(snap.text)));
@@ -1647,7 +1739,24 @@
 
       if (isUser) {
         // User: right-aligned bubble, preserves whitespace
-        const wrap = el('div', { class: 'flex flex-col items-end' });
+        const wrap = el('div', { class: 'flex flex-col items-end gap-1' });
+        // Highlighted selection attached at send-time is rendered above the
+        // bubble as a quoted excerpt so the user can see what page context
+        // they emphasized for this turn.
+        if (m.selection) {
+          const quote = el('div', {
+            class: 'max-w-[85%] border-l-4 border-indigo-500 bg-indigo-50 dark:bg-indigo-900/40 rounded-r-lg px-3 py-2 text-xs'
+          });
+          quote.appendChild(el('div', {
+            class: 'text-[10px] uppercase tracking-wider font-semibold text-indigo-700 dark:text-indigo-300 mb-1'
+          }, '選択中のテキスト'));
+          const body = el('div', {
+            class: 'whitespace-pre-wrap break-words text-zinc-700 dark:text-zinc-200'
+          });
+          body.textContent = m.selection;
+          quote.appendChild(body);
+          wrap.appendChild(quote);
+        }
         const bubble = el('div', { class: 'max-w-[85%] rounded-2xl px-3 py-2 text-sm bg-indigo-600 text-white' });
         if (atts) bubble.appendChild(atts);
         const body = el('div', { class: 'whitespace-pre-wrap break-words' });
@@ -1704,7 +1813,9 @@
       if (this.aborter) return; // already sending
       const text = this.els.ta.value.trim();
       const atts = this.attachments;
-      if (!text && atts.length === 0) return;
+      // Allow a selection-only send (empty composer, no files) so the user can
+      // ask "what about this?" just by highlighting a passage.
+      if (!text && atts.length === 0 && !Selection.get()) return;
       if (!Store.settings.apiKey) { UI.toast('API キーを設定してください', 'error'); SettingsPanel.open(); return; }
 
       // Lazily create the conversation on first send, snapshotting the page
@@ -1723,10 +1834,19 @@
       const els = this.els;
       const firstMessage = conv.messages.filter((m) => m.role === 'user').length === 0;
 
+      // Capture the user's page selection at send-time (tracked by the
+      // selectionchange listener since focusing the composer on mobile
+      // collapses window.getSelection()). The selection becomes part of the
+      // message itself — shown as a quote above the bubble, and emphasized
+      // in the outgoing API payload. Consumed on send, so the next message
+      // requires a fresh selection unless the user changes/keeps it.
+      const selectedText = Selection.get();
       const userMsg = {
         id: uid(), role: 'user', content: text, createdAt: now(),
-        attachments: atts.length ? atts.map(({ id, name, mimeType, dataUrl }) => ({ id, name, mimeType, dataUrl })) : undefined
+        attachments: atts.length ? atts.map(({ id, name, mimeType, dataUrl }) => ({ id, name, mimeType, dataUrl })) : undefined,
+        selection: selectedText || undefined
       };
+      Selection.clear();
       conv.messages.push(userMsg);
       if (!conv.title) conv.title = (text || (atts[0] && atts[0].name) || '新しい会話').slice(0, 60);
 
@@ -1752,7 +1872,16 @@
       }
       for (const m of conv.messages) {
         if (m === asstMsg) continue;
-        apiMessages.push({ role: m.role, content: m.content, attachments: m.attachments });
+        let content = m.content;
+        // Prepend the highlighted page selection as emphasized context so the
+        // model focuses its reply on the quoted passage. Kept per-message
+        // (not collapsed into the first-message page context) so follow-up
+        // turns can reference fresh selections the user makes mid-chat.
+        if (m.role === 'user' && m.selection) {
+          const quoted = `The user has highlighted the following passage on the page. Treat it as the primary focus of this turn:\n"""\n${m.selection}\n"""`;
+          content = content ? `${quoted}\n\n${content}` : `${quoted}\n\nこの選択箇所について解説してください。`;
+        }
+        apiMessages.push({ role: m.role, content, attachments: m.attachments });
       }
 
       const aborter = new AbortController();
@@ -2582,6 +2711,7 @@
     // Tailwind first, then UI
     await TailwindBoot.load().catch((e) => console.warn('[aicx] Tailwind load failed:', e));
     UI.init();
+    Selection.init();
     OverlayButton.init();
     // Prefetch raw HTML in the background so embed recovery (Twitter/X etc.)
     // is ready by the time the user sends their first message. Fire-and-
