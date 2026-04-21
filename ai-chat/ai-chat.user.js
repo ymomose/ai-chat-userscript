@@ -841,6 +841,17 @@
                 '3xl': '1.5em',
                 'full': '9999px'
               },
+              maxWidth: {
+                '0': '0em',
+                'none': 'none',
+                'xs': '20em', 'sm': '24em', 'md': '28em', 'lg': '32em',
+                'xl': '36em', '2xl': '42em', '3xl': '48em', '4xl': '56em',
+                '5xl': '64em', '6xl': '72em', '7xl': '80em',
+                'full': '100%', 'min': 'min-content', 'max': 'max-content', 'fit': 'fit-content',
+                'prose': '65ch',
+                'screen-sm': '640px', 'screen-md': '768px', 'screen-lg': '1024px',
+                'screen-xl': '1280px', 'screen-2xl': '1536px'
+              },
               fontSize: {
                 'xs':   ['0.75em',  { lineHeight: '1em' }],
                 'sm':   ['0.875em', { lineHeight: '1.25em' }],
@@ -1373,7 +1384,8 @@
       if (recent.length) {
         menu.appendChild(el('div', { class: 'px-4 pt-2 pb-1 text-xs uppercase tracking-wide text-zinc-500 dark:text-zinc-400' }, '最近の会話'));
         recent.forEach((c) => {
-          const label = c.title || (c.messages[0] && (c.messages[0].content || '').slice(0, 40)) || '(新規会話)';
+          const firstUser = c.messages.find((m) => m.role === 'user' && !m._synthetic);
+          const label = c.title || (firstUser && (firstUser.content || '').slice(0, 40)) || '(新規会話)';
           menu.appendChild(row('chat', label, () => ChatPanel.open({ conversationId: c.id })));
         });
       }
@@ -1439,6 +1451,18 @@
       // Web grounding defaults to off for every newly opened chat panel,
       // unless the caller (e.g. a template shortcut) explicitly requests it.
       this.webGrounding = !!opts.webSearch;
+      // Include-current-page defaults ON for fresh chats, and OFF when
+      // restoring from history. Rationale: a restored conversation already
+      // has its conversation-time page baked into `conv.pageSnapshot` and
+      // the user is often on a different page now — silently layering the
+      // current page over the original context would be misleading.
+      this.includeCurrentPage = conv ? false : true;
+      // Remembers the URL whose snapshot we most recently injected into the
+      // API stream during this panel session. Used to avoid re-sending the
+      // same context on every follow-up message while still re-injecting
+      // when the user navigates to a different page (or explicitly toggles
+      // the feature back on after turning it off — handled below).
+      this._lastInjectedUrl = null;
       this.conv = conv;
       this.attachments = [];
 
@@ -1448,7 +1472,7 @@
 
       const heightPct = Math.max(25, Math.min(100, Number(Store.settings.chatHeightPct) || 70));
       const sheet = el('div', {
-        class: 'relative bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 w-full sm:max-w-xl sm:mb-4 sm:rounded-2xl rounded-t-2xl shadow-2xl flex flex-col aicx-enter-sheet overflow-hidden',
+        class: 'relative bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 w-full sm:max-w-6xl sm:mb-4 sm:rounded-2xl rounded-t-2xl shadow-2xl flex flex-col aicx-enter-sheet overflow-hidden',
         style: {
           height: `${heightPct}dvh`,
           maxHeight: 'calc(100dvh - env(safe-area-inset-top, 0px))',
@@ -1570,8 +1594,38 @@
         updateWebBtn();
       });
 
+      // Context toggle (include the current page as context). Round icon-
+      // button whose background reflects pressed state, matching the size
+      // of the other composer buttons so the row fits on narrow screens.
+      // Defaults OFF for restored conversations so the baked-in
+      // pageSnapshot — not whatever page the user is on now — is what the
+      // model receives.
+      const btnCtxToggle = el('button', {
+        type: 'button',
+        'aria-label': '現在のページをコンテキストに含める',
+        'aria-pressed': 'false',
+        title: '現在のページ内容をコンテキストに含める (オン/オフ)'
+      });
+      btnCtxToggle.appendChild(icon('summary'));
+      const updateCtxToggleBtn = () => {
+        const on = !!this.includeCurrentPage;
+        btnCtxToggle.setAttribute('aria-pressed', on ? 'true' : 'false');
+        btnCtxToggle.className = `w-10 h-10 shrink-0 rounded-full flex items-center justify-center aicx-tap transition ${on ? 'bg-indigo-600 text-white' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300'}`;
+      };
+      updateCtxToggleBtn();
+      btnCtxToggle.addEventListener('click', () => {
+        const wasOn = this.includeCurrentPage;
+        this.includeCurrentPage = !wasOn;
+        // OFF → ON: user is asking to (re-)include the current page. Wipe
+        // the injected-URL memo so the next send attaches a fresh snapshot
+        // even if its URL matches the last-injected one — otherwise the
+        // explicit toggle action would be a no-op.
+        if (!wasOn && this.includeCurrentPage) this._lastInjectedUrl = null;
+        updateCtxToggleBtn();
+      });
+
       const btnCtx = el('button', { class: 'w-10 h-10 shrink-0 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 flex items-center justify-center aicx-tap', type: 'button', 'aria-label': 'コンテキストを確認', title: 'AI に送られるページコンテキストをプレビュー' });
-      btnCtx.appendChild(icon('summary'));
+      btnCtx.appendChild(icon('search'));
       btnCtx.addEventListener('click', () => this.showContextPreview());
 
       const spacer = el('div', { class: 'flex-1' });
@@ -1584,7 +1638,7 @@
       btnStop.appendChild(icon('stop'));
       btnStop.addEventListener('click', () => this.stop());
 
-      btnRow.append(btnAttach, btnCamera, btnWeb, btnCtx, spacer, btnSend, btnStop, fileInput, cameraInput);
+      btnRow.append(btnAttach, btnCamera, btnWeb, btnCtxToggle, btnCtx, spacer, btnSend, btnStop, fileInput, cameraInput);
       composer.append(selBar, attBar, ta, btnRow);
 
       sheet.append(resizeHandle, header, list, composer);
@@ -1723,12 +1777,25 @@
     },
 
     async showContextPreview() {
+      // Pick which page snapshot the preview reflects:
+      //   - toggle ON  → the live current page (what will actually be sent)
+      //   - toggle OFF → the conversation's stored pageSnapshot if any
+      //                  (captured when the conversation was originally sent),
+      //                  so a restored chat shows the page it was about rather
+      //                  than whatever page the user happens to be on now.
+      //   - otherwise  → fall back to a fresh snapshot
       let snap;
-      try {
-        snap = await Page.snapshot();
-      } catch (e) {
-        UI.toast('コンテキストの取得に失敗しました: ' + (e && e.message || e), 'error');
-        return;
+      let snapSource = 'current';
+      if (!this.includeCurrentPage && this.conv && this.conv.pageSnapshot) {
+        snap = this.conv.pageSnapshot;
+        snapSource = 'stored';
+      } else {
+        try {
+          snap = await Page.snapshot();
+        } catch (e) {
+          UI.toast('コンテキストの取得に失敗しました: ' + (e && e.message || e), 'error');
+          return;
+        }
       }
       const MODE_LABEL = {
         auto: '自動 (Readability)',
@@ -1764,7 +1831,11 @@
       close.addEventListener('click', () => panel.remove());
 
       // Summary (mode + stats)
+      const sourceLabel = snapSource === 'stored'
+        ? '保存済み (会話開始時点)'
+        : (this.includeCurrentPage ? '現在のページ' : '現在のページ (トグル OFF のため未送信)');
       const stats = el('div', { class: 'space-y-1 p-3 rounded-lg bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-700' }, [
+        kv('ソース', sourceLabel),
         kv('抽出モード', modeLabel),
         kv('本文文字数', `${snap.text.length.toLocaleString()} 文字${snap.text.endsWith('...[truncated]') ? ' (打ち切り)' : ''}`),
         kv('選択文字数', `${trackedSelection.length.toLocaleString()} 文字`),
@@ -1810,15 +1881,38 @@
     render() {
       const list = this.els.list;
       clear(list);
-      const visible = this.conv ? this.conv.messages.filter((m) => m.role !== 'system') : [];
+      // Hide the synthetic "(context received)" ack from the chat; the paired
+      // user-side context message is rendered as a compact banner below.
+      const visible = this.conv
+        ? this.conv.messages.filter((m) => m.role !== 'system' && !(m._synthetic && m.role === 'assistant'))
+        : [];
       if (!visible.length) {
         list.appendChild(el('div', { class: 'text-center text-xs text-zinc-500 py-8' }, 'このページについて質問してみましょう。ページのテキストが文脈として送信されます。'));
       }
-      for (const m of visible) list.appendChild(this.renderMessage(m));
+      for (const m of visible) {
+        const node = this.renderMessage(m);
+        if (node) list.appendChild(node);
+      }
       list.scrollTop = list.scrollHeight;
     },
 
     renderMessage(m) {
+      // Synthetic page-context injection: render as a compact centered
+      // banner instead of a normal chat bubble. Clicking opens the full
+      // snapshot in the context preview so the user can inspect what was
+      // sent. The paired assistant ack is filtered out in render().
+      if (m._synthetic) {
+        const label = m._contextTitle || m._contextUrl || 'ページコンテキスト';
+        const banner = el('div', { class: 'w-full flex justify-center' });
+        const pill = el('div', {
+          class: 'inline-flex items-center gap-2 max-w-[90%] px-3 py-1.5 rounded-full bg-zinc-100 dark:bg-zinc-800 text-[11px] text-zinc-600 dark:text-zinc-300'
+        });
+        pill.appendChild(icon('summary', 'w-3.5 h-3.5'));
+        pill.appendChild(el('span', { class: 'truncate' }, `ページコンテキストを追加: ${label}`));
+        banner.appendChild(pill);
+        return banner;
+      }
+
       const isUser = m.role === 'user';
 
       // Build attachments block (if any)
@@ -1929,7 +2023,52 @@
       const host = this.host;
       const conv = this.conv;
       const els = this.els;
-      const firstMessage = conv.messages.filter((m) => m.role === 'user').length === 0;
+      const firstRealUserMsg = conv.messages.filter((m) => m.role === 'user' && !m._synthetic).length === 0;
+
+      // Decide whether to inject a page-context snapshot pair on this turn.
+      //
+      // Toggle ON: snapshot the current page, *unless* we've already
+      //   injected this same URL during this panel session — that keeps
+      //   same-page follow-ups from re-paying the context token cost.
+      //   When the user navigates to a different page (URL changes) or
+      //   flips the toggle OFF→ON (which clears _lastInjectedUrl), the
+      //   next send triggers a fresh injection. Injections are
+      //   *additive*: they're persisted as synthetic message pairs inside
+      //   conv.messages (not replacing prior context), so the model sees
+      //   every page the user chose to share, in chronological order.
+      //
+      // Toggle OFF: only inject on the very first real message of a
+      //   conversation, and only if a stored snapshot is available —
+      //   lets a restored chat re-use its conversation-time page without
+      //   the user having to toggle anything.
+      let pendingSnap = null;
+      if (this.includeCurrentPage) {
+        const currentUrl = location.href;
+        if (this._lastInjectedUrl !== currentUrl) {
+          pendingSnap = await Page.snapshot();
+          this._lastInjectedUrl = currentUrl;
+        }
+      } else if (firstRealUserMsg && conv.pageSnapshot) {
+        pendingSnap = conv.pageSnapshot;
+      }
+      if (pendingSnap) {
+        // Synthetic pair: a "user" message carrying the formatted context
+        // and an "assistant" ack. _synthetic flags them so the renderer
+        // shows a compact banner instead of a normal bubble; the API
+        // payload builder below emits them verbatim.
+        conv.messages.push({
+          id: uid(), role: 'user', _synthetic: true,
+          _contextUrl: pendingSnap.url, _contextTitle: pendingSnap.title,
+          content: Page.formatForPrompt(pendingSnap), createdAt: now()
+        });
+        conv.messages.push({
+          id: uid(), role: 'assistant', _synthetic: true,
+          content: '(context received)', createdAt: now()
+        });
+        // Keep the conv's latest snapshot handy for the context preview
+        // (and for the toggle-OFF fallback in future sessions).
+        conv.pageSnapshot = pendingSnap;
+      }
 
       // Capture the user's page selection at send-time (tracked by the
       // selectionchange listener since focusing the composer on mobile
@@ -1960,13 +2099,12 @@
       Store.upsertConversation(host, conv);
       Store.saveDomains();
 
-      // Build message list for API
+      // Build API payload by walking conv.messages in order. Synthetic
+      // context pairs injected above are part of that stream, so they flow
+      // to the model in the same chronological position as the user
+      // chose to share them — a later-injected page appears AFTER earlier
+      // conversation turns, not collapsed to the front.
       const apiMessages = [];
-      const snap = await Page.snapshot();
-      if (firstMessage) {
-        apiMessages.push({ role: 'user', content: Page.formatForPrompt(snap) });
-        apiMessages.push({ role: 'assistant', content: '(context received)' });
-      }
       for (const m of conv.messages) {
         if (m === asstMsg) continue;
         let content = m.content;
@@ -1974,7 +2112,7 @@
         // model focuses its reply on the quoted passage. Kept per-message
         // (not collapsed into the first-message page context) so follow-up
         // turns can reference fresh selections the user makes mid-chat.
-        if (m.role === 'user' && m.selection) {
+        if (m.role === 'user' && !m._synthetic && m.selection) {
           const quoted = `The user has highlighted the following passage on the page. Treat it as the primary focus of this turn:\n"""\n${m.selection}\n"""`;
           content = content ? `${quoted}\n\n${content}` : `${quoted}\n\nこの選択箇所について解説してください。`;
         }
@@ -2072,7 +2210,7 @@
       overlay.addEventListener('click', () => this.close());
 
       const sheet = el('div', {
-        class: 'relative bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 w-full sm:max-w-md sm:mx-auto sm:my-4 sm:rounded-2xl rounded-t-2xl shadow-2xl flex flex-col aicx-enter-sheet aicx-full sm:h-[calc(100dvh-2em)] overflow-hidden',
+        class: 'relative bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 w-full sm:max-w-4xl sm:mx-auto sm:my-4 sm:rounded-2xl rounded-t-2xl shadow-2xl flex flex-col aicx-enter-sheet aicx-full sm:h-[calc(100dvh-2em)] overflow-hidden',
         style: { paddingBottom: 'env(safe-area-inset-bottom, 0px)' }
       });
 
@@ -2102,7 +2240,7 @@
       const snippet = (c.messages.find((m) => m.role === 'user') || {}).content || '';
       main.append(
         el('div', { class: 'text-sm font-medium truncate' }, c.title || snippet.slice(0, 50) || '(無題)'),
-        el('div', { class: 'text-xs text-zinc-500 truncate' }, `${fmtDate(c.updatedAt || c.createdAt)} · ${c.messages.filter((m) => m.role !== 'system').length} msg`)
+        el('div', { class: 'text-xs text-zinc-500 truncate' }, `${fmtDate(c.updatedAt || c.createdAt)} · ${c.messages.filter((m) => m.role !== 'system' && !m._synthetic).length} msg`)
       );
       main.addEventListener('click', () => { this.close(); ChatPanel.open({ conversationId: c.id }); });
 
@@ -2224,7 +2362,7 @@
     // Sheet skeleton: returns { panel, sheet, body } with header already mounted.
     // `title` may be a string or HTMLElement. `subheader` (optional) is rendered
     // between the header and the scrollable body (useful for tab bars).
-    sheet({ title, onBack, onClose, leading, trailing, subheader, maxWidth = 'sm:max-w-lg' }) {
+    sheet({ title, onBack, onClose, leading, trailing, subheader, maxWidth = 'sm:max-w-5xl' }) {
       const panel = el('div', { class: 'fixed inset-0 aicx-panel aicx-enter-fade flex items-end sm:items-stretch justify-center', style: { zIndex: 30 } });
       const overlay = el('div', { class: 'absolute inset-0 bg-black/30' });
       overlay.addEventListener('click', () => { (onBack || onClose || (() => panel.remove()))(); });
@@ -2741,10 +2879,10 @@
         for (const c of dom.conversations) {
           const row = el('div', { class: 'flex items-start gap-2 p-3' });
           const main = el('div', { class: 'flex-1 min-w-0' });
-          const preview = (c.messages.find((m) => m.role === 'user') || {}).content || '';
+          const preview = (c.messages.find((m) => m.role === 'user' && !m._synthetic) || {}).content || '';
           main.append(
             el('div', { class: 'text-sm font-medium truncate' }, c.title || preview.slice(0, 50) || '(無題)'),
-            el('div', { class: 'text-xs text-zinc-500 truncate' }, `${fmtDate(c.updatedAt || c.createdAt)} · ${c.messages.filter((m) => m.role !== 'system').length} msg`)
+            el('div', { class: 'text-xs text-zinc-500 truncate' }, `${fmtDate(c.updatedAt || c.createdAt)} · ${c.messages.filter((m) => m.role !== 'system' && !m._synthetic).length} msg`)
           );
           if (preview && preview !== c.title) {
             main.append(el('div', { class: 'text-xs text-zinc-400 dark:text-zinc-500 mt-1 line-clamp-2 break-words' }, preview.slice(0, 160)));
