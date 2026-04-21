@@ -807,15 +807,18 @@
       if (document.getElementById('aicx-base')) return;
       const css = `
 /* AI Chat Overlay — scoped base */
+/* Font stack + size + line-height are marked !important so host-page rules
+   (e.g. html { font-size: 10px !important } or body { font-family: Noto Serif !important })
+   can't propagate into our overlay. */
 #aicx-root {
   all: initial;
   position: fixed;
   inset: 0;
   pointer-events: none;
   z-index: 2147483000;
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-  font-size: 14px;
-  line-height: 1.5;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif !important;
+  font-size: 14px !important;
+  line-height: 1.5 !important;
   color: rgb(24,24,27);
   -webkit-tap-highlight-color: transparent;
   -webkit-font-smoothing: antialiased;
@@ -856,6 +859,31 @@
   color: inherit !important;
   background-color: transparent !important;
 }
+/* Font sweeper — mirrors the color/background sweeper above, at specificity
+   (1,0,1) with !important, so host-page rules (e.g. body span font-family
+   declarations or blanket #main * font-size overrides) can't bleed into our
+   descendants. Font-size defaults to inherit, so elements without an
+   explicit .text-* utility resolve to the root 14px; text-* utilities
+   (enforced below) beat this sweeper via their higher specificity (1,1,0). */
+#aicx-root *,
+#aicx-root *::before,
+#aicx-root *::after {
+  font-family: inherit !important;
+  line-height: inherit !important;
+  font-size: inherit !important;
+}
+/* Explicit font-size enforcement for every Tailwind text-* utility used by
+   the overlay. Specificity (1,1,0) beats the sweeper (1,0,1), so these
+   sizes win even when descendants are forced to inherit. Keep this list in
+   sync with utilities used in the script. */
+#aicx-root .text-xs { font-size: 12px !important; line-height: 16px !important; }
+#aicx-root .text-sm { font-size: 14px !important; line-height: 20px !important; }
+#aicx-root .text-base { font-size: 16px !important; line-height: 24px !important; }
+#aicx-root .text-lg { font-size: 18px !important; line-height: 28px !important; }
+#aicx-root .text-xl { font-size: 20px !important; line-height: 28px !important; }
+#aicx-root .text-\\[10px\\] { font-size: 10px !important; }
+#aicx-root .text-\\[11px\\] { font-size: 11px !important; }
+#aicx-root .text-\\[0\\.85em\\] { font-size: 0.85em !important; }
 :where(
   #aicx-root button,
   #aicx-root input:not([type="checkbox"]):not([type="radio"]),
@@ -873,13 +901,15 @@
   border-radius: 8px; padding: 8px 10px;
 }
 /* Prevent iOS Safari auto-zoom on focus: font-size must be >= 16px.
-   Scoped to touch devices so desktop layout is unaffected. Uses #aicx-root
-   prefix (specificity 1,0,1) so it beats Tailwind's .text-sm / .text-xs. */
+   Scoped to touch devices so desktop layout is unaffected. !important lets
+   it beat the font-size sweeper above (both at specificity 1,0,1) — without
+   !important the sweeper would force the 16px field back to inherited
+   14px and re-enable iOS auto-zoom. */
 @media (hover: none) and (pointer: coarse) {
   #aicx-root input:not([type="checkbox"]):not([type="radio"]),
   #aicx-root textarea,
   #aicx-root select {
-    font-size: 16px;
+    font-size: 16px !important;
   }
 }
 :where(#aicx-root button) { cursor: pointer; touch-action: manipulation; }
@@ -1264,9 +1294,7 @@
       };
 
       // Header
-      const header = el('div', { class: 'px-4 pt-3 pb-2 text-xs uppercase tracking-wide text-zinc-500 dark:text-zinc-400 flex items-center justify-between' },
-        [el('span', {}, host), el('span', { class: 'text-[10px] opacity-60' }, Store.settings.model || '')]
-      );
+      const header = el('div', { class: 'px-4 pt-3 pb-2 text-xs uppercase tracking-wide text-zinc-500 dark:text-zinc-400' }, host);
       menu.appendChild(header);
 
       menu.appendChild(row('plus', '新規 AI チャット', () => ChatPanel.open({ newChat: true })));
