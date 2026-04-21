@@ -188,6 +188,28 @@
       const d = this.getDomain(host);
       d.conversations = d.conversations.filter((c) => c.id !== id);
     },
+    // True when a domain carries no conversations, no templates, no system-
+    // prompt override, and no page-extract-mode override. Used by bulk
+    // operations (e.g. wipe-all-history) to drop domain entries that are
+    // effectively blank.
+    isDomainEmpty(d) {
+      if (!d) return true;
+      if (d.conversations && d.conversations.length) return false;
+      if (d.templates && d.templates.length) return false;
+      if (d.systemPrompt && d.systemPrompt.trim()) return false;
+      if (d.pageExtractMode && d.pageExtractMode !== 'inherit') return false;
+      return true;
+    },
+    pruneEmptyDomains() {
+      let removed = 0;
+      for (const host of Object.keys(this.domains)) {
+        if (this.isDomainEmpty(this.domains[host])) {
+          delete this.domains[host];
+          removed++;
+        }
+      }
+      return removed;
+    },
     resolveSystemPrompt(host) {
       host = host || getDomain();
       const d = this.domains[host];
@@ -2440,8 +2462,16 @@
         for (const host of Object.keys(Store.domains)) {
           if (Store.domains[host]) Store.domains[host].conversations = [];
         }
+        // After the wipe, drop any domain entry whose templates / prompt
+        // override / extract-mode are also empty — otherwise domains that
+        // existed only to hold now-deleted history would linger forever in
+        // the domain list.
+        const pruned = Store.pruneEmptyDomains();
         await Store.saveDomains();
-        UI.toast(`${totals.convs.toLocaleString()} 件の会話履歴を削除しました`, 'success');
+        const msg = pruned
+          ? `${totals.convs.toLocaleString()} 件の会話履歴を削除しました (空ドメイン ${pruned} 件も削除)`
+          : `${totals.convs.toLocaleString()} 件の会話履歴を削除しました`;
+        UI.toast(msg, 'success');
         this.close();
         this.open();
       }, 'bg-red-600 text-white w-full disabled:opacity-50');
