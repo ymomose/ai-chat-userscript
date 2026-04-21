@@ -599,17 +599,68 @@
       }
     },
 
+    // Prioritized CSS selectors for the article-body container on common
+    // CMSes. Checked BEFORE falling back to plain <article>/<main> so the
+    // heuristic doesn't trip over sites that use <article> for individual
+    // comments. Concretely, LiveDoor Blog's mobile theme renders each
+    // comment as `<article class="comment-list">` — without this list the
+    // old heuristic would pick the first comment (≈ a hundred characters)
+    // and miss the real post in `#article-contents`.
+    ARTICLE_BODY_HINTS: [
+      '[itemprop="articleBody"]',
+      '#article-contents',
+      '.article-body-inner',
+      '.article-body',
+      '.entry-content',
+      '.post-content',
+      '.post-body',
+      '.story-body',
+      '#mw-content-text' // Wikipedia
+    ],
+    // Minimum characters a candidate container must hold before we accept
+    // it. Low enough to allow short posts, high enough to reject a single
+    // comment or a "read more" teaser.
+    MIN_ROOT_TEXT: 200,
+
+    // Pick the DOM subtree the heuristic should walk. Priority, in order:
+    //   1. <main> (only when preferMain and substantial)
+    //   2. any ARTICLE_BODY_HINTS selector with substantial content
+    //   3. the largest <article> on the page (substantial)
+    //   4. legacy fallback chain main → article → body
+    _findContentRoot(preferMain) {
+      const enough = (el) => el && (el.innerText || '').length >= this.MIN_ROOT_TEXT;
+
+      if (preferMain) {
+        const main = document.querySelector('main');
+        if (enough(main)) return main;
+      }
+
+      for (const sel of this.ARTICLE_BODY_HINTS) {
+        let el;
+        try { el = document.querySelector(sel); } catch { el = null; }
+        if (enough(el)) return el;
+      }
+
+      const articles = Array.from(document.querySelectorAll('article'));
+      if (articles.length) {
+        articles.sort((a, b) => (b.innerText || '').length - (a.innerText || '').length);
+        if (enough(articles[0])) return articles[0];
+      }
+
+      const main = document.querySelector('main');
+      const article = articles[0] || null;
+      return preferMain
+        ? (main || article || document.body)
+        : (article || main || document.body);
+    },
+
     // Heuristic extraction.
     //   stripLevel: 'clean' | 'permissive' | 'raw'
     //   preferMain: when true, pick <main> first (gets article + comments +
     //     related), then fall back to <article>. Default false keeps the old
     //     article-first behavior for 'clean' / 'raw' modes.
     _extractHeuristic(stripLevel, preferMain) {
-      const article = document.querySelector('article');
-      const main = document.querySelector('main');
-      const root = preferMain
-        ? (main || article || document.body)
-        : (article || main || document.body);
+      const root = this._findContentRoot(preferMain);
       if (!root) return '';
       const clone = root.cloneNode(true);
       this._stripSelf(clone);
