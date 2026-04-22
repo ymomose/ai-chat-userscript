@@ -1870,6 +1870,52 @@
       const overlay = el('div', { class: 'absolute inset-0 bg-black/30' });
       overlay.addEventListener('click', () => this.close());
 
+      // Keyboard-event isolation — stop events that originate inside the
+      // panel from bubbling to site-level handlers that would otherwise
+      // intercept typing or trigger shortcuts (e.g. Gmail "j/k", Twitter
+      // hotkeys, Slack). Panel-internal handlers (Enter→send, input-grow,
+      // IME) fire in the target/bubble phase on inner elements first and
+      // are unaffected; we only block at the panel boundary on the way
+      // up to document/window. Site handlers registered in the CAPTURE
+      // phase on ancestors still fire (they run before the event reaches
+      // the panel) — an unavoidable limitation of running at
+      // document-idle, but in practice most sites use bubble-phase hooks.
+      const stopKeyBubble = (e) => e.stopPropagation();
+      for (const type of [
+        'keydown', 'keyup', 'keypress',
+        'beforeinput', 'input',
+        'compositionstart', 'compositionupdate', 'compositionend',
+        // Clipboard / context events — Ctrl/Cmd+C/V/X fire both keydown
+        // (already blocked above) and the dedicated clipboard events.
+        // Sites like Gmail and X listen to the latter at document level,
+        // so without these entries copy/paste inside the composer still
+        // leaks out and can be hijacked.
+        'copy', 'cut', 'paste', 'contextmenu'
+      ]) {
+        panel.addEventListener(type, stopKeyBubble);
+      }
+
+      // Focus containment — some sites aggressively refocus their own
+      // inputs on certain events; without this guard, subsequent typing
+      // would route to the page instead of the composer. Redirects only
+      // when focus lands on a real element outside the panel, so native
+      // dialogs (file picker, camera) that blur to body are left alone.
+      const focusGuard = (e) => {
+        if (!this.panel) return;
+        const t = e.target;
+        if (!t || t === document.body || t === document.documentElement) return;
+        if (this.panel.contains(t)) return;
+        const ta = this.els && this.els.ta;
+        if (!ta) return;
+        setTimeout(() => {
+          if (this.panel && !this.panel.contains(document.activeElement)) {
+            ta.focus({ preventScroll: true });
+          }
+        }, 0);
+      };
+      document.addEventListener('focusin', focusGuard, true);
+      this._focusGuard = focusGuard;
+
       const heightPct = Math.max(25, Math.min(100, Number(Store.settings.chatHeightPct) || 70));
       const sheet = el('div', {
         class: 'relative bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 w-full sm:max-w-6xl sm:mb-4 sm:rounded-2xl rounded-t-2xl shadow-2xl flex flex-col aicx-enter-sheet overflow-hidden',
@@ -2267,6 +2313,10 @@
 
     close() {
       if (this.aborter) { try { this.aborter.abort(); } catch {} this.aborter = null; }
+      if (this._focusGuard) {
+        document.removeEventListener('focusin', this._focusGuard, true);
+        this._focusGuard = null;
+      }
       if (this.panel) { this.panel.remove(); this.panel = null; }
       if (this._selUnsub) { try { this._selUnsub(); } catch {} this._selUnsub = null; }
       this.sheet = null;
