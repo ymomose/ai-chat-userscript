@@ -18,6 +18,8 @@
 // @grant        GM.listValues
 // @grant        GM_openInTab
 // @grant        GM.openInTab
+// @grant        GM_xmlhttpRequest
+// @grant        GM.xmlHttpRequest
 // @connect      generativelanguage.googleapis.com
 // @connect      www.googleapis.com
 // @connect      oauth2.googleapis.com
@@ -229,12 +231,54 @@
   // 4. Gemini API client
   // =========================================================================
   const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+
+  // GM_xmlhttpRequest wrapper — bypasses the page's CSP (can't do SSE, so this
+  // is only used as a fallback when plain fetch is blocked by strict CSPs).
+  const _gmXhr = (typeof GM_xmlhttpRequest !== 'undefined') ? GM_xmlhttpRequest
+    : (typeof GM !== 'undefined' && GM && typeof GM.xmlHttpRequest === 'function') ? GM.xmlHttpRequest.bind(GM)
+    : null;
+  function gmRequest({ method = 'GET', url, headers, body, signal }) {
+    return new Promise((resolve, reject) => {
+      if (!_gmXhr) { reject(new Error('GM_xmlhttpRequest is unavailable')); return; }
+      if (signal && signal.aborted) {
+        reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }));
+        return;
+      }
+      const handle = _gmXhr({
+        method, url, headers, data: body, responseType: 'text',
+        onload: (r) => resolve({ status: r.status, statusText: r.statusText, responseText: r.responseText }),
+        onerror: (r) => reject(new Error(`Network error${r && r.status ? ' ' + r.status : ''}${r && r.statusText ? ' ' + r.statusText : ''}`)),
+        ontimeout: () => reject(new Error('Request timed out')),
+        onabort: () => reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }))
+      });
+      if (signal) {
+        const onAbort = () => { try { handle && handle.abort && handle.abort(); } catch {} };
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
+  }
+
   const Gemini = {
     async listModels(apiKey) {
       if (!apiKey) throw new Error('API key is required.');
-      const res = await fetch(`${API_BASE}/models?pageSize=200&key=${encodeURIComponent(apiKey)}`);
-      if (!res.ok) throw new Error(`Gemini listModels failed: ${res.status} ${await res.text()}`);
-      const data = await res.json();
+      const url = `${API_BASE}/models?pageSize=200&key=${encodeURIComponent(apiKey)}`;
+      let data;
+      let res = null;
+      try {
+        res = await fetch(url);
+      } catch (e) {
+        if (e && e.name === 'AbortError') throw e;
+        // CSP / network — fall through to GM_xmlhttpRequest fallback below.
+        console.warn('[aicx] fetch listModels blocked, falling back to GM_xmlhttpRequest:', e);
+      }
+      if (res) {
+        if (!res.ok) throw new Error(`Gemini listModels failed: ${res.status} ${await res.text()}`);
+        data = await res.json();
+      } else {
+        const r = await gmRequest({ method: 'GET', url });
+        if (r.status < 200 || r.status >= 300) throw new Error(`Gemini listModels failed: ${r.status} ${r.responseText || r.statusText || ''}`);
+        try { data = JSON.parse(r.responseText); } catch { throw new Error('Gemini listModels: invalid JSON response'); }
+      }
       const models = (data.models || []).filter((m) => (m.supportedGenerationMethods || []).includes('generateContent'));
       models.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
       return models.map((m) => ({
@@ -269,7 +313,7 @@
     async *streamGenerate({ apiKey, model, messages, systemPrompt, tools, onMetadata, signal }) {
       if (!apiKey) throw new Error('API キーが設定されていません。設定画面から登録してください。');
       if (!model) throw new Error('モデルが選択されていません。');
-      const url = `${API_BASE}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`;
+      const streamUrl = `${API_BASE}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`;
       const body = {
         contents: this.buildContents(messages),
         generationConfig: { temperature: 0.7 }
@@ -278,12 +322,48 @@
         body.systemInstruction = { role: 'user', parts: [{ text: systemPrompt }] };
       }
       if (tools && tools.length) body.tools = tools;
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body),
-        signal
-      });
+      let res = null;
+      try {
+        res = await fetch(streamUrl, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+          signal
+        });
+      } catch (e) {
+        if (e && e.name === 'AbortError') throw e;
+        // CSP / network — fall back to GM_xmlhttpRequest against the
+        // non-streaming endpoint. GM_xmlhttpRequest can't do SSE, so we
+        // surface the full response as a single chunk.
+        console.warn('[aicx] fetch streamGenerate blocked, falling back to GM_xmlhttpRequest (non-streaming):', e);
+        const genUrl = `${API_BASE}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+        const r = await gmRequest({
+          method: 'POST', url: genUrl,
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+          signal
+        });
+        if (r.status < 200 || r.status >= 300) {
+          throw new Error(`Gemini request failed: ${r.status} ${r.responseText || r.statusText || ''}`);
+        }
+        let obj;
+        try { obj = JSON.parse(r.responseText); } catch { throw new Error('Gemini: invalid JSON response'); }
+        if (obj && obj.error) {
+          throw new Error((obj.error.message || 'Gemini API error') + (obj.error.status ? ` (${obj.error.status})` : ''));
+        }
+        const cand = obj && obj.candidates && obj.candidates[0];
+        const parts = cand && cand.content && cand.content.parts;
+        if (parts) {
+          for (const p of parts) if (p.text) yield p.text;
+        }
+        if (cand && cand.groundingMetadata && typeof onMetadata === 'function') {
+          try { onMetadata(cand.groundingMetadata); } catch {}
+        }
+        if (cand && cand.finishReason && cand.finishReason !== 'STOP' && cand.finishReason !== 'FINISH_REASON_UNSPECIFIED') {
+          yield `\n\n_(finishReason: ${cand.finishReason})_`;
+        }
+        return;
+      }
       if (!res.ok || !res.body) {
         const t = await res.text();
         throw new Error(`Gemini request failed: ${res.status} ${t}`);
