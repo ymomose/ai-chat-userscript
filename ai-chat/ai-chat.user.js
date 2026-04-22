@@ -1931,8 +1931,10 @@
       const cameraInput = el('input', { type: 'file', accept: 'image/*', capture: 'environment', class: 'hidden' });
       cameraInput.addEventListener('change', (e) => this.handleFiles(e.target.files));
 
-      // Button row (below textarea)
-      const btnRow = el('div', { class: 'flex items-center gap-2' });
+      // Button row (below textarea). Actions wrap onto multiple lines on
+      // narrow viewports (phones); send/stop stays pinned to the right.
+      const btnRow = el('div', { class: 'flex items-end gap-2' });
+      const actionsWrap = el('div', { class: 'flex flex-wrap items-center gap-2 flex-1 min-w-0' });
 
       const btnAttach = el('button', { class: 'w-10 h-10 shrink-0 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 flex items-center justify-center aicx-tap', 'aria-label': 'ファイル添付', title: 'ファイル添付' });
       btnAttach.appendChild(icon('attach'));
@@ -1947,10 +1949,9 @@
       const updateWebBtn = () => {
         const on = !!this.webGrounding;
         btnWeb.setAttribute('aria-pressed', on ? 'true' : 'false');
-        btnWeb.className = `h-10 shrink-0 rounded-full flex items-center justify-center gap-1 px-3 aicx-tap transition ${on ? 'bg-indigo-600 text-white' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300'}`;
+        btnWeb.className = `w-10 h-10 shrink-0 rounded-full flex items-center justify-center aicx-tap transition ${on ? 'bg-indigo-600 text-white' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300'}`;
       };
       updateWebBtn();
-      btnWeb.appendChild(el('span', { class: 'text-xs font-medium' }, 'Web'));
       btnWeb.addEventListener('click', () => {
         this.webGrounding = !this.webGrounding;
         updateWebBtn();
@@ -1961,10 +1962,9 @@
       const updateUrlCtxBtn = () => {
         const on = !!this.urlContext;
         btnUrlCtx.setAttribute('aria-pressed', on ? 'true' : 'false');
-        btnUrlCtx.className = `h-10 shrink-0 rounded-full flex items-center justify-center gap-1 px-3 aicx-tap transition ${on ? 'bg-indigo-600 text-white' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300'}`;
+        btnUrlCtx.className = `w-10 h-10 shrink-0 rounded-full flex items-center justify-center aicx-tap transition ${on ? 'bg-indigo-600 text-white' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300'}`;
       };
       updateUrlCtxBtn();
-      btnUrlCtx.appendChild(el('span', { class: 'text-xs font-medium' }, 'URL'));
       btnUrlCtx.addEventListener('click', () => {
         this.urlContext = !this.urlContext;
         updateUrlCtxBtn();
@@ -2072,8 +2072,6 @@
       btnCtx.appendChild(icon('search'));
       btnCtx.addEventListener('click', () => this.showContextPreview());
 
-      const spacer = el('div', { class: 'flex-1' });
-
       const btnSend = el('button', { class: 'w-10 h-10 shrink-0 rounded-full bg-indigo-600 text-white flex items-center justify-center disabled:opacity-50 aicx-tap', 'aria-label': '送信' });
       btnSend.appendChild(icon('send'));
       btnSend.addEventListener('click', () => this.send());
@@ -2082,7 +2080,8 @@
       btnStop.appendChild(icon('stop'));
       btnStop.addEventListener('click', () => this.stop());
 
-      btnRow.append(btnAttach, btnCamera, btnWeb, btnUrlCtx, btnCtxToggle, modeWrap, btnCtx, spacer, btnSend, btnStop, fileInput, cameraInput);
+      actionsWrap.append(btnAttach, btnCamera, btnWeb, btnUrlCtx, btnCtxToggle, modeWrap, btnCtx, fileInput, cameraInput);
+      btnRow.append(actionsWrap, btnSend, btnStop);
       composer.append(selBar, attBar, ta, btnRow);
 
       sheet.append(resizeHandle, header, list, composer);
