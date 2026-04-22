@@ -693,6 +693,18 @@
     // Base strip list — tags whose visible text is either noise or unparseable
     // regardless of extraction mode.
     BASE_STRIP: 'script,style,noscript,svg,iframe,video,audio,canvas,template',
+    // Extra tags to drop in 'raw' HTML output — in-body <link>/<meta>/<base>
+    // carry no user-visible content. <input type=hidden> likewise.
+    RAW_EXTRA_STRIP: 'link,meta,base,input[type="hidden"]',
+    // Attributes removed in 'raw' HTML output. Presentation (class/style),
+    // identity hooks (id), a11y metadata (aria-*, role, tabindex), custom
+    // data-*, inline event handlers (on*), and a handful of editor-only
+    // boolean attributes — none of which contribute to body content.
+    RAW_DROP_ATTR_EXACT: new Set([
+      'class', 'style', 'id', 'tabindex', 'role',
+      'contenteditable', 'spellcheck', 'draggable',
+      'autocapitalize', 'autocorrect', 'translate', 'slot', 'part', 'is'
+    ]),
     // Strict chrome strip for 'clean' mode: removes navigation/boilerplate
     // plus <aside>/<footer>/complementary roles. Note this also strips
     // comment widgets on sites (e.g. Yahoo News) that wrap comments in
@@ -714,7 +726,7 @@
     ].join(','),
     MAX_TEXT: 20000,
 
-    async snapshot() {
+    async snapshot(modeOverride) {
       const selection = (window.getSelection && String(window.getSelection())) || '';
       const title = document.title || '';
       const metaDesc = (document.querySelector('meta[name="description"]') || {}).content || '';
@@ -725,7 +737,7 @@
       // snapshot already includes tweets; subsequent calls hit the cache.
       await this.primeRawDoc();
 
-      const mode = Store.resolvePageExtractMode();
+      const mode = modeOverride || Store.resolvePageExtractMode();
       let text = '';
       let effectiveMode = mode;
 
@@ -744,7 +756,7 @@
       } else if (mode === 'clean') {
         text = this._extractHeuristic('clean');
       } else {
-        text = this._extractHeuristic('raw');
+        text = this._extractRaw();
       }
 
       if (text.length > this.MAX_TEXT) text = text.slice(0, this.MAX_TEXT) + '\n...[truncated]';
@@ -918,6 +930,46 @@
       return (clone.innerText || '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
     },
 
+    // Raw extraction — emits the <body>'s HTML with minimal stripping so the
+    // model sees document structure (headings, lists, links, ...) that plain-
+    // text modes discard. Removes only content-irrelevant noise: scripts /
+    // styles / media, HTML comments, presentation (class/style/id), a11y
+    // metadata (aria-*/role/tabindex), custom data-*, and inline event
+    // handlers. The textual content and semantic tags are preserved.
+    _extractRaw() {
+      const body = document.body;
+      if (!body) return '';
+      const clone = body.cloneNode(true);
+      this._stripSelf(clone);
+      this._inlineEmbeds(clone);
+      clone.querySelectorAll(this.BASE_STRIP).forEach((n) => n.remove());
+      clone.querySelectorAll(this.RAW_EXTRA_STRIP).forEach((n) => n.remove());
+
+      const doc = clone.ownerDocument;
+      const commentWalker = doc.createTreeWalker(clone, NodeFilter.SHOW_COMMENT);
+      const comments = [];
+      let c; while ((c = commentWalker.nextNode())) comments.push(c);
+      for (const n of comments) n.remove();
+
+      const all = [clone, ...clone.querySelectorAll('*')];
+      for (const n of all) {
+        if (!n.attributes || !n.attributes.length) continue;
+        for (const attr of Array.from(n.attributes)) {
+          const name = attr.name;
+          if (
+            this.RAW_DROP_ATTR_EXACT.has(name) ||
+            name.startsWith('aria-') ||
+            name.startsWith('data-') ||
+            name.startsWith('on')
+          ) {
+            n.removeAttribute(name);
+          }
+        }
+      }
+
+      return (clone.innerHTML || '').replace(/\n{3,}/g, '\n\n').trim();
+    },
+
     // Merge a primary text (typically permissive heuristic from <main>) with
     // a secondary text (typically Readability). Paragraphs from secondary
     // that are already contained in primary are skipped; genuinely new
@@ -955,7 +1007,10 @@
       // to `userMsg.selection` (see ChatPanel.send) so every message the user
       // sends can carry its own highlighted excerpt, and so the quoted text
       // appears visibly in the chat bubble.
-      if (snap.text) parts.push(`\nPage text:\n"""\n${snap.text}\n"""`);
+      if (snap.text) {
+        const label = snap.mode === 'raw' ? 'Page HTML' : 'Page text';
+        parts.push(`\n${label}:\n"""\n${snap.text}\n"""`);
+      }
       return parts.join('\n');
     }
   };
@@ -1759,6 +1814,11 @@
       // the user is often on a different page now — silently layering the
       // current page over the original context would be misleading.
       this.includeCurrentPage = conv ? false : true;
+      // Session-level extraction-mode override. Seeded from the resolved
+      // domain/global setting so the chat behaves as configured by default,
+      // but changeable from the composer for the duration of this panel
+      // session (no persistence — closing the panel reverts to settings).
+      this.pageExtractMode = Store.resolvePageExtractMode(host);
       // Remembers the URL whose snapshot we most recently injected into the
       // API stream during this panel session. Used to avoid re-sending the
       // same context on every follow-up message while still re-injecting
@@ -1940,6 +2000,74 @@
         updateCtxToggleBtn();
       });
 
+      // Extraction-mode picker — lets the user switch auto/clean/raw for
+      // this chat without touching the global/domain setting. Changing the
+      // mode invalidates _lastInjectedUrl so the next send attaches a fresh
+      // snapshot built with the new mode.
+      const MODE_OPTIONS = [
+        { value: 'auto',  short: '自動',     label: '自動 (Readability)' },
+        { value: 'clean', short: 'クリーン', label: 'クリーン (chrome 除外)' },
+        { value: 'raw',   short: '生',       label: 'ほぼそのまま (HTML)' }
+      ];
+      const modeWrap = el('div', { class: 'relative shrink-0' });
+      const btnMode = el('button', {
+        type: 'button',
+        'aria-label': '抽出モード',
+        'aria-haspopup': 'menu',
+        'aria-expanded': 'false'
+      });
+      const btnModeLabel = el('span', { class: 'text-xs font-medium' }, '');
+      btnMode.append(icon('summary'), btnModeLabel);
+      const paintModeBtn = () => {
+        const opt = MODE_OPTIONS.find((o) => o.value === this.pageExtractMode) || MODE_OPTIONS[0];
+        btnModeLabel.textContent = opt.short;
+        btnMode.title = `抽出モード: ${opt.label}`;
+        btnMode.className = 'h-10 shrink-0 rounded-full flex items-center justify-center gap-1 px-3 aicx-tap transition bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300';
+      };
+      paintModeBtn();
+      let modePopover = null;
+      const onModeDocDown = (e) => {
+        if (modePopover && !modePopover.contains(e.target) && !btnMode.contains(e.target)) closeModePop();
+      };
+      const closeModePop = () => {
+        if (!modePopover) return;
+        modePopover.remove(); modePopover = null;
+        btnMode.setAttribute('aria-expanded', 'false');
+        document.removeEventListener('pointerdown', onModeDocDown, true);
+      };
+      btnMode.addEventListener('click', () => {
+        if (modePopover) { closeModePop(); return; }
+        modePopover = el('div', {
+          class: 'absolute z-20 bottom-full mb-2 left-0 p-1 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 shadow-xl min-w-[220px]',
+          role: 'menu'
+        });
+        for (const opt of MODE_OPTIONS) {
+          const active = opt.value === this.pageExtractMode;
+          const item = el('button', {
+            class: `w-full text-left text-xs px-3 py-2 rounded flex items-center gap-2 aicx-tap ${active ? 'bg-indigo-50 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-200' : 'hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200'}`,
+            type: 'button',
+            role: 'menuitemradio',
+            'aria-checked': active ? 'true' : 'false'
+          });
+          const mark = el('span', { class: 'w-3.5 h-3.5 inline-flex items-center justify-center shrink-0' });
+          if (active) mark.appendChild(icon('check', 'w-3.5 h-3.5'));
+          item.append(mark, el('span', {}, opt.label));
+          item.addEventListener('click', () => {
+            if (this.pageExtractMode !== opt.value) {
+              this.pageExtractMode = opt.value;
+              this._lastInjectedUrl = null;
+              paintModeBtn();
+            }
+            closeModePop();
+          });
+          modePopover.append(item);
+        }
+        modeWrap.append(modePopover);
+        btnMode.setAttribute('aria-expanded', 'true');
+        setTimeout(() => document.addEventListener('pointerdown', onModeDocDown, true), 0);
+      });
+      modeWrap.append(btnMode);
+
       const btnCtx = el('button', { class: 'w-10 h-10 shrink-0 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 flex items-center justify-center aicx-tap', type: 'button', 'aria-label': 'コンテキストを確認', title: 'AI に送られるページコンテキストをプレビュー' });
       btnCtx.appendChild(icon('search'));
       btnCtx.addEventListener('click', () => this.showContextPreview());
@@ -1954,7 +2082,7 @@
       btnStop.appendChild(icon('stop'));
       btnStop.addEventListener('click', () => this.stop());
 
-      btnRow.append(btnAttach, btnCamera, btnWeb, btnUrlCtx, btnCtxToggle, btnCtx, spacer, btnSend, btnStop, fileInput, cameraInput);
+      btnRow.append(btnAttach, btnCamera, btnWeb, btnUrlCtx, btnCtxToggle, modeWrap, btnCtx, spacer, btnSend, btnStop, fileInput, cameraInput);
       composer.append(selBar, attBar, ta, btnRow);
 
       sheet.append(resizeHandle, header, list, composer);
@@ -2107,7 +2235,7 @@
         snapSource = 'stored';
       } else {
         try {
-          snap = await Page.snapshot();
+          snap = await Page.snapshot(this.pageExtractMode);
         } catch (e) {
           UI.toast('コンテキストの取得に失敗しました: ' + (e && e.message || e), 'error');
           return;
@@ -2116,7 +2244,7 @@
       const MODE_LABEL = {
         auto: '自動 (Readability)',
         clean: 'クリーン (chrome 除外)',
-        raw: 'ほぼそのまま'
+        raw: 'ほぼそのまま (HTML)'
       };
       const modeLabel = MODE_LABEL[snap.mode] || snap.mode;
       const systemPrompt = Store.resolveSystemPrompt(this.host);
@@ -2361,7 +2489,7 @@
       if (this.includeCurrentPage) {
         const currentUrl = location.href;
         if (this._lastInjectedUrl !== currentUrl) {
-          pendingSnap = await Page.snapshot();
+          pendingSnap = await Page.snapshot(this.pageExtractMode);
           this._lastInjectedUrl = currentUrl;
         }
       } else if (firstRealUserMsg && conv.pageSnapshot) {
@@ -2863,7 +2991,7 @@
       const opts = [
         { value: 'auto', label: '自動 (Readability で本文抽出 · 推奨)' },
         { value: 'clean', label: 'クリーン (ヘッダー/ナビ/フッター/サイドバー等を除外)' },
-        { value: 'raw', label: 'ほぼそのまま (スクリプト/スタイル等のみ除外)' }
+        { value: 'raw', label: 'ほぼそのまま (HTML · スクリプト/スタイル/装飾属性のみ除外)' }
       ];
       box.append(Form.select(opts, Store.settings.pageExtractMode || 'auto', (v) => {
         Store.settings.pageExtractMode = v;
@@ -3139,7 +3267,7 @@
         { value: 'inherit', label: 'グローバル設定を使用' },
         { value: 'auto', label: '自動 (Readability で本文抽出)' },
         { value: 'clean', label: 'クリーン (ヘッダー/ナビ/フッター/サイドバー等を除外)' },
-        { value: 'raw', label: 'ほぼそのまま (スクリプト/スタイル等のみ除外)' }
+        { value: 'raw', label: 'ほぼそのまま (HTML · スクリプト/スタイル/装飾属性のみ除外)' }
       ];
       box.append(Form.select(opts, dom.pageExtractMode || 'inherit', async (v) => {
         dom.pageExtractMode = v;
