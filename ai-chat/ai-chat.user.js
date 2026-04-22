@@ -438,6 +438,23 @@
   }
 
   const Gemini = {
+    // Compact badge for a Gemini model id: "gemini-2.5-pro" → "2.5P",
+    // "gemini-3-flash" → "3F", "gemini-2.0-flash-lite" → "2.0FL". Falls
+    // back to a truncation of the non-prefix portion for odd ids so the
+    // UI always has something short to display.
+    abbreviate(id) {
+      if (!id) return '—';
+      const s = String(id).replace(/^models\//, '').replace(/^gemini-/i, '');
+      const ver = (s.match(/^([0-9]+(?:\.[0-9]+)?)/) || [])[1] || '';
+      let tier = '';
+      if (/flash-lite/i.test(s)) tier = 'FL';
+      else if (/\bpro\b/i.test(s)) tier = 'P';
+      else if (/\bflash\b/i.test(s)) tier = 'F';
+      else if (/\bultra\b/i.test(s)) tier = 'U';
+      else if (/\bnano\b/i.test(s)) tier = 'N';
+      const out = ver + tier;
+      return out || s.slice(0, 6).toUpperCase();
+    },
     async listModels(apiKey) {
       if (!apiKey) throw new Error('API key is required.');
       const url = `${API_BASE}/models?pageSize=200&key=${encodeURIComponent(apiKey)}`;
@@ -1791,6 +1808,27 @@
   // =========================================================================
   const ChatPanel = {
     panel: null, host: null, conv: null, aborter: null, attachments: [],
+    _modelsCache: null, _modelsPromise: null,
+    // Fetch-once model list shared across open()s of the chat panel. The
+    // model picker in the header calls into here; the settings panel has
+    // its own cache and refresh UI, so both coexist without coordination.
+    async getModels(force = false) {
+      if (!force && this._modelsCache) return this._modelsCache;
+      if (!force && this._modelsPromise) return this._modelsPromise;
+      if (!Store.settings.apiKey) return [];
+      this._modelsPromise = (async () => {
+        try {
+          this._modelsCache = await Gemini.listModels(Store.settings.apiKey);
+        } catch (e) {
+          console.warn('[aicx] getModels failed:', e);
+          this._modelsCache = [];
+        } finally {
+          this._modelsPromise = null;
+        }
+        return this._modelsCache;
+      })();
+      return this._modelsPromise;
+    },
     open(opts = {}) {
       this.close();
       const host = getDomain();
@@ -2068,6 +2106,92 @@
       });
       modeWrap.append(btnMode);
 
+      // Model picker — compact pill in the action row showing the
+      // abbreviated current model. Opening reveals the full catalog
+      // (fetched once per panel session) and selecting persists globally
+      // via Store.settings.model. Placed in the composer area so the
+      // popover naturally paints above the messages list.
+      const modelBtnWrap = el('div', { class: 'relative shrink-0' });
+      const btnModel = el('button', {
+        type: 'button',
+        class: 'h-10 shrink-0 rounded-full flex items-center justify-center gap-1 px-3 aicx-tap transition bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300',
+        'aria-label': 'モデルを選択',
+        'aria-haspopup': 'menu',
+        'aria-expanded': 'false'
+      });
+      btnModel.append(icon('bot'));
+      const btnModelLabel = el('span', { class: 'text-xs font-medium' }, '');
+      btnModel.append(btnModelLabel);
+      const paintModelBtn = () => {
+        btnModelLabel.textContent = Gemini.abbreviate(Store.settings.model || '');
+        btnModel.title = `モデル: ${Store.settings.model || '(未選択)'}`;
+      };
+      paintModelBtn();
+      let modelPopover = null;
+      const onModelDocDown = (e) => {
+        if (modelPopover && !modelPopover.contains(e.target) && !btnModel.contains(e.target)) closeModelPop();
+      };
+      const closeModelPop = () => {
+        if (!modelPopover) return;
+        modelPopover.remove(); modelPopover = null;
+        btnModel.setAttribute('aria-expanded', 'false');
+        document.removeEventListener('pointerdown', onModelDocDown, true);
+      };
+      btnModel.addEventListener('click', async () => {
+        if (modelPopover) { closeModelPop(); return; }
+        modelPopover = el('div', {
+          class: 'absolute z-20 bottom-full mb-2 left-0 p-1 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 shadow-xl max-h-80 overflow-auto w-72',
+          role: 'menu'
+        });
+        modelPopover.append(el('div', { class: 'text-xs text-zinc-500 p-3' }, 'モデル一覧を取得中...'));
+        modelBtnWrap.append(modelPopover);
+        btnModel.setAttribute('aria-expanded', 'true');
+        setTimeout(() => document.addEventListener('pointerdown', onModelDocDown, true), 0);
+
+        const currentPopover = modelPopover;
+        if (!Store.settings.apiKey) {
+          clear(currentPopover);
+          currentPopover.append(el('div', { class: 'text-xs text-zinc-500 p-3' }, 'API キーが未設定です。設定画面から追加してください。'));
+          return;
+        }
+        const models = await this.getModels();
+        if (modelPopover !== currentPopover) return; // closed while loading
+        clear(currentPopover);
+        if (!models.length) {
+          currentPopover.append(el('div', { class: 'text-xs text-zinc-500 p-3' }, 'モデル一覧を取得できませんでした。'));
+          return;
+        }
+        const current = Store.settings.model || '';
+        for (const m of models) {
+          const active = m.id === current;
+          const item = el('button', {
+            type: 'button',
+            class: `w-full text-left px-3 py-2 rounded flex items-start gap-2 aicx-tap ${active ? 'bg-indigo-50 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-200' : 'hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200'}`,
+            role: 'menuitemradio',
+            'aria-checked': active ? 'true' : 'false'
+          });
+          const mark = el('span', { class: 'w-3.5 h-3.5 inline-flex items-center justify-center shrink-0 mt-0.5' });
+          if (active) mark.appendChild(icon('check', 'w-3.5 h-3.5'));
+          const text = el('div', { class: 'flex-1 min-w-0' });
+          text.append(
+            el('div', { class: 'text-xs font-medium truncate' }, m.display || m.id),
+            el('div', { class: 'text-[10px] text-zinc-500 dark:text-zinc-400 truncate' }, m.id)
+          );
+          item.append(mark, text);
+          item.addEventListener('click', async () => {
+            if (Store.settings.model !== m.id) {
+              Store.settings.model = m.id;
+              await Store.saveSettings();
+              paintModelBtn();
+              updateTitleSub();
+            }
+            closeModelPop();
+          });
+          currentPopover.append(item);
+        }
+      });
+      modelBtnWrap.append(btnModel);
+
       const btnCtx = el('button', { class: 'w-10 h-10 shrink-0 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 flex items-center justify-center aicx-tap', type: 'button', 'aria-label': 'コンテキストを確認', title: 'AI に送られるページコンテキストをプレビュー' });
       btnCtx.appendChild(icon('search'));
       btnCtx.addEventListener('click', () => this.showContextPreview());
@@ -2080,7 +2204,7 @@
       btnStop.appendChild(icon('stop'));
       btnStop.addEventListener('click', () => this.stop());
 
-      actionsWrap.append(btnAttach, btnCamera, btnWeb, btnUrlCtx, btnCtxToggle, modeWrap, btnCtx, fileInput, cameraInput);
+      actionsWrap.append(btnAttach, btnCamera, btnWeb, btnUrlCtx, btnCtxToggle, modeWrap, modelBtnWrap, btnCtx, fileInput, cameraInput);
       btnRow.append(actionsWrap, btnSend, btnStop);
       composer.append(selBar, attBar, ta, btnRow);
 
