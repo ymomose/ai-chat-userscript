@@ -1197,6 +1197,11 @@
           };
           window.tailwind.config = {
             darkMode: 'class',
+            // Scope every utility under #aicx-root so host-page elements with
+            // matching class names (e.g. `.flex`, `.p-4`, `.text-sm`) don't
+            // receive the overlay's utility styles and break the host layout.
+            // Tailwind rewrites each selector to `#aicx-root .foo { … !important }`.
+            important: '#aicx-root',
             corePlugins: { preflight: false },
             theme: {
               spacing: emSpacing,
