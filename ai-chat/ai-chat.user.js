@@ -1470,6 +1470,7 @@
       bot:     '<rect x="4" y="6" width="16" height="12" rx="3" stroke="currentColor" stroke-width="1.6" fill="none"/><circle cx="9" cy="12" r="1.2" fill="currentColor"/><circle cx="15" cy="12" r="1.2" fill="currentColor"/><path d="M12 2v4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>',
       drag:    '<circle cx="9" cy="6" r="1.4" fill="currentColor"/><circle cx="15" cy="6" r="1.4" fill="currentColor"/><circle cx="9" cy="12" r="1.4" fill="currentColor"/><circle cx="15" cy="12" r="1.4" fill="currentColor"/><circle cx="9" cy="18" r="1.4" fill="currentColor"/><circle cx="15" cy="18" r="1.4" fill="currentColor"/>',
       web:     '<circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.6" fill="none"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18" stroke="currentColor" stroke-width="1.6" fill="none"/>',
+      link:    '<path d="M10 13a5 5 0 0 0 7.07 0l3-3a5 5 0 1 0-7.07-7.07l-1.5 1.5M14 11a5 5 0 0 0-7.07 0l-3 3a5 5 0 1 0 7.07 7.07l1.5-1.5" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round"/>',
       copy:    '<rect x="9" y="9" width="11" height="11" rx="2" stroke="currentColor" stroke-width="1.6" fill="none"/><path d="M5 15V6a2 2 0 0 1 2-2h9" stroke="currentColor" stroke-width="1.6" fill="none"/>',
       search:  '<circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="1.6" fill="none"/><path d="M20 20l-4.35-4.35" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>',
       edit:    '<path d="M12 20h9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4 12.5-12.5Z" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linejoin="round"/>',
@@ -1706,7 +1707,7 @@
             title: label + (scope === 'global' ? ' (グローバル)' : '')
           });
           b.appendChild(icon(t.icon || 'template', 'w-5 h-5'));
-          b.addEventListener('click', () => { this.closeMenu(); ChatPanel.open({ newChat: true, initialPrompt: t.prompt || '', autoSend: true, webSearch: !!t.webSearch }); });
+          b.addEventListener('click', () => { this.closeMenu(); ChatPanel.open({ newChat: true, initialPrompt: t.prompt || '', autoSend: true, webSearch: !!t.webSearch, urlContext: !!t.urlContext }); });
           return b;
         };
         for (const t of globalTpls) bar.appendChild(mkShortcut(t, 'global'));
@@ -1749,6 +1750,9 @@
       // Web grounding defaults to off for every newly opened chat panel,
       // unless the caller (e.g. a template shortcut) explicitly requests it.
       this.webGrounding = !!opts.webSearch;
+      // URL Context tool defaults OFF — only enabled when the user opts in
+      // per-chat via the composer toggle.
+      this.urlContext = !!opts.urlContext;
       // Include-current-page defaults ON for fresh chats, and OFF when
       // restoring from history. Rationale: a restored conversation already
       // has its conversation-time page baked into `conv.pageSnapshot` and
@@ -1892,6 +1896,20 @@
         updateWebBtn();
       });
 
+      const btnUrlCtx = el('button', { class: '', type: 'button', 'aria-label': 'URL Context', 'aria-pressed': 'false', title: 'Gemini の URL Context を有効/無効 (プロンプト内の URL をツールが取得・解析します)' });
+      btnUrlCtx.appendChild(icon('link'));
+      const updateUrlCtxBtn = () => {
+        const on = !!this.urlContext;
+        btnUrlCtx.setAttribute('aria-pressed', on ? 'true' : 'false');
+        btnUrlCtx.className = `h-10 shrink-0 rounded-full flex items-center justify-center gap-1 px-3 aicx-tap transition ${on ? 'bg-indigo-600 text-white' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300'}`;
+      };
+      updateUrlCtxBtn();
+      btnUrlCtx.appendChild(el('span', { class: 'text-xs font-medium' }, 'URL'));
+      btnUrlCtx.addEventListener('click', () => {
+        this.urlContext = !this.urlContext;
+        updateUrlCtxBtn();
+      });
+
       // Context toggle (include the current page as context). Round icon-
       // button whose background reflects pressed state, matching the size
       // of the other composer buttons so the row fits on narrow screens.
@@ -1936,7 +1954,7 @@
       btnStop.appendChild(icon('stop'));
       btnStop.addEventListener('click', () => this.stop());
 
-      btnRow.append(btnAttach, btnCamera, btnWeb, btnCtxToggle, btnCtx, spacer, btnSend, btnStop, fileInput, cameraInput);
+      btnRow.append(btnAttach, btnCamera, btnWeb, btnUrlCtx, btnCtxToggle, btnCtx, spacer, btnSend, btnStop, fileInput, cameraInput);
       composer.append(selBar, attBar, ta, btnRow);
 
       sheet.append(resizeHandle, header, list, composer);
@@ -2425,10 +2443,19 @@
       try {
         let acc = '';
         // Google Search grounding (requires Gemini 2.0+ for `googleSearch`; 1.5 uses `googleSearchRetrieval`)
+        // URL Context asks Gemini to fetch and read URLs present in the prompt.
+        // It's a Gemini 2.x tool, so we skip it on 1.x and on 1.x only the
+        // legacy retrieval tool is offered.
+        const modelId = Store.settings.model || '';
+        const isLegacy = /\b1\.[05]\b/.test(modelId);
         let tools;
-        if (this.webGrounding) {
-          const m = Store.settings.model || '';
-          tools = /\b1\.[05]\b/.test(m) ? [{ googleSearchRetrieval: {} }] : [{ googleSearch: {} }];
+        if (isLegacy) {
+          if (this.webGrounding) tools = [{ googleSearchRetrieval: {} }];
+        } else {
+          const t = [];
+          if (this.webGrounding) t.push({ googleSearch: {} });
+          if (this.urlContext) t.push({ urlContext: {} });
+          if (t.length) tools = t;
         }
         let grounding = null;
         const stream = Gemini.streamGenerate({
@@ -2877,14 +2904,15 @@
           const ta = Form.textarea(t.prompt || '', async (v) => { t.prompt = v; await Store.saveSettings(); }, 3);
           ta.placeholder = 'プロンプトテキスト';
           const webChk = Form.checkbox('Web 検索 (Grounding) を有効にする', !!t.webSearch, async (v) => { t.webSearch = v; await Store.saveSettings(); });
-          row.append(head, ta, webChk);
+          const urlChk = Form.checkbox('URL Context を有効にする', !!t.urlContext, async (v) => { t.urlContext = v; await Store.saveSettings(); });
+          row.append(head, ta, webChk, urlChk);
           list.append(row);
         }
         if (!tpls.length) list.append(el('p', { class: 'text-xs text-zinc-500' }, 'テンプレートはまだありません。'));
       };
       render();
       const addBtn = Form.btn('+ テンプレートを追加', async () => {
-        tpls.push({ id: uid(), icon: 'template', name: '新規テンプレート', prompt: '', webSearch: false });
+        tpls.push({ id: uid(), icon: 'template', name: '新規テンプレート', prompt: '', webSearch: false, urlContext: false });
         await Store.saveSettings();
         render();
       }, 'bg-zinc-100 dark:bg-zinc-800 text-zinc-800 dark:text-zinc-100 w-full');
@@ -3148,14 +3176,15 @@
           const ta = Form.textarea(t.prompt || '', async (v) => { t.prompt = v; await Store.saveDomains(); }, 3);
           ta.placeholder = 'プロンプトテキスト';
           const webChk = Form.checkbox('Web 検索 (Grounding) を有効にする', !!t.webSearch, async (v) => { t.webSearch = v; await Store.saveDomains(); });
-          row.append(head, ta, webChk);
+          const urlChk = Form.checkbox('URL Context を有効にする', !!t.urlContext, async (v) => { t.urlContext = v; await Store.saveDomains(); });
+          row.append(head, ta, webChk, urlChk);
           list.append(row);
         }
         if (!dom.templates.length) list.append(el('p', { class: 'text-xs text-zinc-500' }, 'テンプレートはまだありません。'));
       };
       render();
       const addBtn = Form.btn('+ テンプレートを追加', async () => {
-        dom.templates.push({ id: uid(), icon: 'template', name: '新規テンプレート', prompt: '', webSearch: false });
+        dom.templates.push({ id: uid(), icon: 'template', name: '新規テンプレート', prompt: '', webSearch: false, urlContext: false });
         await Store.saveDomains();
         render();
       }, 'bg-zinc-100 dark:bg-zinc-800 text-zinc-800 dark:text-zinc-100 w-full');
