@@ -258,6 +258,185 @@
     });
   }
 
+  // Streaming variant of GM.xmlHttpRequest.
+  //
+  // Prefers Tampermonkey's `responseType: 'stream'`, which exposes a real
+  // ReadableStream on `onloadstart`'s `response.response`. That path delivers
+  // bytes as the server flushes them — exactly what SSE needs.
+  //
+  // When the runtime doesn't honor `responseType: 'stream'` (Violentmonkey,
+  // older Tampermonkey builds), we fall back to reading `responseText` growth
+  // from `onprogress`. That path is best-effort: some environments buffer
+  // more aggressively, which can coalesce chunks but still produces valid
+  // (just chunkier) output.
+  function gmStream({ method = 'GET', url, headers, body, signal }) {
+    return {
+      [Symbol.asyncIterator]() {
+        const queue = [];
+        let pendingResolve = null;
+        let pendingReject = null;
+        let finished = false;
+        let failure = null;
+        let lastIndex = 0;
+        let usingReadableStream = false;
+        let streamReader = null;
+        let streamEndTimer = null;
+        let handle = null;
+
+        const push = (chunk) => {
+          if (!chunk) return;
+          if (pendingResolve) {
+            const r = pendingResolve; pendingResolve = null; pendingReject = null;
+            r({ value: chunk, done: false });
+          } else {
+            queue.push(chunk);
+          }
+        };
+        const finish = (err) => {
+          if (finished) return;
+          finished = true;
+          failure = err || null;
+          if (streamEndTimer) { clearTimeout(streamEndTimer); streamEndTimer = null; }
+          // Wake any pending reader.read() in pumpReadable so it can exit.
+          // cancel() fulfils the pending read with {done: true}; subsequent
+          // reads resolve the same way, so the pump loop terminates cleanly.
+          if (streamReader) {
+            try { streamReader.cancel(); } catch {}
+          }
+          if (pendingResolve) {
+            const r = pendingResolve; const j = pendingReject;
+            pendingResolve = null; pendingReject = null;
+            if (err) j(err); else r({ value: undefined, done: true });
+          }
+        };
+        const drainResponseText = (r) => {
+          const text = r && typeof r.responseText === 'string' ? r.responseText : '';
+          if (text.length > lastIndex) {
+            const slice = text.slice(lastIndex);
+            lastIndex = text.length;
+            push(slice);
+          }
+        };
+        const pumpReadable = async (stream) => {
+          usingReadableStream = true;
+          streamReader = stream.getReader();
+          const decoder = new TextDecoder();
+          try {
+            while (true) {
+              const { value, done } = await streamReader.read();
+              if (done) break;
+              if (value == null) continue;
+              if (typeof value === 'string') push(value);
+              else push(decoder.decode(value, { stream: true }));
+            }
+            const tail = decoder.decode();
+            if (tail) push(tail);
+          } catch (e) {
+            if (!finished) finish(e);
+            return;
+          }
+          if (!finished) finish(null);
+        };
+        // Safety net: some Tampermonkey builds deliver all chunks through the
+        // stream but never flip `done: true`, so `pumpReadable`'s reader stays
+        // pending forever. When the XHR's `onload`/`onloadend` fires we know
+        // no more bytes are coming — give the pump a brief grace window to
+        // drain any already-enqueued chunks, then force-close.
+        const scheduleStreamEnd = () => {
+          if (finished || streamEndTimer) return;
+          streamEndTimer = setTimeout(() => {
+            streamEndTimer = null;
+            if (!finished) finish(null);
+          }, 250);
+        };
+
+        if (!_gmXhr) {
+          finish(new Error('GM_xmlhttpRequest is unavailable'));
+        } else if (signal && signal.aborted) {
+          finish(Object.assign(new Error('Aborted'), { name: 'AbortError' }));
+        } else {
+          handle = _gmXhr({
+            method, url, headers, data: body,
+            responseType: 'stream',
+            onloadstart: (r) => {
+              const resp = r && r.response;
+              if (resp && typeof resp.getReader === 'function') {
+                pumpReadable(resp);
+              }
+            },
+            onprogress: (r) => {
+              if (usingReadableStream) return;
+              try { drainResponseText(r); } catch {}
+            },
+            onload: (r) => {
+              if (r && (r.status < 200 || r.status >= 300)) {
+                finish(new Error(`Gemini request failed: ${r.status} ${(r && r.responseText) || (r && r.statusText) || ''}`));
+                return;
+              }
+              if (!usingReadableStream) {
+                try { drainResponseText(r); } catch {}
+                finish(null);
+                return;
+              }
+              scheduleStreamEnd();
+            },
+            onloadend: () => { if (usingReadableStream) scheduleStreamEnd(); },
+            onerror: (r) => finish(new Error(`Network error${r && r.status ? ' ' + r.status : ''}${r && r.statusText ? ' ' + r.statusText : ''}`)),
+            ontimeout: () => finish(new Error('Request timed out')),
+            onabort: () => finish(Object.assign(new Error('Aborted'), { name: 'AbortError' }))
+          });
+          if (signal) {
+            signal.addEventListener('abort', () => {
+              try { handle && handle.abort && handle.abort(); } catch {}
+            }, { once: true });
+          }
+        }
+
+        return {
+          next() {
+            if (queue.length) return Promise.resolve({ value: queue.shift(), done: false });
+            if (finished) {
+              if (failure) return Promise.reject(failure);
+              return Promise.resolve({ value: undefined, done: true });
+            }
+            return new Promise((resolve, reject) => {
+              pendingResolve = resolve;
+              pendingReject = reject;
+            });
+          },
+          return(v) {
+            try { handle && handle.abort && handle.abort(); } catch {}
+            finish(null);
+            return Promise.resolve({ value: v, done: true });
+          },
+          throw(e) {
+            try { handle && handle.abort && handle.abort(); } catch {}
+            finish(e);
+            return Promise.reject(e);
+          }
+        };
+      }
+    };
+  }
+
+  // Adapt a ReadableStream (e.g. fetch response body) into an async iterable
+  // of decoded text chunks so it can share the SSE parsing loop with gmStream.
+  async function* readerToTextChunks(body) {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) yield decoder.decode(value, { stream: true });
+      }
+      const tail = decoder.decode();
+      if (tail) yield tail;
+    } finally {
+      try { reader.releaseLock(); } catch {}
+    }
+  }
+
   const Gemini = {
     async listModels(apiKey) {
       if (!apiKey) throw new Error('API key is required.');
@@ -322,69 +501,44 @@
         body.systemInstruction = { role: 'user', parts: [{ text: systemPrompt }] };
       }
       if (tools && tools.length) body.tools = tools;
+      const payload = JSON.stringify(body);
+      const reqHeaders = { 'content-type': 'application/json' };
+
+      // Pick a transport: try fetch first (native SSE); if the page's CSP
+      // (or a network error) blocks it, fall back to GM.xmlHttpRequest and
+      // stream incrementally via its onprogress callback.
+      let chunks;
       let res = null;
       try {
-        res = await fetch(streamUrl, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(body),
-          signal
-        });
+        res = await fetch(streamUrl, { method: 'POST', headers: reqHeaders, body: payload, signal });
       } catch (e) {
         if (e && e.name === 'AbortError') throw e;
-        // CSP / network — fall back to GM_xmlhttpRequest against the
-        // non-streaming endpoint. GM_xmlhttpRequest can't do SSE, so we
-        // surface the full response as a single chunk.
-        console.warn('[aicx] fetch streamGenerate blocked, falling back to GM_xmlhttpRequest (non-streaming):', e);
-        const genUrl = `${API_BASE}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
-        const r = await gmRequest({
-          method: 'POST', url: genUrl,
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(body),
-          signal
-        });
-        if (r.status < 200 || r.status >= 300) {
-          throw new Error(`Gemini request failed: ${r.status} ${r.responseText || r.statusText || ''}`);
-        }
-        let obj;
-        try { obj = JSON.parse(r.responseText); } catch { throw new Error('Gemini: invalid JSON response'); }
-        if (obj && obj.error) {
-          throw new Error((obj.error.message || 'Gemini API error') + (obj.error.status ? ` (${obj.error.status})` : ''));
-        }
-        const cand = obj && obj.candidates && obj.candidates[0];
-        const parts = cand && cand.content && cand.content.parts;
-        if (parts) {
-          for (const p of parts) if (p.text) yield p.text;
-        }
-        if (cand && cand.groundingMetadata && typeof onMetadata === 'function') {
-          try { onMetadata(cand.groundingMetadata); } catch {}
-        }
-        if (cand && cand.finishReason && cand.finishReason !== 'STOP' && cand.finishReason !== 'FINISH_REASON_UNSPECIFIED') {
-          yield `\n\n_(finishReason: ${cand.finishReason})_`;
-        }
-        return;
+        console.warn('[aicx] fetch streamGenerate blocked, falling back to GM.xmlHttpRequest:', e);
       }
-      if (!res.ok || !res.body) {
-        const t = await res.text();
-        throw new Error(`Gemini request failed: ${res.status} ${t}`);
+      if (res) {
+        if (!res.ok || !res.body) {
+          const t = await res.text();
+          throw new Error(`Gemini request failed: ${res.status} ${t}`);
+        }
+        chunks = readerToTextChunks(res.body);
+      } else {
+        chunks = gmStream({ method: 'POST', url: streamUrl, headers: reqHeaders, body: payload, signal });
       }
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
+
+      // Shared SSE parsing loop. Both transports deliver text chunks that we
+      // split on blank-line boundaries, then parse `data:` lines as JSON.
       let buf = '';
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        // SSE: split on double newlines
+      for await (const text of chunks) {
+        buf += text;
         const parts = buf.split(/\r?\n\r?\n/);
         buf = parts.pop();
         for (const chunk of parts) {
           const lines = chunk.split(/\r?\n/).filter((l) => l.startsWith('data:'));
           for (const line of lines) {
-            const payload = line.slice(5).trim();
-            if (!payload || payload === '[DONE]') continue;
+            const data = line.slice(5).trim();
+            if (!data || data === '[DONE]') continue;
             let obj;
-            try { obj = JSON.parse(payload); } catch { continue; }
+            try { obj = JSON.parse(data); } catch { continue; }
             if (obj && obj.error) {
               throw new Error((obj.error.message || 'Gemini API error') + (obj.error.status ? ` (${obj.error.status})` : ''));
             }
@@ -396,9 +550,22 @@
             if (cand && cand.groundingMetadata && typeof onMetadata === 'function') {
               try { onMetadata(cand.groundingMetadata); } catch {}
             }
-            if (cand && cand.finishReason && cand.finishReason !== 'STOP' && cand.finishReason !== 'FINISH_REASON_UNSPECIFIED') {
-              // Safety block or length cap — surface to user via a tail message
-              yield `\n\n_(finishReason: ${cand.finishReason})_`;
+            if (cand && cand.finishReason && cand.finishReason !== 'FINISH_REASON_UNSPECIFIED') {
+              // Gemini's final SSE frame always carries a finishReason. Using
+              // it as the authoritative end-of-response signal lets us exit
+              // the generator (and, via the inner iterator's return(), abort
+              // the GM_xmlhttpRequest) even when the transport itself never
+              // signals stream-close — some Tampermonkey builds deliver every
+              // byte but never flip the ReadableStream to `done: true`, and
+              // their `onload`/`onloadend` callbacks also don't fire in
+              // `responseType: 'stream'` mode. Waiting for transport close
+              // there leaves the request (and the UI "generating" state)
+              // pending forever.
+              if (cand.finishReason !== 'STOP') {
+                // Safety block or length cap — surface to user via a tail message
+                yield `\n\n_(finishReason: ${cand.finishReason})_`;
+              }
+              return;
             }
           }
         }
