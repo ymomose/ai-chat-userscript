@@ -157,6 +157,9 @@
     //   'auto'  : Mozilla Readability → falls back to 'clean' if it yields nothing
     //   'clean' : heuristic — strip header/footer/nav/aside/[aria-hidden]/[hidden]
     //   'raw'   : legacy — strip only script/style/svg/iframe/video/audio/canvas
+    //   'none'  : do not attach the current page as context (per-chat opt-out;
+    //             this is also what restored conversations default to so the
+    //             stored pageSnapshot is used instead of the current page)
     pageExtractMode: 'auto'
   };
 
@@ -1726,17 +1729,15 @@ textarea { resize: none; }
       // URL Context tool defaults OFF — only enabled when the user opts in
       // per-chat via the composer toggle.
       this.urlContext = !!opts.urlContext;
-      // Include-current-page defaults ON for fresh chats, and OFF when
-      // restoring from history. Rationale: a restored conversation already
-      // has its conversation-time page baked into `conv.pageSnapshot` and
-      // the user is often on a different page now — silently layering the
-      // current page over the original context would be misleading.
-      this.includeCurrentPage = conv ? false : true;
       // Session-level extraction-mode override. Seeded from the resolved
-      // domain/global setting so the chat behaves as configured by default,
-      // but changeable from the composer for the duration of this panel
-      // session (no persistence — closing the panel reverts to settings).
-      this.pageExtractMode = Store.resolvePageExtractMode(host);
+      // domain/global setting for fresh chats, but forced to 'none' when
+      // restoring from history so the conversation-time `conv.pageSnapshot`
+      // — not whatever page the user happens to be on now — is what the
+      // model continues to see. Changeable from the composer picker for
+      // the duration of this panel session (no persistence — closing the
+      // panel reverts to settings). The 'none' value is also user-selectable
+      // and means "do not attach any page context to outgoing messages".
+      this.pageExtractMode = conv ? 'none' : Store.resolvePageExtractMode(host);
       // Remembers the URL whose snapshot we most recently injected into the
       // API stream during this panel session. Used to avoid re-sending the
       // same context on every follow-up message while still re-injecting
@@ -1905,13 +1906,54 @@ textarea { resize: none; }
       const btnRow = el('div', { class: 'flex items-end gap-2' });
       const actionsWrap = el('div', { class: 'flex flex-wrap items-center gap-2 flex-1 min-w-0' });
 
-      const btnAttach = el('button', { class: 'w-10 h-10 shrink-0 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 flex items-center justify-center aicx-tap', 'aria-label': 'ファイル添付', title: 'ファイル添付' });
+      // Unified attachment button: opens a popover with "ファイル添付" and
+      // "カメラ撮影" so the composer row stays compact on narrow screens
+      // (the two used to be side-by-side pills).
+      const attachWrap = el('div', { class: 'relative shrink-0' });
+      const btnAttach = el('button', {
+        class: 'w-10 h-10 shrink-0 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 flex items-center justify-center aicx-tap',
+        type: 'button',
+        'aria-label': 'ファイル / カメラを追加',
+        'aria-haspopup': 'menu',
+        'aria-expanded': 'false',
+        title: 'ファイル添付 / カメラ撮影'
+      });
       btnAttach.appendChild(icon('attach'));
-      btnAttach.addEventListener('click', () => fileInput.click());
-
-      const btnCamera = el('button', { class: 'w-10 h-10 shrink-0 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 flex items-center justify-center aicx-tap', 'aria-label': 'カメラ撮影', title: 'カメラ撮影' });
-      btnCamera.appendChild(icon('camera'));
-      btnCamera.addEventListener('click', () => cameraInput.click());
+      let attachPopover = null;
+      const onAttachDocDown = (e) => {
+        if (attachPopover && !eventPathIncludes(attachPopover, e) && !eventPathIncludes(btnAttach, e)) closeAttachPop();
+      };
+      const closeAttachPop = () => {
+        if (!attachPopover) return;
+        attachPopover.remove(); attachPopover = null;
+        btnAttach.setAttribute('aria-expanded', 'false');
+        document.removeEventListener('pointerdown', onAttachDocDown, true);
+      };
+      btnAttach.addEventListener('click', () => {
+        if (attachPopover) { closeAttachPop(); return; }
+        attachPopover = el('div', {
+          class: 'absolute z-20 bottom-full mb-2 left-0 p-1 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 shadow-xl min-w-[220px]',
+          role: 'menu'
+        });
+        const mkItem = (iconName, label, onClick) => {
+          const item = el('button', {
+            class: 'w-full text-left text-xs px-3 py-2 rounded flex items-center gap-2 aicx-tap hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200',
+            type: 'button',
+            role: 'menuitem'
+          });
+          item.append(icon(iconName, 'w-4 h-4'), el('span', {}, label));
+          item.addEventListener('click', () => { closeAttachPop(); onClick(); });
+          return item;
+        };
+        attachPopover.append(
+          mkItem('attach', 'ファイル添付', () => fileInput.click()),
+          mkItem('camera', 'カメラ撮影', () => cameraInput.click())
+        );
+        attachWrap.append(attachPopover);
+        btnAttach.setAttribute('aria-expanded', 'true');
+        setTimeout(() => document.addEventListener('pointerdown', onAttachDocDown, true), 0);
+      });
+      attachWrap.append(btnAttach);
 
       const btnWeb = el('button', { class: '', type: 'button', 'aria-label': 'Web 検索 (Grounding)', 'aria-pressed': 'false', title: 'Gemini の Google 検索 Grounding を有効/無効 (このチャット内のみ)' });
       btnWeb.appendChild(icon('web'));
@@ -1939,44 +1981,16 @@ textarea { resize: none; }
         updateUrlCtxBtn();
       });
 
-      // Context toggle (include the current page as context). Round icon-
-      // button whose background reflects pressed state, matching the size
-      // of the other composer buttons so the row fits on narrow screens.
-      // Defaults OFF for restored conversations so the baked-in
-      // pageSnapshot — not whatever page the user is on now — is what the
-      // model receives.
-      const btnCtxToggle = el('button', {
-        type: 'button',
-        'aria-label': '現在のページをコンテキストに含める',
-        'aria-pressed': 'false',
-        title: '現在のページ内容をコンテキストに含める (オン/オフ)'
-      });
-      btnCtxToggle.appendChild(icon('summary'));
-      const updateCtxToggleBtn = () => {
-        const on = !!this.includeCurrentPage;
-        btnCtxToggle.setAttribute('aria-pressed', on ? 'true' : 'false');
-        btnCtxToggle.className = `w-10 h-10 shrink-0 rounded-full flex items-center justify-center aicx-tap transition ${on ? 'bg-indigo-600 text-white' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300'}`;
-      };
-      updateCtxToggleBtn();
-      btnCtxToggle.addEventListener('click', () => {
-        const wasOn = this.includeCurrentPage;
-        this.includeCurrentPage = !wasOn;
-        // OFF → ON: user is asking to (re-)include the current page. Wipe
-        // the injected-URL memo so the next send attaches a fresh snapshot
-        // even if its URL matches the last-injected one — otherwise the
-        // explicit toggle action would be a no-op.
-        if (!wasOn && this.includeCurrentPage) this._lastInjectedUrl = null;
-        updateCtxToggleBtn();
-      });
-
-      // Extraction-mode picker — lets the user switch auto/clean/raw for
-      // this chat without touching the global/domain setting. Changing the
-      // mode invalidates _lastInjectedUrl so the next send attaches a fresh
-      // snapshot built with the new mode.
+      // Extraction-mode picker — lets the user switch the extraction mode
+      // (including "抽出なし", which turns off page-context injection
+      // entirely) for this chat without touching the global/domain setting.
+      // Changing the mode invalidates _lastInjectedUrl so the next send
+      // attaches a fresh snapshot built with the new mode.
       const MODE_OPTIONS = [
         { value: 'auto',  short: '自動',     label: '自動 (Readability)' },
         { value: 'clean', short: 'クリーン', label: 'クリーン (chrome 除外)' },
-        { value: 'raw',   short: '生',       label: 'ほぼそのまま (HTML)' }
+        { value: 'raw',   short: '生',       label: 'ほぼそのまま (HTML)' },
+        { value: 'none',  short: 'なし',     label: '抽出なし (ページを含めない)' }
       ];
       const modeWrap = el('div', { class: 'relative shrink-0' });
       const btnMode = el('button', {
@@ -2135,7 +2149,7 @@ textarea { resize: none; }
       btnStop.appendChild(icon('stop'));
       btnStop.addEventListener('click', () => this.stop());
 
-      actionsWrap.append(btnAttach, btnCamera, btnWeb, btnUrlCtx, btnCtxToggle, modeWrap, modelBtnWrap, btnCtx, fileInput, cameraInput);
+      actionsWrap.append(attachWrap, btnWeb, btnUrlCtx, modeWrap, modelBtnWrap, btnCtx, fileInput, cameraInput);
       btnRow.append(actionsWrap, btnSend, btnStop);
       composer.append(selBar, attBar, ta, btnRow);
 
@@ -2288,9 +2302,19 @@ textarea { resize: none; }
       //   - otherwise  → fall back to a fresh snapshot
       let snap;
       let snapSource = 'current';
-      if (!this.includeCurrentPage && this.conv && this.conv.pageSnapshot) {
-        snap = this.conv.pageSnapshot;
-        snapSource = 'stored';
+      if (this.pageExtractMode === 'none') {
+        // "抽出なし" — do not fetch a fresh snapshot. For restored chats
+        // we still show the baked-in snapshot since it is what the model
+        // will see on the next user message (same as the old toggle-OFF
+        // fallback). For fresh chats with no stored snapshot there is
+        // simply nothing to preview.
+        if (this.conv && this.conv.pageSnapshot) {
+          snap = this.conv.pageSnapshot;
+          snapSource = 'stored';
+        } else {
+          snap = null;
+          snapSource = 'skipped';
+        }
       } else {
         try {
           snap = await Page.snapshot(this.pageExtractMode);
@@ -2302,15 +2326,16 @@ textarea { resize: none; }
       const MODE_LABEL = {
         auto: '自動 (Readability)',
         clean: 'クリーン (chrome 除外)',
-        raw: 'ほぼそのまま (HTML)'
+        raw: 'ほぼそのまま (HTML)',
+        none: '抽出なし (ページを含めない)'
       };
-      const modeLabel = MODE_LABEL[snap.mode] || snap.mode;
+      const modeLabel = MODE_LABEL[(snap && snap.mode) || this.pageExtractMode] || this.pageExtractMode;
       const systemPrompt = Store.resolveSystemPrompt(this.host);
-      const promptText = Page.formatForPrompt(snap);
+      const promptText = snap ? Page.formatForPrompt(snap) : '';
       // Selection shown in the preview comes from the live tracker (what will
       // actually be attached on the next send), not from the one-shot snapshot
       // which may already have been collapsed by focusing the preview button.
-      const trackedSelection = Selection.get() || snap.selection || '';
+      const trackedSelection = Selection.get() || (snap && snap.selection) || '';
 
       const kv = (k, v) => el('div', { class: 'flex gap-2 text-xs' }, [
         el('span', { class: 'shrink-0 w-24 text-zinc-500 dark:text-zinc-400' }, k),
@@ -2335,47 +2360,58 @@ textarea { resize: none; }
       // Summary (mode + stats)
       const sourceLabel = snapSource === 'stored'
         ? '保存済み (会話開始時点)'
-        : (this.includeCurrentPage ? '現在のページ' : '現在のページ (トグル OFF のため未送信)');
-      const stats = el('div', { class: 'space-y-1 p-3 rounded-lg bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-700' }, [
+        : (snapSource === 'skipped' ? '送信されません (抽出なし)' : '現在のページ');
+      const statsChildren = [
         kv('ソース', sourceLabel),
-        kv('抽出モード', modeLabel),
-        kv('本文文字数', `${snap.text.length.toLocaleString()} 文字${snap.text.endsWith('...[truncated]') ? ' (打ち切り)' : ''}`),
-        kv('選択文字数', `${trackedSelection.length.toLocaleString()} 文字`),
-        kv('添付ファイル', this.attachments.length ? this.attachments.map((a) => a.name).join(', ') : 'なし')
-      ]);
+        kv('抽出モード', modeLabel)
+      ];
+      if (snap) {
+        statsChildren.push(kv('本文文字数', `${snap.text.length.toLocaleString()} 文字${snap.text.endsWith('...[truncated]') ? ' (打ち切り)' : ''}`));
+      }
+      statsChildren.push(kv('選択文字数', `${trackedSelection.length.toLocaleString()} 文字`));
+      statsChildren.push(kv('添付ファイル', this.attachments.length ? this.attachments.map((a) => a.name).join(', ') : 'なし'));
+      const stats = el('div', { class: 'space-y-1 p-3 rounded-lg bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-700' }, statsChildren);
       body.append(section('概要', stats));
 
-      // Page meta
-      body.append(section('ページ情報', el('div', { class: 'space-y-1' }, [
-        kv('URL', snap.url),
-        kv('Title', snap.title || '(なし)'),
-        kv('Description', snap.metaDesc || '(なし)')
-      ])));
+      // Page meta (only when a snapshot exists)
+      if (snap) {
+        body.append(section('ページ情報', el('div', { class: 'space-y-1' }, [
+          kv('URL', snap.url),
+          kv('Title', snap.title || '(なし)'),
+          kv('Description', snap.metaDesc || '(なし)')
+        ])));
+      }
 
       // Selection (attached per-message, not embedded in page context)
       if (trackedSelection) body.append(section('選択中のテキスト (次回送信時に添付)', preBlock(trackedSelection)));
 
-      // Extracted text
-      body.append(section('抽出された本文', preBlock(snap.text)));
+      if (snap) {
+        // Extracted text
+        body.append(section('抽出された本文', preBlock(snap.text)));
+      }
 
       // System prompt
       body.append(section('システムプロンプト', preBlock(systemPrompt || '(なし)')));
 
-      // Full prompt (what actually gets sent as context)
-      body.append(section('送信される Page Context (整形済み)', preBlock(promptText)));
+      if (snap) {
+        // Full prompt (what actually gets sent as context)
+        body.append(section('送信される Page Context (整形済み)', preBlock(promptText)));
+      }
 
-      // Actions
-      const actions = el('div', { class: 'flex gap-2 pt-2' });
-      const copyBtn = Form.btn('本文をコピー', async () => {
-        const ok = await copyToClipboard(snap.text);
-        UI.toast(ok ? 'コピーしました' : 'コピーに失敗しました', ok ? 'success' : 'error');
-      }, 'bg-zinc-200 dark:bg-zinc-700 text-zinc-800 dark:text-zinc-100');
-      const copyAllBtn = Form.btn('プロンプト全体をコピー', async () => {
-        const ok = await copyToClipboard(promptText);
-        UI.toast(ok ? 'コピーしました' : 'コピーに失敗しました', ok ? 'success' : 'error');
-      }, 'bg-indigo-600 text-white');
-      actions.append(copyBtn, copyAllBtn);
-      body.append(actions);
+      // Actions — only shown when there is an actual snapshot to copy.
+      if (snap) {
+        const actions = el('div', { class: 'flex gap-2 pt-2' });
+        const copyBtn = Form.btn('本文をコピー', async () => {
+          const ok = await copyToClipboard(snap.text);
+          UI.toast(ok ? 'コピーしました' : 'コピーに失敗しました', ok ? 'success' : 'error');
+        }, 'bg-zinc-200 dark:bg-zinc-700 text-zinc-800 dark:text-zinc-100');
+        const copyAllBtn = Form.btn('プロンプト全体をコピー', async () => {
+          const ok = await copyToClipboard(promptText);
+          UI.toast(ok ? 'コピーしました' : 'コピーに失敗しました', ok ? 'success' : 'error');
+        }, 'bg-indigo-600 text-white');
+        actions.append(copyBtn, copyAllBtn);
+        body.append(actions);
+      }
 
       UI.root.appendChild(panel);
     },
@@ -2529,22 +2565,23 @@ textarea { resize: none; }
 
       // Decide whether to inject a page-context snapshot pair on this turn.
       //
-      // Toggle ON: snapshot the current page, *unless* we've already
-      //   injected this same URL during this panel session — that keeps
-      //   same-page follow-ups from re-paying the context token cost.
+      // Extraction mode ≠ 'none': snapshot the current page, *unless* we've
+      //   already injected this same URL during this panel session — that
+      //   keeps same-page follow-ups from re-paying the context token cost.
       //   When the user navigates to a different page (URL changes) or
-      //   flips the toggle OFF→ON (which clears _lastInjectedUrl), the
-      //   next send triggers a fresh injection. Injections are
-      //   *additive*: they're persisted as synthetic message pairs inside
-      //   conv.messages (not replacing prior context), so the model sees
-      //   every page the user chose to share, in chronological order.
+      //   switches the mode from 'none' to an extracting mode (any mode
+      //   change clears _lastInjectedUrl), the next send triggers a fresh
+      //   injection. Injections are *additive*: they're persisted as
+      //   synthetic message pairs inside conv.messages (not replacing prior
+      //   context), so the model sees every page the user chose to share,
+      //   in chronological order.
       //
-      // Toggle OFF: only inject on the very first real message of a
-      //   conversation, and only if a stored snapshot is available —
-      //   lets a restored chat re-use its conversation-time page without
-      //   the user having to toggle anything.
+      // Extraction mode = 'none': only inject on the very first real
+      //   message of a conversation, and only if a stored snapshot is
+      //   available — lets a restored chat re-use its conversation-time
+      //   page without the user having to change the extraction mode.
       let pendingSnap = null;
-      if (this.includeCurrentPage) {
+      if (this.pageExtractMode !== 'none') {
         const currentUrl = location.href;
         if (this._lastInjectedUrl !== currentUrl) {
           pendingSnap = await Page.snapshot(this.pageExtractMode);
@@ -3049,7 +3086,8 @@ textarea { resize: none; }
       const opts = [
         { value: 'auto', label: '自動 (Readability で本文抽出 · 推奨)' },
         { value: 'clean', label: 'クリーン (ヘッダー/ナビ/フッター/サイドバー等を除外)' },
-        { value: 'raw', label: 'ほぼそのまま (HTML · スクリプト/スタイル/装飾属性のみ除外)' }
+        { value: 'raw', label: 'ほぼそのまま (HTML · スクリプト/スタイル/装飾属性のみ除外)' },
+        { value: 'none', label: '抽出なし (ページをコンテキストに含めない)' }
       ];
       box.append(Form.select(opts, Store.settings.pageExtractMode || 'auto', (v) => {
         Store.settings.pageExtractMode = v;
@@ -3325,7 +3363,8 @@ textarea { resize: none; }
         { value: 'inherit', label: 'グローバル設定を使用' },
         { value: 'auto', label: '自動 (Readability で本文抽出)' },
         { value: 'clean', label: 'クリーン (ヘッダー/ナビ/フッター/サイドバー等を除外)' },
-        { value: 'raw', label: 'ほぼそのまま (HTML · スクリプト/スタイル/装飾属性のみ除外)' }
+        { value: 'raw', label: 'ほぼそのまま (HTML · スクリプト/スタイル/装飾属性のみ除外)' },
+        { value: 'none', label: '抽出なし (ページをコンテキストに含めない)' }
       ];
       box.append(Form.select(opts, dom.pageExtractMode || 'inherit', async (v) => {
         dom.pageExtractMode = v;
