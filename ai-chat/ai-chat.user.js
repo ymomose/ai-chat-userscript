@@ -1402,6 +1402,7 @@ textarea { resize: none; }
     shadow: null,   // attached shadow root — every overlay element lives here
     root: null,     // .aicx-stage inside shadow — where `.dark` is toggled and children mount
     toastHost: null,
+    _twPromise: null,
     init() {
       const hostEl = el('div', { id: 'aicx-root' });
       (document.body || document.documentElement).appendChild(hostEl);
@@ -1418,18 +1419,38 @@ textarea { resize: none; }
       const baseStyle = document.createElement('style');
       baseStyle.textContent = BASE_CSS;
       shadow.appendChild(baseStyle);
-      const twStyle = document.createElement('style');
-      twStyle.textContent = TAILWIND_CSS;
-      shadow.appendChild(twStyle);
+      // TAILWIND_CSS injection is deferred to the first FAB click — see
+      // `UI.ensureTailwindLoaded()` and `OverlayButton.toggleMenu()`. The
+      // FAB itself renders from hand-written `.aicx-fab-btn` rules in
+      // BASE_CSS above, so it is fully styled before Tailwind loads; pages
+      // the user never engages with pay no cost for the large utility sheet.
       const stage = el('div', { class: 'aicx-stage' });
       shadow.appendChild(stage);
       this.hostEl = hostEl;
       this.shadow = shadow;
       this.root = stage;
-      // toast host
+      // Toast host uses Tailwind utilities, but no toast is emitted until
+      // the user interacts with an overlay panel — by which time Tailwind
+      // has already been injected via ensureTailwindLoaded().
       this.toastHost = el('div', { class: 'fixed bottom-4 left-1/2 -translate-x-1/2 flex flex-col gap-2 items-center pointer-events-none', style: { zIndex: 20 } });
       stage.appendChild(this.toastHost);
       Theme.install(stage);
+    },
+    // Lazily inject the precompiled Tailwind stylesheet on first demand.
+    // Runs in a microtask so the click handler returns promptly; the menu
+    // opens immediately after the returned promise resolves, so its first
+    // frame already has utilities applied (no flash of unstyled content).
+    ensureTailwindLoaded() {
+      if (this._twPromise) return this._twPromise;
+      this._twPromise = new Promise((resolve) => {
+        queueMicrotask(() => {
+          const twStyle = document.createElement('style');
+          twStyle.textContent = TAILWIND_CSS;
+          this.shadow.appendChild(twStyle);
+          resolve();
+        });
+      });
+      return this._twPromise;
     },
     toast(msg, kind = 'info') {
       const colors = {
@@ -1570,6 +1591,9 @@ textarea { resize: none; }
       // Defer raw-doc prefetch to the first interaction so pages the user
       // never engages with pay zero runtime cost.
       try { Page.primeRawDoc(); } catch {}
+      // Defer the precompiled Tailwind stylesheet to the first click too —
+      // start it before the await so it runs in parallel with primeRawDoc.
+      await UI.ensureTailwindLoaded();
       this.openMenu();
     },
     closeMenu() {
@@ -3440,12 +3464,15 @@ textarea { resize: none; }
     await Store.load();
     // If coming back from OAuth, consume hash
     Drive.consumeOAuthHash();
-    // Styles ship as a precompiled CSS string injected into a closed Shadow
-    // Root, so there is no runtime class scan, no MutationObserver on the
-    // host document, and no network fetch for a styling library. Pages the
-    // user never engages with — Speedometer, benchmarks, embedded third-party
-    // frames — pay essentially zero runtime cost from the overlay, and the
-    // host page's CSS is fully insulated from overlay styles (and vice versa).
+    // Styles ship as a precompiled CSS string injected into a Shadow Root,
+    // so there is no runtime class scan, no MutationObserver on the host
+    // document, and no network fetch for a styling library. The large
+    // utility sheet (`TAILWIND_CSS`) is deferred until the FAB is first
+    // clicked — only the tiny `BASE_CSS` runs at startup, so pages the
+    // user never engages with — Speedometer, benchmarks, embedded third-
+    // party frames — pay essentially zero runtime cost from the overlay,
+    // and the host page's CSS is fully insulated from overlay styles (and
+    // vice versa).
     UI.init();
     Selection.init();
     OverlayButton.init();
