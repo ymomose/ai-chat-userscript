@@ -23,7 +23,6 @@
 // @connect      generativelanguage.googleapis.com
 // @connect      www.googleapis.com
 // @connect      oauth2.googleapis.com
-// @connect      cdn.tailwindcss.com
 // @require      https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js
 // @require      https://cdn.jsdelivr.net/npm/dompurify@3.0.11/dist/purify.min.js
 // @require      https://cdn.jsdelivr.net/npm/@mozilla/readability@0.5.0/Readability.js
@@ -76,6 +75,16 @@
   const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
   const now = () => Date.now();
   const $ = (sel, root) => (root || document).querySelector(sel);
+  // Events originating inside a shadow tree have their `target` retargeted
+  // to the shadow host when observed from the light DOM, so `.contains(target)`
+  // no longer works against shadow-internal elements. Walking `composedPath`
+  // piercing the shadow boundary gives the true event path.
+  const eventPathIncludes = (container, e) => {
+    if (!container) return false;
+    const path = (e && typeof e.composedPath === 'function') ? e.composedPath() : null;
+    if (path && path.length) return path.indexOf(container) !== -1;
+    return !!(e && e.target && container.contains(e.target));
+  };
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const debounce = (fn, ms) => {
     let t;
@@ -1055,7 +1064,7 @@
           if (!text) return;
           const node = sel.anchorNode;
           const anchor = node && (node.nodeType === 3 ? node.parentNode : node);
-          if (anchor && UI.rootEl && UI.rootEl.contains(anchor)) return;
+          if (anchor && UI.hostEl && UI.hostEl.contains(anchor)) return;
           const next = text.slice(0, 4000);
           if (next === this._last) return;
           this._last = next;
@@ -1097,7 +1106,7 @@
         : raw;
       return this.decorate(clean);
     },
-    // Add Tailwind classes so rendered markdown looks right under our scoped tailwind
+    // Add Tailwind classes so rendered markdown looks right inside the overlay
     decorate(html) {
       const tpl = document.createElement('div');
       tpl.innerHTML = html;
@@ -1164,199 +1173,92 @@
   };
 
   // =========================================================================
-  // 9. Tailwind bootstrap  (lazy-loaded on first interaction)
+  // 9. Styles — precompiled Tailwind + hand-written base, installed into a
+  //    Shadow Root by UI.init below.
   // =========================================================================
   //
-  // We deliberately avoid `@require`-ing the Play CDN. The CDN's IIFE installs
-  // a MutationObserver on `document.documentElement` with subtree+childList+
-  // class-attribute observation, and *every* mutation batch triggers a full
-  // `document.querySelectorAll('[class]')` + classList walk — no debounce, no
-  // disable API. On benchmark-heavy pages (Speedometer, real-world SPAs that
-  // churn thousands of nodes per frame) this destroys the host page's
-  // performance and can crash the tab. By loading Tailwind lazily on the
-  // first FAB click and wrapping `MutationObserver` so the CDN's observer
-  // attaches to our own root instead of `documentElement`, the host DOM stays
-  // unobserved and host perf is unaffected.
-  const TAILWIND_SRC_URL = 'https://cdn.tailwindcss.com/3.4.16';
-  const TailwindBoot = {
-    loaded: false,
-    loading: null,
-    load() {
-      if (this.loaded) return Promise.resolve();
-      if (this.loading) return this.loading;
-      this.loading = this._load().catch((e) => {
-        console.warn('[aicx] Tailwind load failed:', e);
-        this.loading = null;
-        throw e;
-      });
-      return this.loading;
-    },
-    _fetchSource() {
-      return new Promise((resolve, reject) => {
-        const xhr = (typeof GM !== 'undefined' && GM && GM.xmlHttpRequest)
-          || (typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest : null);
-        if (!xhr) { reject(new Error('GM_xmlhttpRequest unavailable')); return; }
-        try {
-          xhr({
-            method: 'GET',
-            url: TAILWIND_SRC_URL,
-            onload: (r) => {
-              if (r && typeof r.responseText === 'string' && r.responseText) resolve(r.responseText);
-              else reject(new Error('empty Tailwind response'));
-            },
-            onerror: (e) => reject(e || new Error('Tailwind fetch error')),
-            ontimeout: () => reject(new Error('Tailwind fetch timeout'))
-          });
-        } catch (e) { reject(e); }
-      });
-    },
-    async _load() {
-      const source = await this._fetchSource();
-      // Scope MutationObserver to our own root BEFORE Tailwind executes.
-      // Tailwind's IIFE will call `new MutationObserver(...).observe(
-      // document.documentElement, { subtree, childList, attributes: class })`.
-      // Our wrapper rewrites that single target so Tailwind never sees host
-      // DOM mutations — only mutations inside `#aicx-root`, which is our UI.
-      const OrigMO = window.MutationObserver;
-      const scope = UI.rootEl || document.documentElement;
-      class ScopedMO extends OrigMO {
-        observe(target, options) {
-          if (target === document.documentElement || target === document || target === document.body) {
-            target = scope;
-          }
-          return super.observe(target, options);
-        }
-      }
-      window.MutationObserver = ScopedMO;
-      try {
-        // Execute Tailwind in the userscript sandbox. `new Function` bypasses
-        // the host page's `script-src` CSP (unlike a `<script src=…>` element)
-        // and runs synchronously, so by the time it returns, `window.tailwind`
-        // is installed.
-        (new Function(source))();
-        if (window.tailwind) {
-          // Replace Tailwind's default rem-based scales with em-based ones.
-          // Rationale: `rem` resolves against the host page's <html>
-          // font-size. When a site sets `html { font-size: 10px !important }`
-          // (common reset pattern), every w-*/h-*/p-*/rounded-* utility
-          // inside our overlay shrinks with it — e.g. a w-4 icon becomes
-          // 10px instead of 16px. `em` resolves against the element's own
-          // font-size, which we pin to 14px at #aicx-root (and enforce on
-          // text-* utilities below), so em values are immune to host CSS.
-          const emSpacing = {
-            '0': '0px', 'px': '1px',
-            '0.5': '0.125em', '1': '0.25em', '1.5': '0.375em', '2': '0.5em',
-            '2.5': '0.625em', '3': '0.75em', '3.5': '0.875em', '4': '1em',
-            '5': '1.25em', '6': '1.5em', '7': '1.75em', '8': '2em',
-            '9': '2.25em', '10': '2.5em', '11': '2.75em', '12': '3em',
-            '14': '3.5em', '16': '4em', '20': '5em', '24': '6em',
-            '28': '7em', '32': '8em', '36': '9em', '40': '10em',
-            '44': '11em', '48': '12em', '52': '13em', '56': '14em',
-            '60': '15em', '64': '16em', '72': '18em', '80': '20em', '96': '24em'
-          };
-          // Setting `window.tailwind.config` hits the CDN's Proxy `set` trap,
-          // which schedules the initial build. The build is what generates
-          // CSS for every `[class]` already present in the DOM (including our
-          // mounted UI), so the scoped observer only needs to fire for
-          // future class additions inside `#aicx-root`.
-          window.tailwind.config = {
-            darkMode: 'class',
-            // Scope every utility under #aicx-root so host-page elements with
-            // matching class names (e.g. `.flex`, `.p-4`, `.text-sm`) don't
-            // receive the overlay's utility styles and break the host layout.
-            // Tailwind rewrites each selector to `#aicx-root .foo { … !important }`.
-            important: '#aicx-root',
-            corePlugins: { preflight: false },
-            theme: {
-              spacing: emSpacing,
-              borderRadius: {
-                'none': '0px',
-                'sm': '0.125em',
-                DEFAULT: '0.25em',
-                'md': '0.375em',
-                'lg': '0.5em',
-                'xl': '0.75em',
-                '2xl': '1em',
-                '3xl': '1.5em',
-                'full': '9999px'
-              },
-              maxWidth: {
-                '0': '0em',
-                'none': 'none',
-                'xs': '20em', 'sm': '24em', 'md': '28em', 'lg': '32em',
-                'xl': '36em', '2xl': '42em', '3xl': '48em', '4xl': '56em',
-                '5xl': '64em', '6xl': '72em', '7xl': '80em',
-                'full': '100%', 'min': 'min-content', 'max': 'max-content', 'fit': 'fit-content',
-                'prose': '65ch',
-                'screen-sm': '640px', 'screen-md': '768px', 'screen-lg': '1024px',
-                'screen-xl': '1280px', 'screen-2xl': '1536px'
-              },
-              fontSize: {
-                'xs':   ['0.75em',  { lineHeight: '1em' }],
-                'sm':   ['0.875em', { lineHeight: '1.25em' }],
-                'base': ['1em',     { lineHeight: '1.5em' }],
-                'lg':   ['1.125em', { lineHeight: '1.75em' }],
-                'xl':   ['1.25em',  { lineHeight: '1.75em' }],
-                '2xl':  ['1.5em',   { lineHeight: '2em' }],
-                '3xl':  ['1.875em', { lineHeight: '2.25em' }],
-                '4xl':  ['2.25em',  { lineHeight: '2.5em' }]
-              },
-              lineHeight: {
-                'none': '1', 'tight': '1.25', 'snug': '1.375',
-                'normal': '1.5', 'relaxed': '1.625', 'loose': '2',
-                '3': '0.75em', '4': '1em', '5': '1.25em', '6': '1.5em',
-                '7': '1.75em', '8': '2em', '9': '2.25em', '10': '2.5em'
-              },
-              extend: {
-                fontFamily: {
-                  sans: ['system-ui', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Helvetica', 'Arial', 'sans-serif'],
-                  mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'Consolas', 'monospace']
-                }
-              }
-            }
-          };
-        }
-      } finally {
-        // Restore the original constructor. Observers already created under
-        // our wrapper keep their redirected target — the wrapper is only
-        // consulted at `.observe()` call time.
-        window.MutationObserver = OrigMO;
-      }
-      this.loaded = true;
-    },
-    // Install scoped base styles (mini "preflight" confined to our root) so page CSS
-    // can't bleed into our UI, and vice versa.
-    installBase() {
-      if (document.getElementById('aicx-base')) return;
-      const css = `
-/* AI Chat Overlay — scoped base */
-/* Font stack + size + line-height are marked !important so host-page rules
-   (e.g. html { font-size: 10px !important } or body { font-family: Noto Serif !important })
-   can't propagate into our overlay. */
-#aicx-root {
+  // All overlay styles are injected into a Shadow Root, so they cannot leak
+  // into the host page and host-page CSS cannot cascade into the overlay
+  // (except through inherited properties, which we pin on `:host`). The
+  // Tailwind CSS string below is generated at build time by `build/build.mjs`
+  // running the Tailwind CLI against this file as its content source — no
+  // runtime CDN, no MutationObserver, no class scanner.
+  //
+  // ------------------------------------------------------------------------
+  // NOTE FOR FUTURE AI AGENTS / MAINTAINERS — READ BEFORE EDITING STYLES
+  // ------------------------------------------------------------------------
+  // 1. The contents of `TAILWIND_CSS` between the
+  //      TAILWIND_CSS_START ... TAILWIND_CSS_END
+  //    markers are MACHINE-GENERATED. Do NOT hand-edit that string — any
+  //    manual change will be silently overwritten the next time the build
+  //    script runs. Edit classes in the userscript source instead, then
+  //    rerun the build (see step 3).
+  //
+  // 2. When you ADD / REMOVE / RENAME any Tailwind utility class anywhere in
+  //    this file (including template literals and dynamic `${...}` class
+  //    names), the embedded CSS goes out of sync with the markup. You MUST
+  //    rebuild so the Shadow-Root `<style>` contains rules for the new
+  //    classes — otherwise the UI renders unstyled for those classes.
+  //    Arbitrary-value utilities (e.g. `max-w-[160px]`, `text-[10px]`) must
+  //    appear literally in a source string; do not construct them at runtime.
+  //
+  // 3. Build command (run from repo root or the `ai-chat/` directory):
+  //      cd ai-chat
+  //      npm install     # first time only
+  //      npm run build   # regenerates TAILWIND_CSS in this file
+  //    The script (`build/build.mjs`) invokes the Tailwind CLI configured at
+  //    `build/tailwind.config.cjs` with this file as its content source and
+  //    rewrites the region between the markers above. Commit the updated
+  //    `ai-chat.user.js`; end users install that single file and never need
+  //    Node / npm themselves.
+  //
+  // 4. The `important: '#aicx-root'` scoping trick used in the legacy Play
+  //    CDN setup is intentionally GONE — Shadow DOM provides the isolation
+  //    instead. Do not reintroduce runtime Tailwind loading (Play CDN,
+  //    `<script src=cdn.tailwindcss.com>`, `new Function(source)()`, etc.);
+  //    that was what caused Speedometer-class pages to suffer massive perf
+  //    regressions and style leakage. All styling must go through the
+  //    precompiled path above.
+  // ------------------------------------------------------------------------
+  /* @TAILWIND_CSS_START */
+  const TAILWIND_CSS = `.\\!container{width:100%!important}.container{width:100%}@media (min-width:640px){.\\!container{max-width:640px!important}.container{max-width:640px}}@media (min-width:768px){.\\!container{max-width:768px!important}.container{max-width:768px}}@media (min-width:1024px){.\\!container{max-width:1024px!important}.container{max-width:1024px}}@media (min-width:1280px){.\\!container{max-width:1280px!important}.container{max-width:1280px}}@media (min-width:1536px){.\\!container{max-width:1536px!important}.container{max-width:1536px}}.pointer-events-none{pointer-events:none}.pointer-events-auto{pointer-events:auto}.\\!visible{visibility:visible!important}.visible{visibility:visible}.fixed{position:fixed}.absolute{position:absolute}.relative{position:relative}.inset-0{inset:0}.bottom-4{bottom:1em}.bottom-full{bottom:100%}.left-0{left:0}.left-1{left:.25em}.left-1\\/2{left:50%}.z-20{z-index:20}.my-2{margin-top:.5em;margin-bottom:.5em}.my-3{margin-top:.75em;margin-bottom:.75em}.mb-1{margin-bottom:.25em}.mb-2{margin-bottom:.5em}.ml-5{margin-left:1.25em}.mr-1{margin-right:.25em}.mr-2{margin-right:.5em}.mt-0{margin-top:0}.mt-0\\.5{margin-top:.125em}.mt-1{margin-top:.25em}.mt-1\\.5{margin-top:.375em}.mt-2{margin-top:.5em}.mt-3{margin-top:.75em}.mt-4{margin-top:1em}.line-clamp-2{-webkit-line-clamp:2}.line-clamp-2,.line-clamp-3{overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical}.line-clamp-3{-webkit-line-clamp:3}.block{display:block}.inline-block{display:inline-block}.inline{display:inline}.flex{display:flex}.inline-flex{display:inline-flex}.table{display:table}.grid{display:grid}.contents{display:contents}.hidden{display:none}.h-1{height:.25em}.h-10{height:2.5em}.h-3{height:.75em}.h-3\\.5{height:.875em}.h-4{height:1em}.h-5{height:1.25em}.h-6{height:1.5em}.h-8{height:2em}.h-9{height:2.25em}.h-auto{height:auto}.max-h-40{max-height:10em}.max-h-64{max-height:16em}.max-h-80{max-height:20em}.max-h-\\[160px\\]{max-height:160px}.min-h-\\[40px\\]{min-height:40px}.w-10{width:2.5em}.w-24{width:6em}.w-3{width:.75em}.w-3\\.5{width:.875em}.w-4{width:1em}.w-5{width:1.25em}.w-6{width:1.5em}.w-72{width:18em}.w-8{width:2em}.w-9{width:2.25em}.w-full{width:100%}.min-w-0{min-width:0}.min-w-\\[220px\\]{min-width:220px}.min-w-\\[80px\\]{min-width:80px}.max-w-\\[160px\\]{max-width:160px}.max-w-\\[200px\\]{max-width:200px}.max-w-\\[85\\%\\]{max-width:85%}.max-w-\\[90\\%\\]{max-width:90%}.max-w-full{max-width:100%}.max-w-sm{max-width:24em}.flex-1{flex:1 1 0%}.flex-shrink,.shrink{flex-shrink:1}.shrink-0{flex-shrink:0}.border-collapse{border-collapse:collapse}.-translate-x-1{--tw-translate-x:-0.25em}.-translate-x-1,.-translate-x-1\\/2{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.-translate-x-1\\/2{--tw-translate-x:-50%}.transform{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.cursor-pointer{cursor:pointer}.select-none{-webkit-user-select:none;-moz-user-select:none;user-select:none}.resize{resize:both}.list-decimal{list-style-type:decimal}.list-disc{list-style-type:disc}.grid-cols-6{grid-template-columns:repeat(6,minmax(0,1fr))}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.items-start{align-items:flex-start}.items-end{align-items:flex-end}.items-center{align-items:center}.justify-start{justify-content:flex-start}.justify-end{justify-content:flex-end}.justify-center{justify-content:center}.gap-1{gap:.25em}.gap-2{gap:.5em}.gap-3{gap:.75em}.space-y-1>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.25em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.25em*var(--tw-space-y-reverse))}.space-y-2>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.5em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.5em*var(--tw-space-y-reverse))}.space-y-3>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.75em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.75em*var(--tw-space-y-reverse))}.space-y-6>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(1.5em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(1.5em*var(--tw-space-y-reverse))}.divide-y>:not([hidden])~:not([hidden]){--tw-divide-y-reverse:0;border-top-width:calc(1px*(1 - var(--tw-divide-y-reverse)));border-bottom-width:calc(1px*var(--tw-divide-y-reverse))}.divide-zinc-100>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(244 244 245/var(--tw-divide-opacity,1))}.overflow-auto{overflow:auto}.overflow-hidden{overflow:hidden}.overflow-x-auto{overflow-x:auto}.overflow-y-auto{overflow-y:auto}.truncate{overflow:hidden;text-overflow:ellipsis}.truncate,.whitespace-nowrap{white-space:nowrap}.whitespace-pre-wrap{white-space:pre-wrap}.break-words{overflow-wrap:break-word}.break-all{word-break:break-all}.rounded{border-radius:.25em}.rounded-2xl{border-radius:1em}.rounded-full{border-radius:9999px}.rounded-lg{border-radius:.5em}.rounded-md{border-radius:.375em}.rounded-r-lg{border-top-right-radius:.5em;border-bottom-right-radius:.5em}.rounded-t-2xl{border-top-left-radius:1em;border-top-right-radius:1em}.border{border-width:1px}.border-b{border-bottom-width:1px}.border-b-2{border-bottom-width:2px}.border-l-4{border-left-width:4px}.border-t{border-top-width:1px}.border-indigo-500{--tw-border-opacity:1;border-color:rgb(99 102 241/var(--tw-border-opacity,1))}.border-indigo-600{--tw-border-opacity:1;border-color:rgb(79 70 229/var(--tw-border-opacity,1))}.border-transparent{border-color:transparent}.border-zinc-100{--tw-border-opacity:1;border-color:rgb(244 244 245/var(--tw-border-opacity,1))}.border-zinc-200{--tw-border-opacity:1;border-color:rgb(228 228 231/var(--tw-border-opacity,1))}.border-zinc-300{--tw-border-opacity:1;border-color:rgb(212 212 216/var(--tw-border-opacity,1))}.bg-black{--tw-bg-opacity:1;background-color:rgb(0 0 0/var(--tw-bg-opacity,1))}.bg-black\\/30{background-color:rgba(0,0,0,.3)}.bg-black\\/40{background-color:rgba(0,0,0,.4)}.bg-emerald-600{--tw-bg-opacity:1;background-color:rgb(5 150 105/var(--tw-bg-opacity,1))}.bg-indigo-100{--tw-bg-opacity:1;background-color:rgb(224 231 255/var(--tw-bg-opacity,1))}.bg-indigo-50{--tw-bg-opacity:1;background-color:rgb(238 242 255/var(--tw-bg-opacity,1))}.bg-indigo-600{--tw-bg-opacity:1;background-color:rgb(79 70 229/var(--tw-bg-opacity,1))}.bg-indigo-900{--tw-bg-opacity:1;background-color:rgb(49 46 129/var(--tw-bg-opacity,1))}.bg-red-600{--tw-bg-opacity:1;background-color:rgb(220 38 38/var(--tw-bg-opacity,1))}.bg-red-900{--tw-bg-opacity:1;background-color:rgb(127 29 29/var(--tw-bg-opacity,1))}.bg-transparent{background-color:transparent}.bg-white{--tw-bg-opacity:1;background-color:rgb(255 255 255/var(--tw-bg-opacity,1))}.bg-zinc-100{--tw-bg-opacity:1;background-color:rgb(244 244 245/var(--tw-bg-opacity,1))}.bg-zinc-200{--tw-bg-opacity:1;background-color:rgb(228 228 231/var(--tw-bg-opacity,1))}.bg-zinc-300{--tw-bg-opacity:1;background-color:rgb(212 212 216/var(--tw-bg-opacity,1))}.bg-zinc-50{--tw-bg-opacity:1;background-color:rgb(250 250 250/var(--tw-bg-opacity,1))}.bg-zinc-800{--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.bg-zinc-900{--tw-bg-opacity:1;background-color:rgb(24 24 27/var(--tw-bg-opacity,1))}.object-cover{-o-object-fit:cover;object-fit:cover}.p-0{padding:0}.p-1{padding:.25em}.p-2{padding:.5em}.p-3{padding:.75em}.p-4{padding:1em}.p-8{padding:2em}.px-1{padding-left:.25em;padding-right:.25em}.px-1\\.5{padding-left:.375em;padding-right:.375em}.px-2{padding-left:.5em;padding-right:.5em}.px-3{padding-left:.75em;padding-right:.75em}.px-4{padding-left:1em;padding-right:1em}.py-0{padding-top:0;padding-bottom:0}.py-0\\.5{padding-top:.125em;padding-bottom:.125em}.py-1{padding-top:.25em;padding-bottom:.25em}.py-1\\.5{padding-top:.375em;padding-bottom:.375em}.py-2{padding-top:.5em;padding-bottom:.5em}.py-2\\.5{padding-top:.625em;padding-bottom:.625em}.py-3{padding-top:.75em;padding-bottom:.75em}.py-8{padding-top:2em;padding-bottom:2em}.pb-1{padding-bottom:.25em}.pb-2{padding-bottom:.5em}.pb-3{padding-bottom:.75em}.pl-3{padding-left:.75em}.pt-0{padding-top:0}.pt-0\\.5{padding-top:.125em}.pt-2{padding-top:.5em}.pt-3{padding-top:.75em}.pt-4{padding-top:1em}.text-left{text-align:left}.text-center{text-align:center}.align-top{vertical-align:top}.font-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.text-\\[0\\.85em\\]{font-size:.85em}.text-\\[10px\\]{font-size:10px}.text-\\[11px\\]{font-size:11px}.text-base{font-size:16px;line-height:24px}.text-lg{font-size:18px;line-height:28px}.text-sm{font-size:14px;line-height:20px}.text-xl{font-size:20px;line-height:28px}.text-xs{font-size:12px;line-height:16px}.font-bold{font-weight:700}.font-medium{font-weight:500}.font-semibold{font-weight:600}.uppercase{text-transform:uppercase}.italic{font-style:italic}.leading-none{line-height:1}.leading-relaxed{line-height:1.625}.tracking-wide{letter-spacing:.025em}.tracking-wider{letter-spacing:.05em}.text-blue-600{--tw-text-opacity:1;color:rgb(37 99 235/var(--tw-text-opacity,1))}.text-emerald-600{--tw-text-opacity:1;color:rgb(5 150 105/var(--tw-text-opacity,1))}.text-indigo-600{--tw-text-opacity:1;color:rgb(79 70 229/var(--tw-text-opacity,1))}.text-indigo-700{--tw-text-opacity:1;color:rgb(67 56 202/var(--tw-text-opacity,1))}.text-inherit{color:inherit}.text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.text-zinc-100{--tw-text-opacity:1;color:rgb(244 244 245/var(--tw-text-opacity,1))}.text-zinc-400{--tw-text-opacity:1;color:rgb(161 161 170/var(--tw-text-opacity,1))}.text-zinc-500{--tw-text-opacity:1;color:rgb(113 113 122/var(--tw-text-opacity,1))}.text-zinc-600{--tw-text-opacity:1;color:rgb(82 82 91/var(--tw-text-opacity,1))}.text-zinc-700{--tw-text-opacity:1;color:rgb(63 63 70/var(--tw-text-opacity,1))}.text-zinc-800{--tw-text-opacity:1;color:rgb(39 39 42/var(--tw-text-opacity,1))}.text-zinc-900{--tw-text-opacity:1;color:rgb(24 24 27/var(--tw-text-opacity,1))}.underline{text-decoration-line:underline}.antialiased{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}.opacity-80{opacity:.8}.shadow{--tw-shadow:0 1px 3px 0 rgba(0,0,0,.1),0 1px 2px -1px rgba(0,0,0,.1);--tw-shadow-colored:0 1px 3px 0 var(--tw-shadow-color),0 1px 2px -1px var(--tw-shadow-color)}.shadow,.shadow-2xl{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-2xl{--tw-shadow:0 25px 50px -12px rgba(0,0,0,.25);--tw-shadow-colored:0 25px 50px -12px var(--tw-shadow-color)}.shadow-lg{--tw-shadow:0 10px 15px -3px rgba(0,0,0,.1),0 4px 6px -4px rgba(0,0,0,.1);--tw-shadow-colored:0 10px 15px -3px var(--tw-shadow-color),0 4px 6px -4px var(--tw-shadow-color)}.shadow-lg,.shadow-xl{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-xl{--tw-shadow:0 20px 25px -5px rgba(0,0,0,.1),0 8px 10px -6px rgba(0,0,0,.1);--tw-shadow-colored:0 20px 25px -5px var(--tw-shadow-color),0 8px 10px -6px var(--tw-shadow-color)}.outline{outline-style:solid}.blur{--tw-blur:blur(8px)}.blur,.filter{filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.transition{transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,-webkit-backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter,-webkit-backdrop-filter;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.ease-out{transition-timing-function:cubic-bezier(0,0,.2,1)}.empty\\:hidden:empty{display:none}.hover\\:bg-indigo-50:hover{--tw-bg-opacity:1;background-color:rgb(238 242 255/var(--tw-bg-opacity,1))}.hover\\:bg-red-50:hover{--tw-bg-opacity:1;background-color:rgb(254 242 242/var(--tw-bg-opacity,1))}.hover\\:bg-zinc-100:hover{--tw-bg-opacity:1;background-color:rgb(244 244 245/var(--tw-bg-opacity,1))}.hover\\:bg-zinc-50:hover{--tw-bg-opacity:1;background-color:rgb(250 250 250/var(--tw-bg-opacity,1))}.hover\\:text-red-500:hover{--tw-text-opacity:1;color:rgb(239 68 68/var(--tw-text-opacity,1))}.hover\\:text-red-600:hover{--tw-text-opacity:1;color:rgb(220 38 38/var(--tw-text-opacity,1))}.hover\\:text-zinc-700:hover{--tw-text-opacity:1;color:rgb(63 63 70/var(--tw-text-opacity,1))}.hover\\:underline:hover{text-decoration-line:underline}.disabled\\:opacity-50:disabled{opacity:.5}.dark\\:divide-zinc-800:is(.dark *)>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(39 39 42/var(--tw-divide-opacity,1))}.dark\\:border-zinc-600:is(.dark *){--tw-border-opacity:1;border-color:rgb(82 82 91/var(--tw-border-opacity,1))}.dark\\:border-zinc-700:is(.dark *){--tw-border-opacity:1;border-color:rgb(63 63 70/var(--tw-border-opacity,1))}.dark\\:border-zinc-800:is(.dark *){--tw-border-opacity:1;border-color:rgb(39 39 42/var(--tw-border-opacity,1))}.dark\\:bg-indigo-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(49 46 129/var(--tw-bg-opacity,1))}.dark\\:bg-indigo-900\\/30:is(.dark *){background-color:rgba(49,46,129,.3)}.dark\\:bg-indigo-900\\/40:is(.dark *){background-color:rgba(49,46,129,.4)}.dark\\:bg-zinc-600:is(.dark *){--tw-bg-opacity:1;background-color:rgb(82 82 91/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-700:is(.dark *){--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-800:is(.dark *){--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-800\\/50:is(.dark *){background-color:rgba(39,39,42,.5)}.dark\\:bg-zinc-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(24 24 27/var(--tw-bg-opacity,1))}.dark\\:text-blue-400:is(.dark *){--tw-text-opacity:1;color:rgb(96 165 250/var(--tw-text-opacity,1))}.dark\\:text-indigo-200:is(.dark *){--tw-text-opacity:1;color:rgb(199 210 254/var(--tw-text-opacity,1))}.dark\\:text-indigo-300:is(.dark *){--tw-text-opacity:1;color:rgb(165 180 252/var(--tw-text-opacity,1))}.dark\\:text-indigo-400:is(.dark *){--tw-text-opacity:1;color:rgb(129 140 248/var(--tw-text-opacity,1))}.dark\\:text-zinc-100:is(.dark *){--tw-text-opacity:1;color:rgb(244 244 245/var(--tw-text-opacity,1))}.dark\\:text-zinc-200:is(.dark *){--tw-text-opacity:1;color:rgb(228 228 231/var(--tw-text-opacity,1))}.dark\\:text-zinc-300:is(.dark *){--tw-text-opacity:1;color:rgb(212 212 216/var(--tw-text-opacity,1))}.dark\\:text-zinc-400:is(.dark *){--tw-text-opacity:1;color:rgb(161 161 170/var(--tw-text-opacity,1))}.dark\\:text-zinc-500:is(.dark *){--tw-text-opacity:1;color:rgb(113 113 122/var(--tw-text-opacity,1))}.dark\\:hover\\:bg-indigo-900\\/40:hover:is(.dark *){background-color:rgba(49,46,129,.4)}.dark\\:hover\\:bg-red-900\\/30:hover:is(.dark *){background-color:rgba(127,29,29,.3)}.dark\\:hover\\:bg-zinc-700:hover:is(.dark *){--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.dark\\:hover\\:bg-zinc-800:hover:is(.dark *){--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.dark\\:hover\\:bg-zinc-800\\/50:hover:is(.dark *){background-color:rgba(39,39,42,.5)}.dark\\:hover\\:bg-zinc-800\\/60:hover:is(.dark *){background-color:rgba(39,39,42,.6)}.dark\\:hover\\:text-zinc-200:hover:is(.dark *){--tw-text-opacity:1;color:rgb(228 228 231/var(--tw-text-opacity,1))}@media (min-width:640px){.sm\\:mx-auto{margin-left:auto;margin-right:auto}.sm\\:my-4{margin-top:1em}.sm\\:mb-4,.sm\\:my-4{margin-bottom:1em}.sm\\:h-\\[calc\\(100dvh-2em\\)\\]{height:calc(100dvh - 2em)}.sm\\:max-w-4xl{max-width:56em}.sm\\:max-w-5xl{max-width:64em}.sm\\:max-w-6xl{max-width:72em}.sm\\:items-stretch{align-items:stretch}.sm\\:rounded-2xl{border-radius:1em}}`;
+  /* @TAILWIND_CSS_END */
+
+  const BASE_CSS = `
+/* AI Chat Overlay — shadow-root base */
+/* Shadow DOM already isolates styles. The only inherited properties that
+   still cross the shadow boundary are the usual CSS inherited ones (color,
+   font-*, line-height, etc.), so we pin those on :host to defeat host-page
+   inheritance without needing !important everywhere. */
+:host {
   all: initial;
   position: fixed;
   inset: 0;
   pointer-events: none;
   z-index: 2147483000;
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif !important;
-  font-size: 14px !important;
-  line-height: 1.5 !important;
-  color: rgb(24,24,27);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  /* Pin the overlay's root font-size so host pages that override the
+     default html font-size (\`html { font-size: 10px !important }\` is a
+     common CSS-reset pattern) don't shrink the UI via rem / em cascades.
+     Tailwind's text-* utilities use absolute px values (see
+     build/tailwind.config.cjs), so those are independently immune; this
+     pin anchors em-based spacing/border-radius and the inherited default
+     for elements without a text-* utility. */
+  font-size: 16px;
+  line-height: 1.5;
+  color: rgb(24, 24, 27);
   -webkit-tap-highlight-color: transparent;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
-#aicx-root .aicx-stage {
+.aicx-stage {
   position: absolute;
   inset: 0;
   pointer-events: none;
   color: inherit;
 }
-#aicx-root .dark { color: rgb(228,228,231); }
-/* Element-level reset wrapped in :where() so specificity is 0.
-   Tailwind utilities (specificity 0,1,0) always override these resets. */
-:where(#aicx-root *, #aicx-root *::before, #aicx-root *::after) {
+.dark { color: rgb(228, 228, 231); }
+*, *::before, *::after {
   box-sizing: border-box;
   margin: 0;
   padding: 0;
@@ -1370,241 +1272,76 @@
   text-decoration: none;
   list-style: none;
 }
-/* Defeat host-page rules that target naked elements (e.g. 'body span' with
-   !important at specificity (0,0,2)) — those would otherwise color our
-   descendants directly, bypassing the inheritance chain from root. Using
-   '#aicx-root *' gets specificity (1,0,0) which beats any non-ID page rule;
-   our .text- / .bg- enforcers (at 1,0,1 + !important) still win over this
-   sweeper for elements that have those utility classes. */
-#aicx-root *,
-#aicx-root *::before,
-#aicx-root *::after {
-  color: inherit !important;
-  background-color: transparent !important;
-}
-/* Font sweeper — mirrors the color/background sweeper above, at specificity
-   (1,0,1) with !important, so host-page rules (e.g. body span font-family
-   declarations or blanket #main * font-size overrides) can't bleed into our
-   descendants. Font-size defaults to inherit, so elements without an
-   explicit .text-* utility resolve to the root 14px; text-* utilities
-   (enforced below) beat this sweeper via their higher specificity (1,1,0). */
-#aicx-root *,
-#aicx-root *::before,
-#aicx-root *::after {
-  font-family: inherit !important;
-  line-height: inherit !important;
-  font-size: inherit !important;
-}
-/* Explicit font-size enforcement for every Tailwind text-* utility used by
-   the overlay. Specificity (1,1,0) beats the sweeper (1,0,1), so these
-   sizes win even when descendants are forced to inherit. Keep this list in
-   sync with utilities used in the script. */
-#aicx-root .text-xs { font-size: 12px !important; line-height: 16px !important; }
-#aicx-root .text-sm { font-size: 14px !important; line-height: 20px !important; }
-#aicx-root .text-base { font-size: 16px !important; line-height: 24px !important; }
-#aicx-root .text-lg { font-size: 18px !important; line-height: 28px !important; }
-#aicx-root .text-xl { font-size: 20px !important; line-height: 28px !important; }
-#aicx-root .text-\\[10px\\] { font-size: 10px !important; }
-#aicx-root .text-\\[11px\\] { font-size: 11px !important; }
-#aicx-root .text-\\[0\\.85em\\] { font-size: 0.85em !important; }
-:where(
-  #aicx-root button,
-  #aicx-root input:not([type="checkbox"]):not([type="radio"]),
-  #aicx-root textarea,
-  #aicx-root select
-) {
+button, input:not([type="checkbox"]):not([type="radio"]), textarea, select {
   font: inherit; color: inherit; background-color: transparent;
   appearance: none; -webkit-appearance: none; outline: none;
 }
-:where(
-  #aicx-root input:not([type="checkbox"]):not([type="radio"]),
-  #aicx-root textarea,
-  #aicx-root select
-) {
+input:not([type="checkbox"]):not([type="radio"]), textarea, select {
   border-radius: 8px; padding: 8px 10px;
 }
-/* Prevent iOS Safari auto-zoom on focus: font-size must be >= 16px.
-   Scoped to touch devices so desktop layout is unaffected. !important lets
-   it beat the font-size sweeper above (both at specificity 1,0,1) — without
-   !important the sweeper would force the 16px field back to inherited
-   14px and re-enable iOS auto-zoom. */
+/* Prevent iOS Safari auto-zoom on focus: font-size must be >= 16px on touch
+   devices. */
 @media (hover: none) and (pointer: coarse) {
-  #aicx-root input:not([type="checkbox"]):not([type="radio"]),
-  #aicx-root textarea,
-  #aicx-root select {
-    font-size: 16px !important;
+  input:not([type="checkbox"]):not([type="radio"]), textarea, select {
+    font-size: 16px;
   }
 }
-:where(#aicx-root button) { cursor: pointer; touch-action: manipulation; }
-:where(#aicx-root img) { max-width: 100%; height: auto; display: block; }
-:where(#aicx-root svg) { display: inline-block; vertical-align: middle; }
-:where(#aicx-root textarea) { resize: none; }
-/* Functional utilities (not intended to be overridden by Tailwind) */
-#aicx-root [data-active="true"] { pointer-events: auto; }
-#aicx-root .aicx-panel { pointer-events: auto; }
-#aicx-root .aicx-scroll { -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
-#aicx-root .aicx-tap { touch-action: manipulation; user-select: none; -webkit-user-select: none; }
-/* aicx-full wrapped in :where() so sm:h-[...] can override it at breakpoints */
-:where(#aicx-root .aicx-full) { height: 100dvh; max-height: 100dvh; }
-/* Resize handle */
-#aicx-root .aicx-resize { touch-action: none; cursor: ns-resize; user-select: none; -webkit-user-select: none; }
-/* Sheet enter animation */
+button { cursor: pointer; touch-action: manipulation; }
+img { max-width: 100%; height: auto; display: block; }
+svg { display: inline-block; vertical-align: middle; }
+textarea { resize: none; }
+/* Functional helpers (not intended to be overridden by Tailwind) */
+[data-active="true"] { pointer-events: auto; }
+.aicx-panel { pointer-events: auto; }
+.aicx-scroll { -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+.aicx-tap { touch-action: manipulation; user-select: none; -webkit-user-select: none; }
+.aicx-full { height: 100dvh; max-height: 100dvh; }
+.aicx-resize { touch-action: none; cursor: ns-resize; user-select: none; -webkit-user-select: none; }
 @keyframes aicx-slide-up { from { transform: translateY(12px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
 @keyframes aicx-fade-in { from { opacity: 0; } to { opacity: 1; } }
-#aicx-root .aicx-enter-sheet { animation: aicx-slide-up 180ms ease-out both; }
-#aicx-root .aicx-enter-fade { animation: aicx-fade-in 160ms ease-out both; }
-/* Typing dots */
+.aicx-enter-sheet { animation: aicx-slide-up 180ms ease-out both; }
+.aicx-enter-fade { animation: aicx-fade-in 160ms ease-out both; }
 @keyframes aicx-dot { 0%, 80%, 100% { opacity: .2; transform: translateY(0); } 40% { opacity: 1; transform: translateY(-2px); } }
-#aicx-root .aicx-dot { display:inline-block; width:6px; height:6px; margin:0 2px; background-color: currentColor !important; border-radius:50%; animation: aicx-dot 1.2s infinite; }
-#aicx-root .aicx-dot:nth-child(2){ animation-delay:.15s; }
-#aicx-root .aicx-dot:nth-child(3){ animation-delay:.3s; }
+.aicx-dot { display:inline-block; width:6px; height:6px; margin:0 2px; background-color: currentColor; border-radius:50%; animation: aicx-dot 1.2s infinite; }
+.aicx-dot:nth-child(2) { animation-delay: .15s; }
+.aicx-dot:nth-child(3) { animation-delay: .3s; }
 
-/* Floating action button — hand-written (no Tailwind deps) so the button
-   renders before Tailwind is lazy-loaded on first interaction. */
-#aicx-root .aicx-fab-btn {
-  display: flex !important;
-  align-items: center !important;
-  justify-content: center !important;
-  width: 56px !important;
-  height: 56px !important;
-  border-radius: 9999px !important;
-  box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1) !important;
-  background-image: linear-gradient(to bottom right, rgb(99 102 241), rgb(124 58 237)) !important;
-  color: rgb(255 255 255) !important;
-  transition: transform 150ms ease !important;
-  cursor: pointer !important;
-  border: 0 !important;
-  padding: 0 !important;
+/* Floating action button — hand-written so appearance does not depend on
+   Tailwind utilities resolving. */
+.aicx-fab-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 56px;
+  height: 56px;
+  border-radius: 9999px;
+  box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+  background-image: linear-gradient(to bottom right, rgb(99 102 241), rgb(124 58 237));
+  color: rgb(255 255 255);
+  transition: transform 150ms ease;
+  cursor: pointer;
+  border: 0;
+  padding: 0;
 }
-#aicx-root .aicx-fab-btn:active { transform: scale(0.95) !important; }
-#aicx-root .aicx-fab-btn svg { width: 28px !important; height: 28px !important; }
-
-/* -------- Theme enforcement --------
-   Host-page CSS can override Tailwind utilities via higher specificity
-   or !important. Play CDN's generated rules also don't always survive
-   re-renders when config is set after initial compile. The rules below
-   are scoped to #aicx-root (specificity at least 1,1,1) and marked
-   !important so our light/dark theme always wins. Hover variants are
-   also !important so they beat the !important base rules. */
-
-/* Root-level colors (force against page's body/html inheritance) */
-#aicx-root { color: rgb(24 24 27) !important; }
-#aicx-root .dark { color: rgb(228 228 231) !important; }
-
-/* Light-mode backgrounds */
-#aicx-root .bg-white { background-color: rgb(255 255 255) !important; }
-#aicx-root .bg-zinc-50 { background-color: rgb(250 250 250) !important; }
-#aicx-root .bg-zinc-100 { background-color: rgb(244 244 245) !important; }
-#aicx-root .bg-zinc-200 { background-color: rgb(228 228 231) !important; }
-#aicx-root .bg-zinc-300 { background-color: rgb(212 212 216) !important; }
-#aicx-root .bg-zinc-600 { background-color: rgb(82 82 91) !important; }
-#aicx-root .bg-zinc-700 { background-color: rgb(63 63 70) !important; }
-#aicx-root .bg-zinc-800 { background-color: rgb(39 39 42) !important; }
-#aicx-root .bg-zinc-900 { background-color: rgb(24 24 27) !important; }
-#aicx-root .bg-zinc-800\\/50 { background-color: rgb(39 39 42 / 0.5) !important; }
-#aicx-root .bg-zinc-800\\/60 { background-color: rgb(39 39 42 / 0.6) !important; }
-#aicx-root .bg-indigo-50 { background-color: rgb(238 242 255) !important; }
-#aicx-root .bg-indigo-100 { background-color: rgb(224 231 255) !important; }
-#aicx-root .bg-indigo-600 { background-color: rgb(79 70 229) !important; }
-#aicx-root .bg-indigo-900 { background-color: rgb(49 46 129) !important; }
-#aicx-root .bg-indigo-900\\/40 { background-color: rgb(49 46 129 / 0.4) !important; }
-#aicx-root .bg-red-50 { background-color: rgb(254 242 242) !important; }
-#aicx-root .bg-red-600 { background-color: rgb(220 38 38) !important; }
-#aicx-root .bg-red-900 { background-color: rgb(127 29 29) !important; }
-#aicx-root .bg-red-900\\/30 { background-color: rgb(127 29 29 / 0.3) !important; }
-#aicx-root .bg-emerald-600 { background-color: rgb(5 150 105) !important; }
-#aicx-root .bg-black\\/30 { background-color: rgb(0 0 0 / 0.3) !important; }
-#aicx-root .bg-black\\/40 { background-color: rgb(0 0 0 / 0.4) !important; }
-
-/* Light-mode text */
-#aicx-root .text-white { color: rgb(255 255 255) !important; }
-#aicx-root .text-zinc-100 { color: rgb(244 244 245) !important; }
-#aicx-root .text-zinc-200 { color: rgb(228 228 231) !important; }
-#aicx-root .text-zinc-300 { color: rgb(212 212 216) !important; }
-#aicx-root .text-zinc-400 { color: rgb(161 161 170) !important; }
-#aicx-root .text-zinc-500 { color: rgb(113 113 122) !important; }
-#aicx-root .text-zinc-600 { color: rgb(82 82 91) !important; }
-#aicx-root .text-zinc-700 { color: rgb(63 63 70) !important; }
-#aicx-root .text-zinc-800 { color: rgb(39 39 42) !important; }
-#aicx-root .text-zinc-900 { color: rgb(24 24 27) !important; }
-#aicx-root .text-indigo-300 { color: rgb(165 180 252) !important; }
-#aicx-root .text-indigo-400 { color: rgb(129 140 248) !important; }
-#aicx-root .text-indigo-600 { color: rgb(79 70 229) !important; }
-#aicx-root .text-indigo-700 { color: rgb(67 56 202) !important; }
-#aicx-root .text-blue-400 { color: rgb(96 165 250) !important; }
-#aicx-root .text-blue-600 { color: rgb(37 99 235) !important; }
-#aicx-root .text-red-300 { color: rgb(252 165 165) !important; }
-#aicx-root .text-red-500 { color: rgb(239 68 68) !important; }
-#aicx-root .text-red-600 { color: rgb(220 38 38) !important; }
-#aicx-root .text-emerald-600 { color: rgb(5 150 105) !important; }
-
-/* Light-mode borders */
-#aicx-root .border-zinc-100 { border-color: rgb(244 244 245) !important; }
-#aicx-root .border-zinc-200 { border-color: rgb(228 228 231) !important; }
-#aicx-root .border-zinc-300 { border-color: rgb(212 212 216) !important; }
-#aicx-root .border-zinc-600 { border-color: rgb(82 82 91) !important; }
-#aicx-root .border-zinc-700 { border-color: rgb(63 63 70) !important; }
-#aicx-root .border-zinc-800 { border-color: rgb(39 39 42) !important; }
-#aicx-root .border-indigo-600 { border-color: rgb(79 70 229) !important; }
-#aicx-root .border-transparent { border-color: transparent !important; }
-#aicx-root .divide-zinc-100 > :not([hidden]) ~ :not([hidden]) { border-color: rgb(244 244 245) !important; }
-
-/* Light-mode hover */
-#aicx-root .hover\\:bg-zinc-50:hover { background-color: rgb(250 250 250) !important; }
-#aicx-root .hover\\:bg-zinc-100:hover { background-color: rgb(244 244 245) !important; }
-#aicx-root .hover\\:bg-zinc-700:hover { background-color: rgb(63 63 70) !important; }
-#aicx-root .hover\\:bg-zinc-800:hover { background-color: rgb(39 39 42) !important; }
-#aicx-root .hover\\:bg-indigo-50:hover { background-color: rgb(238 242 255) !important; }
-#aicx-root .hover\\:bg-red-50:hover { background-color: rgb(254 242 242) !important; }
-#aicx-root .hover\\:text-red-500:hover { color: rgb(239 68 68) !important; }
-#aicx-root .hover\\:text-red-600:hover { color: rgb(220 38 38) !important; }
-#aicx-root .hover\\:text-zinc-700:hover { color: rgb(63 63 70) !important; }
-
-/* Dark-mode backgrounds */
-#aicx-root .dark .dark\\:bg-white { background-color: rgb(255 255 255) !important; }
-#aicx-root .dark .dark\\:bg-zinc-50 { background-color: rgb(250 250 250) !important; }
-#aicx-root .dark .dark\\:bg-zinc-100 { background-color: rgb(244 244 245) !important; }
-#aicx-root .dark .dark\\:bg-zinc-600 { background-color: rgb(82 82 91) !important; }
-#aicx-root .dark .dark\\:bg-zinc-700 { background-color: rgb(63 63 70) !important; }
-#aicx-root .dark .dark\\:bg-zinc-800 { background-color: rgb(39 39 42) !important; }
-#aicx-root .dark .dark\\:bg-zinc-900 { background-color: rgb(24 24 27) !important; }
-#aicx-root .dark .dark\\:bg-zinc-800\\/50 { background-color: rgb(39 39 42 / 0.5) !important; }
-#aicx-root .dark .dark\\:bg-zinc-800\\/60 { background-color: rgb(39 39 42 / 0.6) !important; }
-#aicx-root .dark .dark\\:bg-indigo-900 { background-color: rgb(49 46 129) !important; }
-#aicx-root .dark .dark\\:bg-red-900\\/30 { background-color: rgb(127 29 29 / 0.3) !important; }
-
-/* Dark-mode text */
-#aicx-root .dark .dark\\:text-zinc-100 { color: rgb(244 244 245) !important; }
-#aicx-root .dark .dark\\:text-zinc-200 { color: rgb(228 228 231) !important; }
-#aicx-root .dark .dark\\:text-zinc-300 { color: rgb(212 212 216) !important; }
-#aicx-root .dark .dark\\:text-zinc-400 { color: rgb(161 161 170) !important; }
-#aicx-root .dark .dark\\:text-zinc-500 { color: rgb(113 113 122) !important; }
-#aicx-root .dark .dark\\:text-blue-400 { color: rgb(96 165 250) !important; }
-#aicx-root .dark .dark\\:text-indigo-300 { color: rgb(165 180 252) !important; }
-#aicx-root .dark .dark\\:text-indigo-400 { color: rgb(129 140 248) !important; }
-#aicx-root .dark .dark\\:text-red-300 { color: rgb(252 165 165) !important; }
-
-/* Dark-mode borders */
-#aicx-root .dark .dark\\:border-zinc-600 { border-color: rgb(82 82 91) !important; }
-#aicx-root .dark .dark\\:border-zinc-700 { border-color: rgb(63 63 70) !important; }
-#aicx-root .dark .dark\\:border-zinc-800 { border-color: rgb(39 39 42) !important; }
-#aicx-root .dark .dark\\:divide-zinc-800 > :not([hidden]) ~ :not([hidden]) { border-color: rgb(39 39 42) !important; }
-
-/* Dark-mode hover */
-#aicx-root .dark .dark\\:hover\\:bg-zinc-700:hover { background-color: rgb(63 63 70) !important; }
-#aicx-root .dark .dark\\:hover\\:bg-zinc-800:hover { background-color: rgb(39 39 42) !important; }
-#aicx-root .dark .dark\\:hover\\:bg-zinc-800\\/50:hover { background-color: rgb(39 39 42 / 0.5) !important; }
-#aicx-root .dark .dark\\:hover\\:bg-zinc-800\\/60:hover { background-color: rgb(39 39 42 / 0.6) !important; }
-#aicx-root .dark .dark\\:hover\\:bg-indigo-900\\/40:hover { background-color: rgb(49 46 129 / 0.4) !important; }
-#aicx-root .dark .dark\\:hover\\:bg-red-900\\/30:hover { background-color: rgb(127 29 29 / 0.3) !important; }
-#aicx-root .dark .dark\\:hover\\:text-zinc-200:hover { color: rgb(228 228 231) !important; }
+.aicx-fab-btn:active { transform: scale(0.95); }
+/* Icon container: absolute px (no em) so the icon size is independent of
+   inherited font-size. Without this, the default \`w-5 h-5\` span wrapped
+   around the SVG resolves to 1.25em × inherited font-size — on hosts that
+   compress the cascade (yahoo.co.jp, sites using \`html{font-size:62.5%}\`,
+   viewport-unit-based root font-size, text-size-adjust, etc.) the icon
+   visibly shrinks. \`flex-shrink:0\` prevents shrinkage in the FAB's flex
+   layout; the inner SVG has \`width="100%" height="100%"\` attributes so
+   it fills the container. */
+.aicx-fab-btn .aicx-fab-icon {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.aicx-fab-btn .aicx-fab-icon svg { width: 100%; height: 100%; }
 `;
-      const style = document.createElement('style');
-      style.id = 'aicx-base';
-      style.textContent = css;
-      document.head.appendChild(style);
-    }
-  };
 
   // =========================================================================
   // 10. Icons (inline SVG)
@@ -1661,16 +1398,33 @@
   // 11. UI: root container + notifications
   // =========================================================================
   const UI = {
-    rootEl: null,   // #aicx-root - outer container for Tailwind `important` scoping
-    root: null,     // .aicx-stage - inner container where `.dark` is toggled and children mount
+    hostEl: null,   // light-DOM shadow host (#aicx-root)
+    shadow: null,   // attached shadow root — every overlay element lives here
+    root: null,     // .aicx-stage inside shadow — where `.dark` is toggled and children mount
     toastHost: null,
     init() {
-      TailwindBoot.installBase();
-      const rootEl = el('div', { id: 'aicx-root' });
+      const hostEl = el('div', { id: 'aicx-root' });
+      (document.body || document.documentElement).appendChild(hostEl);
+      // Open mode on purpose: `composedPath()` invoked from light-DOM
+      // listeners (document-level outside-click handlers, focus guard, etc.)
+      // only returns the full shadow-internal path for OPEN shadow roots.
+      // With a closed root the path is truncated at the shadow host, which
+      // breaks every `eventPathIncludes(menuEl, e)` check — clicks inside
+      // the overlay look identical to clicks outside, so popovers close the
+      // instant the user clicks a menu item. Style isolation comes from the
+      // shadow boundary itself, not from `closed` mode; leaving it open has
+      // no effect on leak protection.
+      const shadow = hostEl.attachShadow({ mode: 'open' });
+      const baseStyle = document.createElement('style');
+      baseStyle.textContent = BASE_CSS;
+      shadow.appendChild(baseStyle);
+      const twStyle = document.createElement('style');
+      twStyle.textContent = TAILWIND_CSS;
+      shadow.appendChild(twStyle);
       const stage = el('div', { class: 'aicx-stage' });
-      rootEl.appendChild(stage);
-      (document.body || document.documentElement).appendChild(rootEl);
-      this.rootEl = rootEl;
+      shadow.appendChild(stage);
+      this.hostEl = hostEl;
+      this.shadow = shadow;
       this.root = stage;
       // toast host
       this.toastHost = el('div', { class: 'fixed bottom-4 left-1/2 -translate-x-1/2 flex flex-col gap-2 items-center pointer-events-none', style: { zIndex: 20 } });
@@ -1722,15 +1476,19 @@
     menuEl: null,
     dragging: false,
     init() {
-      // FAB uses pure CSS (`.aicx-fab-btn`, installed by TailwindBoot.installBase)
-      // so it renders correctly before Tailwind itself is lazy-loaded on click.
+      // FAB uses the hand-written `.aicx-fab-btn` rule in BASE_CSS so its
+      // appearance does not depend on Tailwind utilities being present.
       this.host = el('div', { id: 'aicx-fab', class: 'aicx-panel aicx-tap', style: { position: 'fixed', zIndex: 10, touchAction: 'none' } });
       this.btn = el('button', {
         class: 'aicx-fab-btn',
         type: 'button',
         'aria-label': 'AI チャットを開く'
       });
-      this.btn.appendChild(icon('chat'));
+      // `aicx-fab-icon` (see BASE_CSS) gives the icon container a hard 28px
+      // size in px, immune to the host page's font-size cascade. Do NOT
+      // fall back to the default `w-5 h-5` — those utilities are em-based
+      // and can shrink on pages that tighten the cascade.
+      this.btn.appendChild(icon('chat', 'aicx-fab-icon'));
       this.host.appendChild(this.btn);
       UI.root.appendChild(this.host);
       this.applyPosition();
@@ -1809,10 +1567,8 @@
     },
     async toggleMenu() {
       if (this.menuEl) { this.closeMenu(); return; }
-      // Defer Tailwind + raw-doc prefetch to the first interaction so pages
-      // the user never engages with pay zero runtime cost.
-      try { await TailwindBoot.load(); }
-      catch (e) { /* fall through — menu may render unstyled but stays usable */ }
+      // Defer raw-doc prefetch to the first interaction so pages the user
+      // never engages with pay zero runtime cost.
       try { Page.primeRawDoc(); } catch {}
       this.openMenu();
     },
@@ -1893,7 +1649,7 @@
       // Close on outside click (next tick to avoid instant close)
       setTimeout(() => {
         const onDoc = (e) => {
-          if (!menu.contains(e.target) && !this.host.contains(e.target)) {
+          if (!eventPathIncludes(menu, e) && !eventPathIncludes(this.host, e)) {
             document.removeEventListener('pointerdown', onDoc, true);
             this.closeMenu();
           }
@@ -2000,15 +1756,20 @@
       // would route to the page instead of the composer. Redirects only
       // when focus lands on a real element outside the panel, so native
       // dialogs (file picker, camera) that blur to body are left alone.
+      // With shadow DOM, focusin events from inside the shadow retarget
+      // their `target` to the shadow host (`UI.hostEl`); we use that as
+      // the "focus is inside the overlay" signal and consult
+      // `shadow.activeElement` for the actual focused element.
       const focusGuard = (e) => {
         if (!this.panel) return;
         const t = e.target;
         if (!t || t === document.body || t === document.documentElement) return;
-        if (this.panel.contains(t)) return;
+        if (t === UI.hostEl) return;
         const ta = this.els && this.els.ta;
         if (!ta) return;
         setTimeout(() => {
-          if (this.panel && !this.panel.contains(document.activeElement)) {
+          const active = (UI.shadow && UI.shadow.activeElement) || document.activeElement;
+          if (this.panel && !this.panel.contains(active)) {
             ta.focus({ preventScroll: true });
           }
         }, 0);
@@ -2211,7 +1972,7 @@
       paintModeBtn();
       let modePopover = null;
       const onModeDocDown = (e) => {
-        if (modePopover && !modePopover.contains(e.target) && !btnMode.contains(e.target)) closeModePop();
+        if (modePopover && !eventPathIncludes(modePopover, e) && !eventPathIncludes(btnMode, e)) closeModePop();
       };
       const closeModePop = () => {
         if (!modePopover) return;
@@ -2275,7 +2036,7 @@
       paintModelBtn();
       let modelPopover = null;
       const onModelDocDown = (e) => {
-        if (modelPopover && !modelPopover.contains(e.target) && !btnModel.contains(e.target)) closeModelPop();
+        if (modelPopover && !eventPathIncludes(modelPopover, e) && !eventPathIncludes(btnModel, e)) closeModelPop();
       };
       const closeModelPop = () => {
         if (!modelPopover) return;
@@ -3052,7 +2813,7 @@
         if (popover) { popover.remove(); popover = null; }
         document.removeEventListener('pointerdown', onDoc, true);
       };
-      const onDoc = (e) => { if (!wrap.contains(e.target)) closePop(); };
+      const onDoc = (e) => { if (!eventPathIncludes(wrap, e)) closePop(); };
       const openPop = () => {
         if (popover) { closePop(); return; }
         popover = el('div', {
@@ -3679,11 +3440,12 @@
     await Store.load();
     // If coming back from OAuth, consume hash
     Drive.consumeOAuthHash();
-    // Tailwind and raw-doc prefetch are deferred to the first FAB click
-    // (see OverlayButton.toggleMenu). That way pages the user never engages
-    // with — Speedometer, benchmarks, embedded third-party frames, etc. —
-    // pay zero runtime cost from this userscript: no MutationObserver on
-    // document, no extra network request, no CSS-generation work.
+    // Styles ship as a precompiled CSS string injected into a closed Shadow
+    // Root, so there is no runtime class scan, no MutationObserver on the
+    // host document, and no network fetch for a styling library. Pages the
+    // user never engages with — Speedometer, benchmarks, embedded third-party
+    // frames — pay essentially zero runtime cost from the overlay, and the
+    // host page's CSS is fully insulated from overlay styles (and vice versa).
     UI.init();
     Selection.init();
     OverlayButton.init();

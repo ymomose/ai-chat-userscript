@@ -1,0 +1,13 @@
+{
+  "name": "aicx-userscript",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Build tooling for the AI Chat Overlay userscript (Tailwind precompile).",
+  "type": "module",
+  "scripts": {
+    "build": "node build/build.mjs"
+  },
+  "devDependencies": {
+    "tailwindcss": "3.4.16"
+  }
+}
