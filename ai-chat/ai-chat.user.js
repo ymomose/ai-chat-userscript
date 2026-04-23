@@ -23,11 +23,19 @@
 // @connect      generativelanguage.googleapis.com
 // @connect      www.googleapis.com
 // @connect      oauth2.googleapis.com
-// @require      https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js
-// @require      https://cdn.jsdelivr.net/npm/dompurify@3.0.11/dist/purify.min.js
-// @require      https://cdn.jsdelivr.net/npm/@mozilla/readability@0.5.0/Readability.js
+// @connect      cdn.jsdelivr.net
 // @noframes
 // ==/UserScript==
+// Libraries (marked / DOMPurify / Readability) are NOT @require'd any more.
+// Rationale: iOS Safari + Tampermonkey does not reliably honour @noframes for
+// iframe navigations — sites that repeatedly retarget a single iframe at new
+// sub-apps (Speedometer 3.1's benchmark runner is the canonical example) can
+// re-inject the userscript on every navigation, re-parsing every @require'd
+// library each time. With ~150 KB of libraries that accumulates into memory
+// pressure and crashes the browser. Instead, the libraries are fetched by
+// the `LazyLibs` module on the first FAB click, cached in KV storage so
+// subsequent page loads are offline, and injected via a page <script> tag so
+// both sandboxed and page-world userscript hosts can see the globals.
 
 /* global marked, DOMPurify, Readability */
 (() => {
@@ -66,6 +74,89 @@
         if (typeof GM_deleteValue === 'function') return GM_deleteValue(key);
       } catch {}
       try { localStorage.removeItem(KV_PREFIX + key); } catch {}
+    }
+  };
+
+  // =========================================================================
+  // 1b. Lazy library loader (marked / DOMPurify / Readability)
+  // =========================================================================
+  // Fetches each library on first demand, caches the source in KV storage,
+  // and injects it into the page via a <script> tag (so the UMD wrapper's
+  // assignments land on the page's global object regardless of whether the
+  // userscript manager runs us in a sandbox or the page world). Callers
+  // should `await LazyLibs.load()` before relying on `marked`, `DOMPurify`,
+  // or `Readability`; intermediate renderers fall back gracefully when the
+  // libraries are not yet available (see MD.render / Page._extractReadability).
+  const LazyLibs = {
+    specs: [
+      { global: 'marked',      cacheKey: 'lib:marked@12.0.2',     url: 'https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js' },
+      { global: 'DOMPurify',   cacheKey: 'lib:dompurify@3.0.11',  url: 'https://cdn.jsdelivr.net/npm/dompurify@3.0.11/dist/purify.min.js' },
+      { global: 'Readability', cacheKey: 'lib:readability@0.5.0', url: 'https://cdn.jsdelivr.net/npm/@mozilla/readability@0.5.0/Readability.js' }
+    ],
+    _promise: null,
+    load() {
+      if (this._promise) return this._promise;
+      this._promise = Promise.all(this.specs.map((s) => this._loadOne(s))).then(() => {});
+      return this._promise;
+    },
+    loaded(name) {
+      return typeof window[name] !== 'undefined';
+    },
+    async _loadOne(spec) {
+      if (typeof window[spec.global] !== 'undefined') return;
+      let source = null;
+      try { source = await KV.get(spec.cacheKey, null); } catch {}
+      if (!source) {
+        try {
+          source = await this._fetch(spec.url);
+          KV.set(spec.cacheKey, source).catch(() => {});
+        } catch (e) {
+          console.warn('[aicx] library fetch failed:', spec.global, e && e.message || e);
+          return;
+        }
+      }
+      try {
+        // Inject as a page <script> so UMD wrappers assign to page's window
+        // even when the userscript itself runs in an isolated sandbox.
+        const script = document.createElement('script');
+        script.textContent = source + '\n//# sourceURL=' + spec.global + '.js';
+        (document.head || document.documentElement).appendChild(script);
+        script.remove();
+      } catch (e) {
+        // Fallback: indirect eval in the userscript scope. If the manager
+        // runs us in the page world this reaches window directly; in a
+        // sandbox it at least makes the symbol visible to our own code.
+        try { (0, eval)(source); } catch (e2) {
+          console.warn('[aicx] library exec failed:', spec.global, e2 && e2.message || e2);
+        }
+      }
+    },
+    _fetch(url) {
+      return new Promise((resolve, reject) => {
+        const gmXhr = (typeof GM !== 'undefined' && GM && GM.xmlHttpRequest) ||
+                      (typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest : null);
+        if (gmXhr) {
+          try {
+            gmXhr({
+              method: 'GET',
+              url,
+              timeout: 20000,
+              onload: (res) => {
+                if (res && res.status >= 200 && res.status < 300) resolve(res.responseText);
+                else reject(new Error('HTTP ' + (res && res.status)));
+              },
+              onerror: () => reject(new Error('network error')),
+              ontimeout: () => reject(new Error('timeout'))
+            });
+            return;
+          } catch { /* fall through to fetch */ }
+        }
+        // jsDelivr sets Access-Control-Allow-Origin: * so plain fetch works
+        // whenever GM XHR is unavailable or blocked.
+        fetch(url, { cache: 'force-cache' })
+          .then((r) => r.ok ? r.text() : Promise.reject(new Error('HTTP ' + r.status)))
+          .then(resolve, reject);
+      });
     }
   };
 
@@ -767,6 +858,14 @@
       await this.primeRawDoc();
 
       const mode = modeOverride || Store.resolvePageExtractMode();
+      // `auto` mode blends heuristic text with Readability output. Await
+      // the lazy library load so the very first send after FAB-open can
+      // use Readability — normally this resolves instantly because the
+      // menu-open hook kicked off loading already, or because the source
+      // is cached in KV from a prior session.
+      if (mode === 'auto') {
+        try { await LazyLibs.load(); } catch {}
+      }
       let text = '';
       let effectiveMode = mode;
 
@@ -1594,6 +1693,11 @@ textarea { resize: none; }
       // Defer raw-doc prefetch to the first interaction so pages the user
       // never engages with pay zero runtime cost.
       try { Page.primeRawDoc(); } catch {}
+      // Kick off the lazy library fetch too — fire-and-forget so it runs in
+      // parallel with the Tailwind inject and raw-doc prefetch. Consumers
+      // (ChatPanel.open / Page.snapshot) await LazyLibs.load() when they
+      // need the globals, so it's fine if loading is still in flight here.
+      try { LazyLibs.load(); } catch {}
       // Defer the precompiled Tailwind stylesheet to the first click too —
       // start it before the await so it runs in parallel with primeRawDoc.
       await UI.ensureTailwindLoaded();
@@ -1714,6 +1818,13 @@ textarea { resize: none; }
     },
     open(opts = {}) {
       this.close();
+      // Kick off the lazy library load if it wasn't already started from
+      // the FAB menu (e.g. programmatic open). Re-render once finished so
+      // the plaintext fallback used during the initial paint upgrades to
+      // proper markdown + sanitization when the libs land.
+      LazyLibs.load().then(() => {
+        if (this.panel) this.render();
+      });
       const host = getDomain();
       const domain = Store.getDomain(host);
       let conv = null;
