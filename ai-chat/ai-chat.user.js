@@ -23,9 +23,9 @@
 // @connect      generativelanguage.googleapis.com
 // @connect      www.googleapis.com
 // @connect      oauth2.googleapis.com
+// @connect      cdn.tailwindcss.com
 // @require      https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js
 // @require      https://cdn.jsdelivr.net/npm/dompurify@3.0.11/dist/purify.min.js
-// @require      https://cdn.tailwindcss.com/3.4.16
 // @require      https://cdn.jsdelivr.net/npm/@mozilla/readability@0.5.0/Readability.js
 // @noframes
 // ==/UserScript==
@@ -1164,17 +1164,76 @@
   };
 
   // =========================================================================
-  // 9. Tailwind bootstrap  (scoped to #aicx-root via `important` config)
+  // 9. Tailwind bootstrap  (lazy-loaded on first interaction)
   // =========================================================================
+  //
+  // We deliberately avoid `@require`-ing the Play CDN. The CDN's IIFE installs
+  // a MutationObserver on `document.documentElement` with subtree+childList+
+  // class-attribute observation, and *every* mutation batch triggers a full
+  // `document.querySelectorAll('[class]')` + classList walk — no debounce, no
+  // disable API. On benchmark-heavy pages (Speedometer, real-world SPAs that
+  // churn thousands of nodes per frame) this destroys the host page's
+  // performance and can crash the tab. By loading Tailwind lazily on the
+  // first FAB click and wrapping `MutationObserver` so the CDN's observer
+  // attaches to our own root instead of `documentElement`, the host DOM stays
+  // unobserved and host perf is unaffected.
+  const TAILWIND_SRC_URL = 'https://cdn.tailwindcss.com/3.4.16';
   const TailwindBoot = {
     loaded: false,
+    loading: null,
     load() {
       if (this.loaded) return Promise.resolve();
-      // Tailwind Play CDN is loaded via @require, so it executes before this
-      // script runs — bypassing the page's script-src CSP. Setting config here
-      // triggers the Proxy setter installed by the CDN, which schedules the
-      // initial CSS generation with our config.
+      if (this.loading) return this.loading;
+      this.loading = this._load().catch((e) => {
+        console.warn('[aicx] Tailwind load failed:', e);
+        this.loading = null;
+        throw e;
+      });
+      return this.loading;
+    },
+    _fetchSource() {
+      return new Promise((resolve, reject) => {
+        const xhr = (typeof GM !== 'undefined' && GM && GM.xmlHttpRequest)
+          || (typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest : null);
+        if (!xhr) { reject(new Error('GM_xmlhttpRequest unavailable')); return; }
+        try {
+          xhr({
+            method: 'GET',
+            url: TAILWIND_SRC_URL,
+            onload: (r) => {
+              if (r && typeof r.responseText === 'string' && r.responseText) resolve(r.responseText);
+              else reject(new Error('empty Tailwind response'));
+            },
+            onerror: (e) => reject(e || new Error('Tailwind fetch error')),
+            ontimeout: () => reject(new Error('Tailwind fetch timeout'))
+          });
+        } catch (e) { reject(e); }
+      });
+    },
+    async _load() {
+      const source = await this._fetchSource();
+      // Scope MutationObserver to our own root BEFORE Tailwind executes.
+      // Tailwind's IIFE will call `new MutationObserver(...).observe(
+      // document.documentElement, { subtree, childList, attributes: class })`.
+      // Our wrapper rewrites that single target so Tailwind never sees host
+      // DOM mutations — only mutations inside `#aicx-root`, which is our UI.
+      const OrigMO = window.MutationObserver;
+      const scope = UI.rootEl || document.documentElement;
+      class ScopedMO extends OrigMO {
+        observe(target, options) {
+          if (target === document.documentElement || target === document || target === document.body) {
+            target = scope;
+          }
+          return super.observe(target, options);
+        }
+      }
+      window.MutationObserver = ScopedMO;
       try {
+        // Execute Tailwind in the userscript sandbox. `new Function` bypasses
+        // the host page's `script-src` CSP (unlike a `<script src=…>` element)
+        // and runs synchronously, so by the time it returns, `window.tailwind`
+        // is installed.
+        (new Function(source))();
         if (window.tailwind) {
           // Replace Tailwind's default rem-based scales with em-based ones.
           // Rationale: `rem` resolves against the host page's <html>
@@ -1195,6 +1254,11 @@
             '44': '11em', '48': '12em', '52': '13em', '56': '14em',
             '60': '15em', '64': '16em', '72': '18em', '80': '20em', '96': '24em'
           };
+          // Setting `window.tailwind.config` hits the CDN's Proxy `set` trap,
+          // which schedules the initial build. The build is what generates
+          // CSS for every `[class]` already present in the DOM (including our
+          // mounted UI), so the scoped observer only needs to fire for
+          // future class additions inside `#aicx-root`.
           window.tailwind.config = {
             darkMode: 'class',
             // Scope every utility under #aicx-root so host-page elements with
@@ -1252,9 +1316,13 @@
             }
           };
         }
-      } catch (e) { console.warn('[aicx] tailwind config failed:', e); }
+      } finally {
+        // Restore the original constructor. Observers already created under
+        // our wrapper keep their redirected target — the wrapper is only
+        // consulted at `.observe()` call time.
+        window.MutationObserver = OrigMO;
+      }
       this.loaded = true;
-      return Promise.resolve();
     },
     // Install scoped base styles (mini "preflight" confined to our root) so page CSS
     // can't bleed into our UI, and vice versa.
@@ -1390,6 +1458,26 @@
 #aicx-root .aicx-dot { display:inline-block; width:6px; height:6px; margin:0 2px; background-color: currentColor !important; border-radius:50%; animation: aicx-dot 1.2s infinite; }
 #aicx-root .aicx-dot:nth-child(2){ animation-delay:.15s; }
 #aicx-root .aicx-dot:nth-child(3){ animation-delay:.3s; }
+
+/* Floating action button — hand-written (no Tailwind deps) so the button
+   renders before Tailwind is lazy-loaded on first interaction. */
+#aicx-root .aicx-fab-btn {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  width: 56px !important;
+  height: 56px !important;
+  border-radius: 9999px !important;
+  box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1) !important;
+  background-image: linear-gradient(to bottom right, rgb(99 102 241), rgb(124 58 237)) !important;
+  color: rgb(255 255 255) !important;
+  transition: transform 150ms ease !important;
+  cursor: pointer !important;
+  border: 0 !important;
+  padding: 0 !important;
+}
+#aicx-root .aicx-fab-btn:active { transform: scale(0.95) !important; }
+#aicx-root .aicx-fab-btn svg { width: 28px !important; height: 28px !important; }
 
 /* -------- Theme enforcement --------
    Host-page CSS can override Tailwind utilities via higher specificity
@@ -1634,13 +1722,15 @@
     menuEl: null,
     dragging: false,
     init() {
-      this.host = el('div', { id: 'aicx-fab', class: 'fixed aicx-panel aicx-tap', style: { zIndex: 10, touchAction: 'none' } });
+      // FAB uses pure CSS (`.aicx-fab-btn`, installed by TailwindBoot.installBase)
+      // so it renders correctly before Tailwind itself is lazy-loaded on click.
+      this.host = el('div', { id: 'aicx-fab', class: 'aicx-panel aicx-tap', style: { position: 'fixed', zIndex: 10, touchAction: 'none' } });
       this.btn = el('button', {
-        class: 'w-14 h-14 rounded-full shadow-lg bg-gradient-to-br from-indigo-500 to-violet-600 text-white flex items-center justify-center active:scale-95 transition',
+        class: 'aicx-fab-btn',
         type: 'button',
         'aria-label': 'AI チャットを開く'
       });
-      this.btn.appendChild(icon('chat', 'w-7 h-7'));
+      this.btn.appendChild(icon('chat'));
       this.host.appendChild(this.btn);
       UI.root.appendChild(this.host);
       this.applyPosition();
@@ -1717,8 +1807,13 @@
         this.host.addEventListener('pointercancel', onUp);
       });
     },
-    toggleMenu() {
+    async toggleMenu() {
       if (this.menuEl) { this.closeMenu(); return; }
+      // Defer Tailwind + raw-doc prefetch to the first interaction so pages
+      // the user never engages with pay zero runtime cost.
+      try { await TailwindBoot.load(); }
+      catch (e) { /* fall through — menu may render unstyled but stays usable */ }
+      try { Page.primeRawDoc(); } catch {}
       this.openMenu();
     },
     closeMenu() {
@@ -3584,15 +3679,14 @@
     await Store.load();
     // If coming back from OAuth, consume hash
     Drive.consumeOAuthHash();
-    // Tailwind first, then UI
-    await TailwindBoot.load().catch((e) => console.warn('[aicx] Tailwind load failed:', e));
+    // Tailwind and raw-doc prefetch are deferred to the first FAB click
+    // (see OverlayButton.toggleMenu). That way pages the user never engages
+    // with — Speedometer, benchmarks, embedded third-party frames, etc. —
+    // pay zero runtime cost from this userscript: no MutationObserver on
+    // document, no extra network request, no CSS-generation work.
     UI.init();
     Selection.init();
     OverlayButton.init();
-    // Prefetch raw HTML in the background so embed recovery (Twitter/X etc.)
-    // is ready by the time the user sends their first message. Fire-and-
-    // forget; snapshot() will also await this promise if still pending.
-    Page.primeRawDoc();
   }
 
   if (document.readyState === 'loading') {
