@@ -251,7 +251,10 @@
     //   'none'  : do not attach the current page as context (per-chat opt-out;
     //             this is also what restored conversations default to so the
     //             stored pageSnapshot is used instead of the current page)
-    pageExtractMode: 'auto'
+    pageExtractMode: 'auto',
+    // Cap on the page text fed to the model as context. Long pages are
+    // truncated to this many characters before being attached.
+    pageContextMaxChars: 20000
   };
 
   const Store = {
@@ -844,7 +847,11 @@
       '[role="navigation"]', '[role="banner"]', '[role="search"]',
       '[aria-hidden="true"]', '[hidden]'
     ].join(','),
-    MAX_TEXT: 20000,
+    MAX_TEXT_DEFAULT: 20000,
+    get MAX_TEXT() {
+      const n = Number(Store.settings && Store.settings.pageContextMaxChars);
+      return Number.isFinite(n) && n > 0 ? Math.floor(n) : this.MAX_TEXT_DEFAULT;
+    },
 
     async snapshot(modeOverride) {
       const selection = (window.getSelection && String(window.getSelection())) || '';
@@ -1166,7 +1173,17 @@
           if (!text) return;
           const node = sel.anchorNode;
           const anchor = node && (node.nodeType === 3 ? node.parentNode : node);
-          if (anchor && UI.hostEl && UI.hostEl.contains(anchor)) return;
+          // Skip selections inside our overlay UI. The chat panel and its
+          // messages live inside the open shadow root (`UI.shadow`), and
+          // `Node.contains()` does not cross shadow boundaries — so a check
+          // against the light-DOM host alone misses selections highlighted
+          // inside assistant replies. Use `getRootNode()` to also catch
+          // shadow-internal anchors and keep them out of the emphasized
+          // context.
+          if (anchor) {
+            if (UI.hostEl && UI.hostEl.contains(anchor)) return;
+            if (UI.shadow && anchor.getRootNode && anchor.getRootNode() === UI.shadow) return;
+          }
           const next = text.slice(0, 4000);
           if (next === this._last) return;
           this._last = next;
@@ -3204,6 +3221,20 @@ textarea { resize: none; }
         Store.settings.pageExtractMode = v;
         Store.saveSettings();
       }));
+
+      const limitWrap = el('div', { class: 'pt-2' });
+      limitWrap.append(Form.label('ページコンテキストの取り込み上限 (文字数)'));
+      const current = Number(Store.settings.pageContextMaxChars);
+      const initial = Number.isFinite(current) && current > 0 ? current : DEFAULT_SETTINGS.pageContextMaxChars;
+      const limitInput = Form.input(initial, (v) => {
+        const n = parseInt(v, 10);
+        Store.settings.pageContextMaxChars = Number.isFinite(n) && n > 0 ? n : DEFAULT_SETTINGS.pageContextMaxChars;
+        Store.saveSettings();
+      }, { type: 'number', min: '1', step: '1000', inputmode: 'numeric' });
+      limitWrap.append(limitInput);
+      limitWrap.append(el('p', { class: 'text-[11px] text-zinc-500 mt-1' }, `ページから抽出した本文をこの文字数で打ち切ります。空または無効な値はデフォルト (${DEFAULT_SETTINGS.pageContextMaxChars.toLocaleString()}) を使います。`));
+      box.append(limitWrap);
+
       return box;
     },
 
