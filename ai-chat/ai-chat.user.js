@@ -620,9 +620,16 @@
         contents: this.buildContents(messages),
         generationConfig: { temperature: 0.7 }
       };
-      if (systemPrompt && systemPrompt.trim()) {
-        body.systemInstruction = { role: 'user', parts: [{ text: systemPrompt }] };
-      }
+      // Implicit context: tell the model the current local date so it can
+      // resolve "today" / "yesterday" / "next Friday" without us threading
+      // it through every user-facing prompt. Prepended to the system
+      // instruction; not shown in the context preview.
+      const d = new Date();
+      const pad = (n) => String(n).padStart(2, '0');
+      const weekday = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][d.getDay()];
+      const dateLine = `Today's date: ${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} (${weekday})`;
+      const sys = systemPrompt && systemPrompt.trim() ? `${dateLine}\n\n${systemPrompt}` : dateLine;
+      body.systemInstruction = { role: 'user', parts: [{ text: sys }] };
       if (tools && tools.length) body.tools = tools;
       const payload = JSON.stringify(body);
       const reqHeaders = { 'content-type': 'application/json' };
@@ -651,6 +658,7 @@
       // Shared SSE parsing loop. Both transports deliver text chunks that we
       // split on blank-line boundaries, then parse `data:` lines as JSON.
       let buf = '';
+      let yieldedText = false;
       for await (const text of chunks) {
         buf += text;
         const parts = buf.split(/\r?\n\r?\n/);
@@ -668,7 +676,7 @@
             const cand = obj && obj.candidates && obj.candidates[0];
             const parts2 = cand && cand.content && cand.content.parts;
             if (parts2) {
-              for (const p of parts2) if (p.text) yield p.text;
+              for (const p of parts2) if (p.text) { yieldedText = true; yield p.text; }
             }
             if (cand && cand.groundingMetadata && typeof onMetadata === 'function') {
               try { onMetadata(cand.groundingMetadata); } catch {}
@@ -685,6 +693,18 @@
               // there leaves the request (and the UI "generating" state)
               // pending forever.
               if (cand.finishReason !== 'STOP') {
+                // MALFORMED_FUNCTION_CALL is a known sporadic Gemini 2.5
+                // failure (the model emits a function-call-shaped token
+                // even when no tools are configured). When it happens
+                // before any text has been yielded the response is empty,
+                // so throw a retryable error and let the caller try again
+                // rather than dumping an opaque marker on the user.
+                if (cand.finishReason === 'MALFORMED_FUNCTION_CALL' && !yieldedText) {
+                  const err = new Error('MALFORMED_FUNCTION_CALL');
+                  err.code = 'MALFORMED_FUNCTION_CALL';
+                  err.retryable = true;
+                  throw err;
+                }
                 // Safety block or length cap — surface to user via a tail message
                 yield `\n\n_(finishReason: ${cand.finishReason})_`;
               }
@@ -1171,6 +1191,17 @@
           // Empty selections fire on focus/caret moves — don't clobber the
           // stored page selection just because the user tapped into a field.
           if (!text) return;
+          // Skip selections originating from a focused textarea/input inside
+          // our overlay (e.g. the composer). Textarea selections have their
+          // own internal model and `anchorNode` does not point into the
+          // textarea's value, so the shadow-root check below cannot catch
+          // them on browsers where `window.getSelection().toString()` still
+          // surfaces the textarea's selected text.
+          const active = (UI.shadow && UI.shadow.activeElement) || document.activeElement;
+          if (active && (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT')) {
+            if (UI.hostEl && UI.hostEl.contains(active)) return;
+            if (UI.shadow && active.getRootNode && active.getRootNode() === UI.shadow) return;
+          }
           const node = sel.anchorNode;
           const anchor = node && (node.nodeType === 3 ? node.parentNode : node);
           // Skip selections inside our overlay UI. The chat panel and its
@@ -2809,20 +2840,35 @@ textarea { resize: none; }
           if (t.length) tools = t;
         }
         let grounding = null;
-        const stream = Gemini.streamGenerate({
-          apiKey: Store.settings.apiKey,
-          model: Store.settings.model,
-          messages: apiMessages,
-          systemPrompt: Store.resolveSystemPrompt(host),
-          tools,
-          onMetadata: (meta) => { grounding = meta; },
-          signal: aborter.signal
-        });
-        for await (const chunk of stream) {
-          acc += chunk;
-          asstMsg.content = acc;
-          asstMsg._pending = false;
-          if (this.conv === conv) this.renderLastAssistant();
+        // Retry once on MALFORMED_FUNCTION_CALL with no streamed content —
+        // it is a sporadic Gemini 2.5 fault, not a deterministic refusal,
+        // and the user did not opt into any tools.
+        let attempts = 0;
+        while (true) {
+          const stream = Gemini.streamGenerate({
+            apiKey: Store.settings.apiKey,
+            model: Store.settings.model,
+            messages: apiMessages,
+            systemPrompt: Store.resolveSystemPrompt(host),
+            tools,
+            onMetadata: (meta) => { grounding = meta; },
+            signal: aborter.signal
+          });
+          try {
+            for await (const chunk of stream) {
+              acc += chunk;
+              asstMsg.content = acc;
+              asstMsg._pending = false;
+              if (this.conv === conv) this.renderLastAssistant();
+            }
+            break;
+          } catch (err) {
+            if (err && err.retryable && attempts < 1 && acc === '') {
+              attempts++;
+              continue;
+            }
+            throw err;
+          }
         }
         asstMsg._pending = false;
         // Append grounding sources (web citations) if any.
