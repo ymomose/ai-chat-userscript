@@ -233,6 +233,10 @@
   const DEFAULT_SETTINGS = {
     apiKey: '',
     model: 'gemini-2.5-flash',
+    // Models the user has explicitly added in Settings. The chat-side picker
+    // shows only these; the full Gemini catalog is fetched only to populate
+    // the "add model" dropdown in Settings. Shape: [{ id, display }].
+    addedModels: [],
     globalSystemPrompt: 'You are a helpful AI assistant. The user is viewing a webpage; use its content as context. Respond in the same language as the user.',
     theme: 'system', // light | dark | system
     autoBackup: false,
@@ -263,6 +267,12 @@
     async load() {
       this.settings = Object.assign({}, DEFAULT_SETTINGS, await KV.get('settings', {}));
       this.domains = await KV.get('domains', {});
+      // Seed addedModels for users upgrading from a single-model layout so
+      // their previously-selected model survives in the chat picker.
+      if (!Array.isArray(this.settings.addedModels)) this.settings.addedModels = [];
+      if (!this.settings.addedModels.length && this.settings.model) {
+        this.settings.addedModels.push({ id: this.settings.model, display: this.settings.model });
+      }
     },
     async saveSettings() { await KV.set('settings', this.settings); },
     async saveDomains() { await KV.set('domains', this.domains); },
@@ -1843,27 +1853,6 @@ textarea { resize: none; }
   // =========================================================================
   const ChatPanel = {
     panel: null, host: null, conv: null, aborter: null, attachments: [],
-    _modelsCache: null, _modelsPromise: null,
-    // Fetch-once model list shared across open()s of the chat panel. The
-    // model picker in the header calls into here; the settings panel has
-    // its own cache and refresh UI, so both coexist without coordination.
-    async getModels(force = false) {
-      if (!force && this._modelsCache) return this._modelsCache;
-      if (!force && this._modelsPromise) return this._modelsPromise;
-      if (!Store.settings.apiKey) return [];
-      this._modelsPromise = (async () => {
-        try {
-          this._modelsCache = await Gemini.listModels(Store.settings.apiKey);
-        } catch (e) {
-          console.warn('[aicx] getModels failed:', e);
-          this._modelsCache = [];
-        } finally {
-          this._modelsPromise = null;
-        }
-        return this._modelsCache;
-      })();
-      return this._modelsPromise;
-    },
     open(opts = {}) {
       this.close();
       // Kick off the lazy library load if it wasn't already started from
@@ -2211,10 +2200,10 @@ textarea { resize: none; }
       modeWrap.append(btnMode);
 
       // Model picker — compact pill in the action row showing the
-      // abbreviated current model. Opening reveals the full catalog
-      // (fetched once per panel session) and selecting persists globally
-      // via Store.settings.model. Placed in the composer area so the
-      // popover naturally paints above the messages list.
+      // abbreviated current model. Opening reveals only the models the
+      // user has added in Settings; selecting persists globally via
+      // Store.settings.model. Placed in the composer area so the popover
+      // naturally paints above the messages list.
       const modelBtnWrap = el('div', { class: 'relative shrink-0' });
       const btnModel = el('button', {
         type: 'button',
@@ -2247,22 +2236,13 @@ textarea { resize: none; }
           class: 'absolute z-20 bottom-full mb-2 left-0 p-1 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 shadow-xl max-h-80 overflow-auto w-72',
           role: 'menu'
         });
-        modelPopover.append(el('div', { class: 'text-xs text-zinc-500 p-3' }, 'モデル一覧を取得中...'));
         modelBtnWrap.append(modelPopover);
         btnModel.setAttribute('aria-expanded', 'true');
         setTimeout(() => document.addEventListener('pointerdown', onModelDocDown, true), 0);
 
-        const currentPopover = modelPopover;
-        if (!Store.settings.apiKey) {
-          clear(currentPopover);
-          currentPopover.append(el('div', { class: 'text-xs text-zinc-500 p-3' }, 'API キーが未設定です。設定画面から追加してください。'));
-          return;
-        }
-        const models = await this.getModels();
-        if (modelPopover !== currentPopover) return; // closed while loading
-        clear(currentPopover);
+        const models = Store.settings.addedModels || [];
         if (!models.length) {
-          currentPopover.append(el('div', { class: 'text-xs text-zinc-500 p-3' }, 'モデル一覧を取得できませんでした。'));
+          modelPopover.append(el('div', { class: 'text-xs text-zinc-500 p-3' }, '使用するモデルが追加されていません。設定画面の「一般」タブから追加してください。'));
           return;
         }
         const current = Store.settings.model || '';
@@ -2291,7 +2271,7 @@ textarea { resize: none; }
             }
             closeModelPop();
           });
-          currentPopover.append(item);
+          modelPopover.append(item);
         }
       });
       modelBtnWrap.append(btnModel);
@@ -3187,7 +3167,7 @@ textarea { resize: none; }
 
       const keyWrap = el('div');
       keyWrap.append(Form.label('API キー'));
-      const keyInput = Form.input(Store.settings.apiKey, (v) => { Store.settings.apiKey = v.trim(); Store.saveSettings(); updateModelOpts(); }, { type: 'password', placeholder: 'AIza...' });
+      const keyInput = Form.input(Store.settings.apiKey, (v) => { Store.settings.apiKey = v.trim(); Store.saveSettings(); renderAvailable(); }, { type: 'password', placeholder: 'AIza...' });
       keyWrap.append(keyInput);
       keyWrap.append(el('p', { class: 'text-[11px] text-zinc-500 mt-1' }, [
         'キーは ',
@@ -3196,51 +3176,129 @@ textarea { resize: none; }
       ]));
       box.append(keyWrap);
 
-      const modelWrap = el('div');
-      modelWrap.append(Form.label('モデル'));
-      const row = el('div', { class: 'flex gap-2' });
-      const sel = el('select', { class: 'flex-1 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg text-sm px-3 py-2' });
-      const refreshBtn = Form.btn('再取得', () => updateModelOpts(true), 'bg-zinc-200 dark:bg-zinc-700 text-zinc-800 dark:text-zinc-100');
+      const modelWrap = el('div', { class: 'space-y-2' });
+      modelWrap.append(Form.label('使用するモデル'));
+      modelWrap.append(el('p', { class: 'text-[11px] text-zinc-500' }, '追加したモデルだけがチャット画面のモデル選択に表示されます。チェックの付いた行が現在のアクティブモデルです。'));
+
+      const listWrap = el('div', { class: 'space-y-1' });
+      modelWrap.append(listWrap);
+
+      const addRow = el('div', { class: 'flex gap-2 pt-1' });
+      const addSel = el('select', { class: 'flex-1 min-w-0 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg text-sm px-3 py-2' });
+      const addBtn = Form.btn('追加', () => addSelected(), 'bg-indigo-600 text-white shrink-0');
+      addBtn.prepend(icon('plus', 'w-3 h-3 mr-1 inline'));
+      const refreshBtn = Form.btn('再取得', () => renderAvailable(true), 'bg-zinc-200 dark:bg-zinc-700 text-zinc-800 dark:text-zinc-100 shrink-0');
       refreshBtn.prepend(icon('refresh', 'w-3 h-3 mr-1 inline'));
-      row.append(sel, refreshBtn);
-      modelWrap.append(row);
-      const hint = el('p', { class: 'text-[11px] text-zinc-500 mt-1' }, 'API キーを入力すると利用可能な Gemini モデルを動的に取得します。');
+      addRow.append(addSel, addBtn, refreshBtn);
+      modelWrap.append(addRow);
+
+      const hint = el('p', { class: 'text-[11px] text-zinc-500' }, '');
       modelWrap.append(hint);
       box.append(modelWrap);
 
-      const updateModelOpts = async (force = false) => {
-        if (!Store.settings.apiKey) {
-          clear(sel);
-          sel.appendChild(el('option', { value: Store.settings.model || '' }, Store.settings.model || '(API キー未設定)'));
+      const renderAdded = () => {
+        clear(listWrap);
+        const added = Store.settings.addedModels || [];
+        if (!added.length) {
+          listWrap.append(el('p', { class: 'text-xs text-zinc-500 px-3 py-3 border border-dashed border-zinc-300 dark:border-zinc-700 rounded-lg text-center' }, 'モデルが追加されていません。下のドロップダウンから選んで「追加」してください。'));
           return;
         }
+        for (const m of added) {
+          const active = Store.settings.model === m.id;
+          const row = el('div', { class: 'flex items-center gap-2 p-2 rounded-lg border border-zinc-200 dark:border-zinc-700' });
+          const radio = el('button', {
+            type: 'button',
+            class: `w-7 h-7 shrink-0 rounded-full flex items-center justify-center aicx-tap ${active ? 'bg-indigo-600 text-white' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200'}`,
+            'aria-label': active ? 'アクティブなモデル' : 'アクティブにする',
+            title: active ? 'アクティブなモデル' : 'アクティブにする'
+          });
+          if (active) radio.appendChild(icon('check', 'w-4 h-4'));
+          radio.addEventListener('click', async () => {
+            if (Store.settings.model === m.id) return;
+            Store.settings.model = m.id;
+            await Store.saveSettings();
+            renderAdded();
+          });
+          const text = el('div', { class: 'flex-1 min-w-0' });
+          text.append(
+            el('div', { class: 'text-sm font-medium truncate' }, m.display || m.id),
+            el('div', { class: 'text-[11px] text-zinc-500 dark:text-zinc-400 truncate' }, m.id)
+          );
+          const del = el('button', { class: 'w-9 h-9 shrink-0 rounded-lg text-zinc-500 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-900/30 flex items-center justify-center aicx-tap', type: 'button', 'aria-label': 'モデルを削除' });
+          del.appendChild(icon('trash', 'w-4 h-4'));
+          del.addEventListener('click', async () => {
+            const list = Store.settings.addedModels || [];
+            const idx = list.findIndex((x) => x.id === m.id);
+            if (idx >= 0) list.splice(idx, 1);
+            if (Store.settings.model === m.id) {
+              Store.settings.model = list[0] ? list[0].id : '';
+            }
+            await Store.saveSettings();
+            renderAdded();
+            renderAvailable();
+          });
+          row.append(radio, text, del);
+          listWrap.append(row);
+        }
+      };
+
+      const addSelected = async () => {
+        const id = addSel.value;
+        if (!id || !this.models) return;
+        const m = this.models.find((x) => x.id === id);
+        if (!m) return;
+        Store.settings.addedModels = Store.settings.addedModels || [];
+        if (Store.settings.addedModels.some((x) => x.id === id)) return;
+        Store.settings.addedModels.push({ id: m.id, display: m.display });
+        if (!Store.settings.model) Store.settings.model = m.id;
+        await Store.saveSettings();
+        renderAdded();
+        renderAvailable();
+      };
+
+      const renderAvailable = async (force = false) => {
+        if (!Store.settings.apiKey) {
+          clear(addSel);
+          addSel.appendChild(el('option', { value: '' }, '(API キー未設定)'));
+          addSel.disabled = true;
+          addBtn.disabled = true;
+          refreshBtn.disabled = true;
+          hint.textContent = 'API キーを入力するとモデル一覧を取得できます。';
+          return;
+        }
+        refreshBtn.disabled = false;
         if (!this.models || force) {
-          sel.disabled = true;
+          addSel.disabled = true;
+          addBtn.disabled = true;
+          clear(addSel);
+          addSel.appendChild(el('option', { value: '' }, '取得中...'));
           hint.textContent = 'モデル一覧を取得中...';
           try {
             this.models = await Gemini.listModels(Store.settings.apiKey);
-            hint.textContent = `${this.models.length} モデルを取得しました。`;
+            hint.textContent = `${this.models.length} 件のモデルを取得しました。`;
           } catch (e) {
             hint.textContent = 'モデル一覧の取得に失敗しました: ' + (e && e.message || e);
             this.models = [];
-          } finally {
-            sel.disabled = false;
           }
         }
-        clear(sel);
-        const ids = new Set();
-        if (Store.settings.model && !this.models.some((m) => m.id === Store.settings.model)) {
-          sel.appendChild(el('option', { value: Store.settings.model }, Store.settings.model));
-          ids.add(Store.settings.model);
+        clear(addSel);
+        const addedIds = new Set((Store.settings.addedModels || []).map((x) => x.id));
+        const available = (this.models || []).filter((m) => !addedIds.has(m.id));
+        if (!available.length) {
+          addSel.appendChild(el('option', { value: '' }, '(追加できるモデルはありません)'));
+          addSel.disabled = true;
+          addBtn.disabled = true;
+        } else {
+          for (const m of available) {
+            addSel.appendChild(el('option', { value: m.id }, `${m.display} (${m.id})`));
+          }
+          addSel.disabled = false;
+          addBtn.disabled = false;
         }
-        for (const m of this.models) {
-          if (ids.has(m.id)) continue;
-          sel.appendChild(el('option', { value: m.id }, `${m.display} (${m.id})`));
-        }
-        sel.value = Store.settings.model || '';
       };
-      sel.addEventListener('change', () => { Store.settings.model = sel.value; Store.saveSettings(); });
-      updateModelOpts();
+
+      renderAdded();
+      renderAvailable();
 
       return box;
     },
