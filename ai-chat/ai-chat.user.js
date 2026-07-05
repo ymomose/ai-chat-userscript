@@ -2,7 +2,7 @@
 // @name         AI Chat Overlay
 // @name:ja      AI チャット オーバーレイ
 // @namespace    https://github.com/ym/userscripts/ai-chat
-// @version      1.0.2
+// @version      1.0.3
 // @description  Floating AI chat (Gemini) with page context, per-domain history, templates, and Google Drive backup. Optimized for iOS Safari.
 // @description:ja Webページの内容を文脈として Gemini と対話できるオーバーレイ AI チャット。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
 // @author       ym
@@ -640,7 +640,19 @@
       const dateLine = `Today's date: ${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} (${weekday})`;
       const sys = systemPrompt && systemPrompt.trim() ? `${dateLine}\n\n${systemPrompt}` : dateLine;
       body.systemInstruction = { role: 'user', parts: [{ text: sys }] };
-      if (tools && tools.length) body.tools = tools;
+      // Attach tools when the user opted into grounding. Otherwise pin
+      // functionCallingConfig to NONE: Gemini 2.5 sporadically emits a stray
+      // function-call token when no tools are declared and aborts the turn
+      // with MALFORMED_FUNCTION_CALL. Explicitly prohibiting function calls
+      // ("Model is prohibited from making function calls") removes that
+      // failure mode at the source. Grounding tools (googleSearch/urlContext)
+      // are not user-declared functions, so when tools ARE present we leave
+      // the default AUTO behaviour and don't send toolConfig.
+      if (tools && tools.length) {
+        body.tools = tools;
+      } else {
+        body.toolConfig = { functionCallingConfig: { mode: 'NONE' } };
+      }
       const payload = JSON.stringify(body);
       const reqHeaders = { 'content-type': 'application/json' };
 
@@ -703,19 +715,25 @@
               // there leaves the request (and the UI "generating" state)
               // pending forever.
               if (cand.finishReason !== 'STOP') {
-                // MALFORMED_FUNCTION_CALL is a known sporadic Gemini 2.5
-                // failure (the model emits a function-call-shaped token
-                // even when no tools are configured). When it happens
-                // before any text has been yielded the response is empty,
-                // so throw a retryable error and let the caller try again
-                // rather than dumping an opaque marker on the user.
-                if (cand.finishReason === 'MALFORMED_FUNCTION_CALL' && !yieldedText) {
+                // MALFORMED_FUNCTION_CALL is a known Gemini 2.5 fault: the
+                // model emits a stray function-call-shaped token even when no
+                // tools are configured, and the API aborts the turn. It is
+                // sporadic (re-running the identical request usually succeeds)
+                // and — whether it fires before or midway through the text —
+                // leaves a broken/partial answer. So we ALWAYS raise it as a
+                // retryable error (previously only when no text had streamed
+                // yet) and let the caller re-run from scratch, rather than
+                // dumping an opaque `_(finishReason: …)_` marker or a truncated
+                // reply on the user. Enabling a grounding tool masks the bug
+                // only because the stray call then has a valid landing spot.
+                if (cand.finishReason === 'MALFORMED_FUNCTION_CALL') {
                   const err = new Error('MALFORMED_FUNCTION_CALL');
                   err.code = 'MALFORMED_FUNCTION_CALL';
                   err.retryable = true;
                   throw err;
                 }
-                // Safety block or length cap — surface to user via a tail message
+                // Other non-STOP reasons (SAFETY, MAX_TOKENS, RECITATION, …)
+                // are meaningful — surface them to the user via a tail message.
                 yield `\n\n_(finishReason: ${cand.finishReason})_`;
               }
               return;
@@ -2832,11 +2850,20 @@ textarea { resize: none; }
           if (t.length) tools = t;
         }
         let grounding = null;
-        // Retry once on MALFORMED_FUNCTION_CALL with no streamed content —
-        // it is a sporadic Gemini 2.5 fault, not a deterministic refusal,
-        // and the user did not opt into any tools.
+        // Retry on MALFORMED_FUNCTION_CALL — a sporadic Gemini 2.5 fault (the
+        // model emits a stray function-call token even with no tools opted in),
+        // not a deterministic refusal, so re-running the identical request
+        // usually succeeds. The fault can fire midway through the stream, so
+        // each attempt discards whatever partial text was already rendered and
+        // restarts the answer from scratch.
+        const MAX_ATTEMPTS = 3;
         let attempts = 0;
         while (true) {
+          acc = '';
+          grounding = null;
+          asstMsg.content = '';
+          asstMsg._pending = true;
+          if (this.conv === conv) this.renderLastAssistant();
           const stream = Gemini.streamGenerate({
             apiKey: Store.settings.apiKey,
             model: Store.settings.model,
@@ -2855,8 +2882,10 @@ textarea { resize: none; }
             }
             break;
           } catch (err) {
-            if (err && err.retryable && attempts < 1 && acc === '') {
+            if (err && err.retryable && attempts < MAX_ATTEMPTS - 1 && !aborter.signal.aborted) {
               attempts++;
+              // Brief backoff so a transient server-side hiccup can clear.
+              await new Promise((r) => setTimeout(r, 400 * attempts));
               continue;
             }
             throw err;
@@ -2880,6 +2909,10 @@ textarea { resize: none; }
         asstMsg._pending = false;
         if (err && err.name === 'AbortError') {
           asstMsg.content = (asstMsg.content || '') + '\n\n_(停止しました)_';
+        } else if (err && err.code === 'MALFORMED_FUNCTION_CALL') {
+          // Exhausted retries on the sporadic Gemini fault — give an
+          // actionable message instead of the raw finishReason marker.
+          asstMsg.content = '**エラー:** 応答の生成に失敗しました（Gemini の一時的な不具合により中断されました）。もう一度送信するか、別のモデルをお試しください。';
         } else {
           asstMsg.content = `**エラー:** ${esc(err && err.message || String(err))}`;
         }
