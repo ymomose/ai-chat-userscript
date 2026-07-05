@@ -2,7 +2,7 @@
 // @name         AI Chat Overlay
 // @name:ja      AI チャット オーバーレイ
 // @namespace    https://github.com/ym/userscripts/ai-chat
-// @version      1.0.1
+// @version      1.0.2
 // @description  Floating AI chat (Gemini) with page context, per-domain history, templates, and Google Drive backup. Optimized for iOS Safari.
 // @description:ja Webページの内容を文脈として Gemini と対話できるオーバーレイ AI チャット。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
 // @author       ym
