@@ -1440,10 +1440,16 @@ input:not([type="checkbox"]):not([type="radio"]), textarea, select {
   border-radius: 8px; padding: 8px 10px;
 }
 /* Prevent iOS Safari auto-zoom on focus: font-size must be >= 16px on touch
-   devices. */
+   devices. \`!important\` is required, not optional — the composer textarea and
+   the settings inputs carry Tailwind's \`.text-sm\` utility (14px), whose class
+   selector (0,1,0) outranks the bare \`textarea\`/\`select\` selectors (0,0,1)
+   here. Without \`!important\` the 14px utility wins and Safari zooms on focus,
+   trapping the user zoomed-in until they manually pinch back out. The rule is
+   semantically a hard floor ("touch form controls are never < 16px"), so
+   overriding any smaller utility is the intended behaviour. */
 @media (hover: none) and (pointer: coarse) {
   input:not([type="checkbox"]):not([type="radio"]), textarea, select {
-    font-size: 16px;
+    font-size: 16px !important;
   }
 }
 button { cursor: pointer; touch-action: manipulation; }
