@@ -2,7 +2,7 @@
 // @name         AI Chat Overlay
 // @name:ja      AI チャット オーバーレイ
 // @namespace    https://github.com/ym/userscripts/ai-chat
-// @version      1.1.1
+// @version      1.1.2
 // @description  Floating AI chat (Gemini) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode. Optimized for iOS Safari.
 // @description:ja Webページの内容を文脈として Gemini と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
 // @author       ym
@@ -242,6 +242,10 @@
     // FAB menu's "新規 UserScript" entry). Empty means "use the built-in
     // default" — see UserScriptMode.DEFAULT_SYSTEM_PROMPT.
     userscriptSystemPrompt: '',
+    // How many model→tool→model round trips one send() may make in UserScript
+    // mode before it stops and hands control back. See
+    // UserScriptMode.maxToolRounds() for clamping.
+    userscriptMaxToolRounds: 50,
     theme: 'system', // light | dark | system
     autoBackup: false,
     driveClientId: '',
@@ -2060,9 +2064,16 @@ textarea { resize: none; }
   // hosts, which is the user's per-domain gate.
   const UserScriptMode = {
     ID: 'userscript',
-    // Hard cap on model→tool→model round trips within a single send(), so a
-    // confused model can't loop forever burning quota.
-    MAX_TOOL_ROUNDS: 12,
+    // Cap on model→tool→model round trips within a single send(), so a
+    // confused model can't loop forever burning quota. Non-trivial scripts
+    // routinely need a dozen-plus inspect/verify cycles, so the default is
+    // generous; `maxToolRounds()` resolves the user's override.
+    DEFAULT_MAX_TOOL_ROUNDS: 50,
+    // Guard rails for the user-supplied override. The ceiling is not a
+    // safety limit (the user can always send again) — it just keeps a typo
+    // like "5000" from silently committing to an enormous run.
+    MIN_TOOL_ROUNDS: 1,
+    MAX_TOOL_ROUNDS_CAP: 200,
     HTML_MAX_DEFAULT: 24000,
     HTML_MAX_CAP: 100000,
     FETCH_MAX_DEFAULT: 40000,
@@ -2108,6 +2119,15 @@ textarea { resize: none; }
         if (dir && dir !== '/') out.push(`${u.protocol}//${u.hostname}${dir}*`);
         return out;
       } catch { return ['*://*/*']; }
+    },
+
+    // Resolved round limit: the user's setting, clamped into range. Anything
+    // unparseable (empty field, stray text, a value from an older build)
+    // falls back to the default rather than disabling the loop.
+    maxToolRounds() {
+      const n = parseInt(Store.settings.userscriptMaxToolRounds, 10);
+      if (!Number.isFinite(n) || n < this.MIN_TOOL_ROUNDS) return this.DEFAULT_MAX_TOOL_ROUNDS;
+      return Math.min(n, this.MAX_TOOL_ROUNDS_CAP);
     },
 
     systemPrompt() {
@@ -3909,6 +3929,10 @@ textarea { resize: none; }
         // results back, repeat. A turn with no function calls ends the loop —
         // which is every turn outside UserScript mode, so plain chat still
         // makes exactly one pass through here.
+        //
+        // The round budget is read once per send() so that changing the
+        // setting mid-run can't move the goalposts under an in-flight loop.
+        const maxRounds = UserScriptMode.maxToolRounds();
         let rounds = 0;
         while (true) {
           const apiMessages = this._buildApiMessages(conv, pending);
@@ -3999,10 +4023,10 @@ textarea { resize: none; }
           Store.saveDomains();
 
           rounds++;
-          if (rounds >= UserScriptMode.MAX_TOOL_ROUNDS) {
+          if (rounds >= maxRounds) {
             conv.messages.push({
               id: uid(), role: 'assistant', createdAt: now(),
-              content: `_(ツール実行が上限 ${UserScriptMode.MAX_TOOL_ROUNDS} 回に達したため中断しました。続きが必要なら、もう一度指示を送ってください。)_`
+              content: `_(ツール実行が上限 ${maxRounds} 回に達したため中断しました。「続けて」と送れば再開できます。上限は設定 → プロンプト から変更できます。)_`
             });
             if (this.conv === conv) this.render();
             break;
@@ -4518,6 +4542,25 @@ textarea { resize: none; }
         Store.saveSettings();
       }, 'bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200'));
       box.append(row);
+
+      const roundsWrap = el('div', { class: 'pt-2' });
+      roundsWrap.append(Form.label('ツール実行の上限 (1 回の送信あたり)'));
+      const roundsInput = Form.input(UserScriptMode.maxToolRounds(), (v) => {
+        const n = parseInt(v, 10);
+        Store.settings.userscriptMaxToolRounds =
+          Number.isFinite(n) && n >= UserScriptMode.MIN_TOOL_ROUNDS
+            ? Math.min(n, UserScriptMode.MAX_TOOL_ROUNDS_CAP)
+            : DEFAULT_SETTINGS.userscriptMaxToolRounds;
+        Store.saveSettings();
+      }, {
+        type: 'number', min: String(UserScriptMode.MIN_TOOL_ROUNDS),
+        max: String(UserScriptMode.MAX_TOOL_ROUNDS_CAP), step: '1', inputmode: 'numeric'
+      });
+      roundsWrap.append(roundsInput);
+      roundsWrap.append(el('p', { class: 'text-[11px] text-zinc-500 mt-1' },
+        `AI が 1 回の送信で「ページを調べる → コードを書く」を何往復できるかの上限です。上限に達すると一旦停止し、「続けて」と送れば再開できます。複雑なスクリプトほど多く必要になります。空または無効な値は既定 (${DEFAULT_SETTINGS.userscriptMaxToolRounds}) を使います。最大 ${UserScriptMode.MAX_TOOL_ROUNDS_CAP}。`));
+      box.append(roundsWrap);
+
       return box;
     },
 
