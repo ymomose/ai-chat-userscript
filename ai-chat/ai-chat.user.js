@@ -2,7 +2,7 @@
 // @name         AI Chat Overlay
 // @name:ja      AI チャット オーバーレイ
 // @namespace    https://github.com/ym/userscripts/ai-chat
-// @version      1.1.0
+// @version      1.1.1
 // @description  Floating AI chat (Gemini) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode. Optimized for iOS Safari.
 // @description:ja Webページの内容を文脈として Gemini と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
 // @author       ym
@@ -619,6 +619,17 @@
     // — Gemini rejects a functionResponse that has no matching functionCall
     // earlier in the transcript, and the `id` must be echoed when the model
     // supplied one.
+    //
+    // THOUGHT SIGNATURES. Thinking models return an opaque `thoughtSignature`
+    // on the *Part* (a sibling of `functionCall`, not a field inside it), and
+    // Gemini 3 STRICTLY validates that it comes back on every replayed
+    // functionCall part — omit it and the next request dies with
+    // `400 INVALID_ARGUMENT: Function call is missing a thought_signature`.
+    // So the signature is captured at stream time (see streamGenerate) and
+    // re-emitted here on exactly the part it arrived on. With parallel calls
+    // only the first part carries one; storing it per call reproduces that
+    // shape naturally. On text parts the signature is merely recommended (it
+    // preserves the model's reasoning chain), so a missing one is fine there.
     buildContents(messages) {
       const contents = [];
       for (const m of messages) {
@@ -632,13 +643,19 @@
             if (match) parts.push({ inlineData: { mimeType: match[1], data: match[2] } });
           }
         }
-        if (m.content && m.content.trim()) parts.push({ text: m.content });
+        if (m.content && m.content.trim()) {
+          const part = { text: m.content };
+          if (m.thoughtSignature) part.thoughtSignature = m.thoughtSignature;
+          parts.push(part);
+        }
         if (m.functionCalls) {
           for (const fc of m.functionCalls) {
             if (!fc || !fc.name) continue;
             const call = { name: fc.name, args: fc.args || {} };
             if (fc.id) call.id = fc.id;
-            parts.push({ functionCall: call });
+            const part = { functionCall: call };
+            if (fc.thoughtSignature) part.thoughtSignature = fc.thoughtSignature;
+            parts.push(part);
           }
         }
         if (m.functionResponses) {
@@ -655,10 +672,14 @@
     },
 
     // Yields assistant text as it streams. Non-text response parts are handed
-    // to callbacks instead: `onMetadata` for grounding citations and
-    // `onFunctionCall` for tool invocations (the caller executes them and
-    // re-enters this generator with the results appended to `messages`).
-    async *streamGenerate({ apiKey, model, messages, systemPrompt, tools, onMetadata, onFunctionCall, signal }) {
+    // to callbacks instead: `onMetadata` for grounding citations,
+    // `onFunctionCall(call, thoughtSignature)` for tool invocations (the caller
+    // executes them and re-enters this generator with the results appended to
+    // `messages`), and `onThoughtSignature` for the signature riding on the
+    // turn's first text part. Both signatures must survive into the stored
+    // message so buildContents can replay them — see the THOUGHT SIGNATURES
+    // note there.
+    async *streamGenerate({ apiKey, model, messages, systemPrompt, tools, onMetadata, onFunctionCall, onThoughtSignature, signal }) {
       if (!apiKey) throw new Error('API キーが設定されていません。設定画面から登録してください。');
       if (!model) throw new Error('モデルが選択されていません。');
       const streamUrl = `${API_BASE}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`;
@@ -735,9 +756,19 @@
             const parts2 = cand && cand.content && cand.content.parts;
             if (parts2) {
               for (const p of parts2) {
-                if (p.text) { yieldedText = true; yield p.text; }
+                if (p.text) {
+                  // Text arrives split across many parts that we concatenate
+                  // into one message, so only the first part's signature can
+                  // be meaningfully replayed (it is the one the docs say the
+                  // leading part always carries).
+                  if (!yieldedText && p.thoughtSignature && typeof onThoughtSignature === 'function') {
+                    try { onThoughtSignature(p.thoughtSignature); } catch (e) { console.warn('[aicx] onThoughtSignature threw:', e); }
+                  }
+                  yieldedText = true;
+                  yield p.text;
+                }
                 if (p.functionCall && p.functionCall.name && typeof onFunctionCall === 'function') {
-                  try { onFunctionCall(p.functionCall); } catch (e) { console.warn('[aicx] onFunctionCall threw:', e); }
+                  try { onFunctionCall(p.functionCall, p.thoughtSignature); } catch (e) { console.warn('[aicx] onFunctionCall threw:', e); }
                 }
               }
             }
@@ -3898,6 +3929,7 @@ textarea { resize: none; }
             grounding = null;
             pending.content = '';
             pending._pending = true;
+            delete pending.thoughtSignature;
             if (this.conv === conv) this.renderLastAssistant();
             const stream = Gemini.streamGenerate({
               apiKey: Store.settings.apiKey,
@@ -3906,7 +3938,11 @@ textarea { resize: none; }
               systemPrompt,
               tools,
               onMetadata: (meta) => { grounding = meta; },
-              onFunctionCall: (fc) => { calls.push({ id: fc.id, name: fc.name, args: fc.args || {} }); },
+              // The signature must be stored alongside the call it came with:
+              // Gemini 3 rejects the next request outright if a replayed
+              // functionCall part has lost it.
+              onFunctionCall: (fc, sig) => { calls.push({ id: fc.id, name: fc.name, args: fc.args || {}, thoughtSignature: sig }); },
+              onThoughtSignature: (sig) => { pending.thoughtSignature = sig; },
               signal: aborter.signal
             });
             try {
@@ -4022,7 +4058,10 @@ textarea { resize: none; }
           const quoted = `The user has highlighted the following passage on the page. Treat it as the primary focus of this turn:\n"""\n${m.selection}\n"""`;
           content = content ? `${quoted}\n\n${content}` : `${quoted}\n\nこの選択箇所について解説してください。`;
         }
-        out.push({ role: m.role, content, attachments: m.attachments, functionCalls: m.functionCalls });
+        out.push({
+          role: m.role, content, attachments: m.attachments,
+          functionCalls: m.functionCalls, thoughtSignature: m.thoughtSignature
+        });
       }
       return out;
     },
