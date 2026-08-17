@@ -2,7 +2,7 @@
 // @name         AI Chat Overlay
 // @name:ja      AI チャット オーバーレイ
 // @namespace    https://github.com/ym/userscripts/ai-chat
-// @version      1.2.0
+// @version      1.3.0
 // @description  Floating AI chat (Gemini) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode. Optimized for iOS Safari.
 // @description:ja Webページの内容を文脈として Gemini と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
 // @author       ym
@@ -266,7 +266,12 @@
     pageExtractMode: 'auto',
     // Cap on the page text fed to the model as context. Long pages are
     // truncated to this many characters before being attached.
-    pageContextMaxChars: 20000
+    pageContextMaxChars: 20000,
+    // Conversations older than this are swept on the first send of a page
+    // session, to keep the userscript manager's storage from growing without
+    // bound (UserScript-mode transcripts embed page HTML and whole scripts, so
+    // they are far from small). 0 or negative disables the sweep entirely.
+    historyRetentionDays: 30
   };
 
   const Store = {
@@ -330,6 +335,46 @@
       if (d.pageExtractMode && d.pageExtractMode !== 'inherit') return false;
       return true;
     },
+    // Resolved retention window in days; <= 0 means "keep everything".
+    retentionDays() {
+      const n = parseInt(this.settings.historyRetentionDays, 10);
+      if (!Number.isFinite(n)) return DEFAULT_SETTINGS.historyRetentionDays;
+      return n;
+    },
+
+    // Drop conversations last touched before the retention cutoff.
+    //
+    // `keepIds` shields conversations that must not vanish underfoot — the one
+    // being sent to right now, and anything still generating in the background.
+    // Reopening a months-old chat and continuing it would otherwise delete the
+    // very conversation the user is typing into.
+    //
+    // Returns the number removed; the caller decides whether to persist and
+    // whether to tell the user.
+    sweepOldConversations(keepIds) {
+      const days = this.retentionDays();
+      if (!(days > 0)) return 0;
+      const cutoff = now() - days * 86400_000;
+      const keep = keepIds instanceof Set ? keepIds : new Set(keepIds || []);
+      let removed = 0;
+      for (const host of Object.keys(this.domains)) {
+        const d = this.domains[host];
+        if (!d || !Array.isArray(d.conversations)) continue;
+        const before = d.conversations.length;
+        d.conversations = d.conversations.filter((c) => {
+          if (keep.has(c.id)) return true;
+          const ts = Number(c.updatedAt || c.createdAt) || 0;
+          // A conversation with no usable timestamp is kept: deleting on a
+          // parse failure is the wrong side to err on.
+          if (!ts) return true;
+          return ts >= cutoff;
+        });
+        removed += before - d.conversations.length;
+      }
+      if (removed) this.pruneEmptyDomains();
+      return removed;
+    },
+
     pruneEmptyDomains() {
       let removed = 0;
       for (const host of Object.keys(this.domains)) {
@@ -1475,7 +1520,7 @@
   //    precompiled path above.
   // ------------------------------------------------------------------------
   /* @TAILWIND_CSS_START */
-  const TAILWIND_CSS = `.\\!container{width:100%!important}.container{width:100%}@media (min-width:640px){.\\!container{max-width:640px!important}.container{max-width:640px}}@media (min-width:768px){.\\!container{max-width:768px!important}.container{max-width:768px}}@media (min-width:1024px){.\\!container{max-width:1024px!important}.container{max-width:1024px}}@media (min-width:1280px){.\\!container{max-width:1280px!important}.container{max-width:1280px}}@media (min-width:1536px){.\\!container{max-width:1536px!important}.container{max-width:1536px}}.pointer-events-none{pointer-events:none}.pointer-events-auto{pointer-events:auto}.\\!visible{visibility:visible!important}.visible{visibility:visible}.invisible{visibility:hidden}.fixed{position:fixed}.absolute{position:absolute}.relative{position:relative}.inset-0{inset:0}.bottom-4{bottom:1em}.bottom-full{bottom:100%}.left-0{left:0}.left-1{left:.25em}.left-1\\/2{left:50%}.z-20{z-index:20}.mx-3{margin-left:.75em;margin-right:.75em}.my-1{margin-top:.25em;margin-bottom:.25em}.my-2{margin-top:.5em;margin-bottom:.5em}.my-3{margin-top:.75em;margin-bottom:.75em}.mb-1{margin-bottom:.25em}.mb-2{margin-bottom:.5em}.mb-3{margin-bottom:.75em}.ml-5{margin-left:1.25em}.mr-1{margin-right:.25em}.mr-2{margin-right:.5em}.mt-0{margin-top:0}.mt-0\\.5{margin-top:.125em}.mt-1{margin-top:.25em}.mt-1\\.5{margin-top:.375em}.mt-2{margin-top:.5em}.mt-3{margin-top:.75em}.mt-4{margin-top:1em}.line-clamp-2{-webkit-line-clamp:2}.line-clamp-2,.line-clamp-3{overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical}.line-clamp-3{-webkit-line-clamp:3}.\\!block{display:block!important}.block{display:block}.inline-block{display:inline-block}.inline{display:inline}.flex{display:flex}.inline-flex{display:inline-flex}.table{display:table}.grid{display:grid}.contents{display:contents}.hidden{display:none}.h-1{height:.25em}.h-10{height:2.5em}.h-3{height:.75em}.h-3\\.5{height:.875em}.h-4{height:1em}.h-5{height:1.25em}.h-6{height:1.5em}.h-64{height:16em}.h-7{height:1.75em}.h-8{height:2em}.h-9{height:2.25em}.h-auto{height:auto}.max-h-40{max-height:10em}.max-h-64{max-height:16em}.max-h-80{max-height:20em}.max-h-\\[160px\\]{max-height:160px}.max-h-\\[85dvh\\]{max-height:85dvh}.min-h-\\[40px\\]{min-height:40px}.w-10{width:2.5em}.w-24{width:6em}.w-3{width:.75em}.w-3\\.5{width:.875em}.w-4{width:1em}.w-5{width:1.25em}.w-6{width:1.5em}.w-7{width:1.75em}.w-72{width:18em}.w-8{width:2em}.w-9{width:2.25em}.w-full{width:100%}.min-w-0{min-width:0}.min-w-\\[220px\\]{min-width:220px}.min-w-\\[80px\\]{min-width:80px}.max-w-2xl{max-width:42em}.max-w-\\[160px\\]{max-width:160px}.max-w-\\[200px\\]{max-width:200px}.max-w-\\[85\\%\\]{max-width:85%}.max-w-\\[90\\%\\]{max-width:90%}.max-w-full{max-width:100%}.max-w-sm{max-width:24em}.max-w-xl{max-width:36em}.flex-1{flex:1 1 0%}.flex-shrink,.shrink{flex-shrink:1}.shrink-0{flex-shrink:0}.border-collapse{border-collapse:collapse}.-translate-x-1{--tw-translate-x:-0.25em}.-translate-x-1,.-translate-x-1\\/2{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.-translate-x-1\\/2{--tw-translate-x:-50%}.transform{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.cursor-pointer{cursor:pointer}.select-none{-webkit-user-select:none;-moz-user-select:none;user-select:none}.resize{resize:both}.list-decimal{list-style-type:decimal}.list-disc{list-style-type:disc}.grid-cols-6{grid-template-columns:repeat(6,minmax(0,1fr))}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.items-start{align-items:flex-start}.items-end{align-items:flex-end}.items-center{align-items:center}.justify-start{justify-content:flex-start}.justify-end{justify-content:flex-end}.justify-center{justify-content:center}.gap-1{gap:.25em}.gap-2{gap:.5em}.gap-3{gap:.75em}.space-y-1>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.25em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.25em*var(--tw-space-y-reverse))}.space-y-2>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.5em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.5em*var(--tw-space-y-reverse))}.space-y-3>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.75em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.75em*var(--tw-space-y-reverse))}.space-y-6>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(1.5em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(1.5em*var(--tw-space-y-reverse))}.divide-y>:not([hidden])~:not([hidden]){--tw-divide-y-reverse:0;border-top-width:calc(1px*(1 - var(--tw-divide-y-reverse)));border-bottom-width:calc(1px*var(--tw-divide-y-reverse))}.divide-zinc-100>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(244 244 245/var(--tw-divide-opacity,1))}.overflow-auto{overflow:auto}.overflow-hidden{overflow:hidden}.overflow-x-auto{overflow-x:auto}.overflow-y-auto{overflow-y:auto}.truncate{overflow:hidden;text-overflow:ellipsis}.truncate,.whitespace-nowrap{white-space:nowrap}.whitespace-pre-wrap{white-space:pre-wrap}.break-words{overflow-wrap:break-word}.break-all{word-break:break-all}.rounded{border-radius:.25em}.rounded-2xl{border-radius:1em}.rounded-full{border-radius:9999px}.rounded-lg{border-radius:.5em}.rounded-md{border-radius:.375em}.rounded-xl{border-radius:.75em}.rounded-r-lg{border-top-right-radius:.5em;border-bottom-right-radius:.5em}.rounded-t-2xl{border-top-left-radius:1em;border-top-right-radius:1em}.border{border-width:1px}.border-b{border-bottom-width:1px}.border-b-2{border-bottom-width:2px}.border-l-4{border-left-width:4px}.border-t{border-top-width:1px}.border-dashed{border-style:dashed}.border-indigo-200{--tw-border-opacity:1;border-color:rgb(199 210 254/var(--tw-border-opacity,1))}.border-indigo-500{--tw-border-opacity:1;border-color:rgb(99 102 241/var(--tw-border-opacity,1))}.border-indigo-600{--tw-border-opacity:1;border-color:rgb(79 70 229/var(--tw-border-opacity,1))}.border-transparent{border-color:transparent}.border-zinc-100{--tw-border-opacity:1;border-color:rgb(244 244 245/var(--tw-border-opacity,1))}.border-zinc-200{--tw-border-opacity:1;border-color:rgb(228 228 231/var(--tw-border-opacity,1))}.border-zinc-300{--tw-border-opacity:1;border-color:rgb(212 212 216/var(--tw-border-opacity,1))}.bg-black{--tw-bg-opacity:1;background-color:rgb(0 0 0/var(--tw-bg-opacity,1))}.bg-black\\/30{background-color:rgba(0,0,0,.3)}.bg-black\\/40{background-color:rgba(0,0,0,.4)}.bg-emerald-600{--tw-bg-opacity:1;background-color:rgb(5 150 105/var(--tw-bg-opacity,1))}.bg-indigo-100{--tw-bg-opacity:1;background-color:rgb(224 231 255/var(--tw-bg-opacity,1))}.bg-indigo-50{--tw-bg-opacity:1;background-color:rgb(238 242 255/var(--tw-bg-opacity,1))}.bg-indigo-600{--tw-bg-opacity:1;background-color:rgb(79 70 229/var(--tw-bg-opacity,1))}.bg-indigo-900{--tw-bg-opacity:1;background-color:rgb(49 46 129/var(--tw-bg-opacity,1))}.bg-red-50{--tw-bg-opacity:1;background-color:rgb(254 242 242/var(--tw-bg-opacity,1))}.bg-red-600{--tw-bg-opacity:1;background-color:rgb(220 38 38/var(--tw-bg-opacity,1))}.bg-red-900{--tw-bg-opacity:1;background-color:rgb(127 29 29/var(--tw-bg-opacity,1))}.bg-transparent{background-color:transparent}.bg-white{--tw-bg-opacity:1;background-color:rgb(255 255 255/var(--tw-bg-opacity,1))}.bg-zinc-100{--tw-bg-opacity:1;background-color:rgb(244 244 245/var(--tw-bg-opacity,1))}.bg-zinc-200{--tw-bg-opacity:1;background-color:rgb(228 228 231/var(--tw-bg-opacity,1))}.bg-zinc-300{--tw-bg-opacity:1;background-color:rgb(212 212 216/var(--tw-bg-opacity,1))}.bg-zinc-50{--tw-bg-opacity:1;background-color:rgb(250 250 250/var(--tw-bg-opacity,1))}.bg-zinc-800{--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.bg-zinc-900{--tw-bg-opacity:1;background-color:rgb(24 24 27/var(--tw-bg-opacity,1))}.object-cover{-o-object-fit:cover;object-fit:cover}.p-0{padding:0}.p-1{padding:.25em}.p-2{padding:.5em}.p-3{padding:.75em}.p-4{padding:1em}.p-8{padding:2em}.px-1{padding-left:.25em;padding-right:.25em}.px-1\\.5{padding-left:.375em;padding-right:.375em}.px-2{padding-left:.5em;padding-right:.5em}.px-3{padding-left:.75em;padding-right:.75em}.px-4{padding-left:1em;padding-right:1em}.py-0{padding-top:0;padding-bottom:0}.py-0\\.5{padding-top:.125em;padding-bottom:.125em}.py-1{padding-top:.25em;padding-bottom:.25em}.py-1\\.5{padding-top:.375em;padding-bottom:.375em}.py-2{padding-top:.5em;padding-bottom:.5em}.py-2\\.5{padding-top:.625em;padding-bottom:.625em}.py-3{padding-top:.75em;padding-bottom:.75em}.py-8{padding-top:2em;padding-bottom:2em}.pb-1{padding-bottom:.25em}.pb-2{padding-bottom:.5em}.pb-3{padding-bottom:.75em}.pl-3{padding-left:.75em}.pt-0{padding-top:0}.pt-0\\.5{padding-top:.125em}.pt-1{padding-top:.25em}.pt-2{padding-top:.5em}.pt-3{padding-top:.75em}.pt-4{padding-top:1em}.text-left{text-align:left}.text-center{text-align:center}.align-top{vertical-align:top}.font-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.text-\\[0\\.85em\\]{font-size:.85em}.text-\\[10px\\]{font-size:10px}.text-\\[11px\\]{font-size:11px}.text-base{font-size:16px;line-height:24px}.text-lg{font-size:18px;line-height:28px}.text-sm{font-size:14px;line-height:20px}.text-xl{font-size:20px;line-height:28px}.text-xs{font-size:12px;line-height:16px}.font-bold{font-weight:700}.font-medium{font-weight:500}.font-semibold{font-weight:600}.uppercase{text-transform:uppercase}.italic{font-style:italic}.leading-none{line-height:1}.leading-relaxed{line-height:1.625}.tracking-wide{letter-spacing:.025em}.tracking-wider{letter-spacing:.05em}.text-blue-600{--tw-text-opacity:1;color:rgb(37 99 235/var(--tw-text-opacity,1))}.text-emerald-600{--tw-text-opacity:1;color:rgb(5 150 105/var(--tw-text-opacity,1))}.text-indigo-600{--tw-text-opacity:1;color:rgb(79 70 229/var(--tw-text-opacity,1))}.text-indigo-700{--tw-text-opacity:1;color:rgb(67 56 202/var(--tw-text-opacity,1))}.text-inherit{color:inherit}.text-red-700{--tw-text-opacity:1;color:rgb(185 28 28/var(--tw-text-opacity,1))}.text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.text-zinc-100{--tw-text-opacity:1;color:rgb(244 244 245/var(--tw-text-opacity,1))}.text-zinc-400{--tw-text-opacity:1;color:rgb(161 161 170/var(--tw-text-opacity,1))}.text-zinc-500{--tw-text-opacity:1;color:rgb(113 113 122/var(--tw-text-opacity,1))}.text-zinc-600{--tw-text-opacity:1;color:rgb(82 82 91/var(--tw-text-opacity,1))}.text-zinc-700{--tw-text-opacity:1;color:rgb(63 63 70/var(--tw-text-opacity,1))}.text-zinc-800{--tw-text-opacity:1;color:rgb(39 39 42/var(--tw-text-opacity,1))}.text-zinc-900{--tw-text-opacity:1;color:rgb(24 24 27/var(--tw-text-opacity,1))}.underline{text-decoration-line:underline}.antialiased{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}.opacity-80{opacity:.8}.shadow{--tw-shadow:0 1px 3px 0 rgba(0,0,0,.1),0 1px 2px -1px rgba(0,0,0,.1);--tw-shadow-colored:0 1px 3px 0 var(--tw-shadow-color),0 1px 2px -1px var(--tw-shadow-color)}.shadow,.shadow-2xl{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-2xl{--tw-shadow:0 25px 50px -12px rgba(0,0,0,.25);--tw-shadow-colored:0 25px 50px -12px var(--tw-shadow-color)}.shadow-lg{--tw-shadow:0 10px 15px -3px rgba(0,0,0,.1),0 4px 6px -4px rgba(0,0,0,.1);--tw-shadow-colored:0 10px 15px -3px var(--tw-shadow-color),0 4px 6px -4px var(--tw-shadow-color)}.shadow-lg,.shadow-xl{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-xl{--tw-shadow:0 20px 25px -5px rgba(0,0,0,.1),0 8px 10px -6px rgba(0,0,0,.1);--tw-shadow-colored:0 20px 25px -5px var(--tw-shadow-color),0 8px 10px -6px var(--tw-shadow-color)}.outline{outline-style:solid}.ring{--tw-ring-offset-shadow:var(--tw-ring-inset) 0 0 0 var(--tw-ring-offset-width) var(--tw-ring-offset-color);--tw-ring-shadow:var(--tw-ring-inset) 0 0 0 calc(3px + var(--tw-ring-offset-width)) var(--tw-ring-color);box-shadow:var(--tw-ring-offset-shadow),var(--tw-ring-shadow),var(--tw-shadow,0 0 #0000)}.blur{--tw-blur:blur(8px)}.blur,.filter{filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.transition{transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,-webkit-backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter,-webkit-backdrop-filter;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.ease-out{transition-timing-function:cubic-bezier(0,0,.2,1)}.empty\\:hidden:empty{display:none}.hover\\:bg-indigo-50:hover{--tw-bg-opacity:1;background-color:rgb(238 242 255/var(--tw-bg-opacity,1))}.hover\\:bg-red-50:hover{--tw-bg-opacity:1;background-color:rgb(254 242 242/var(--tw-bg-opacity,1))}.hover\\:bg-zinc-100:hover{--tw-bg-opacity:1;background-color:rgb(244 244 245/var(--tw-bg-opacity,1))}.hover\\:bg-zinc-50:hover{--tw-bg-opacity:1;background-color:rgb(250 250 250/var(--tw-bg-opacity,1))}.hover\\:text-red-500:hover{--tw-text-opacity:1;color:rgb(239 68 68/var(--tw-text-opacity,1))}.hover\\:text-red-600:hover{--tw-text-opacity:1;color:rgb(220 38 38/var(--tw-text-opacity,1))}.hover\\:text-zinc-600:hover{--tw-text-opacity:1;color:rgb(82 82 91/var(--tw-text-opacity,1))}.hover\\:text-zinc-700:hover{--tw-text-opacity:1;color:rgb(63 63 70/var(--tw-text-opacity,1))}.hover\\:underline:hover{text-decoration-line:underline}.disabled\\:opacity-50:disabled{opacity:.5}.dark\\:divide-zinc-800:is(.dark *)>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(39 39 42/var(--tw-divide-opacity,1))}.dark\\:border-indigo-800:is(.dark *){--tw-border-opacity:1;border-color:rgb(55 48 163/var(--tw-border-opacity,1))}.dark\\:border-zinc-600:is(.dark *){--tw-border-opacity:1;border-color:rgb(82 82 91/var(--tw-border-opacity,1))}.dark\\:border-zinc-700:is(.dark *){--tw-border-opacity:1;border-color:rgb(63 63 70/var(--tw-border-opacity,1))}.dark\\:border-zinc-800:is(.dark *){--tw-border-opacity:1;border-color:rgb(39 39 42/var(--tw-border-opacity,1))}.dark\\:bg-indigo-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(49 46 129/var(--tw-bg-opacity,1))}.dark\\:bg-indigo-900\\/30:is(.dark *){background-color:rgba(49,46,129,.3)}.dark\\:bg-indigo-900\\/40:is(.dark *){background-color:rgba(49,46,129,.4)}.dark\\:bg-red-900\\/30:is(.dark *){background-color:rgba(127,29,29,.3)}.dark\\:bg-zinc-600:is(.dark *){--tw-bg-opacity:1;background-color:rgb(82 82 91/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-700:is(.dark *){--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-800:is(.dark *){--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-800\\/50:is(.dark *){background-color:rgba(39,39,42,.5)}.dark\\:bg-zinc-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(24 24 27/var(--tw-bg-opacity,1))}.dark\\:text-blue-400:is(.dark *){--tw-text-opacity:1;color:rgb(96 165 250/var(--tw-text-opacity,1))}.dark\\:text-indigo-200:is(.dark *){--tw-text-opacity:1;color:rgb(199 210 254/var(--tw-text-opacity,1))}.dark\\:text-indigo-300:is(.dark *){--tw-text-opacity:1;color:rgb(165 180 252/var(--tw-text-opacity,1))}.dark\\:text-indigo-400:is(.dark *){--tw-text-opacity:1;color:rgb(129 140 248/var(--tw-text-opacity,1))}.dark\\:text-red-300:is(.dark *){--tw-text-opacity:1;color:rgb(252 165 165/var(--tw-text-opacity,1))}.dark\\:text-zinc-100:is(.dark *){--tw-text-opacity:1;color:rgb(244 244 245/var(--tw-text-opacity,1))}.dark\\:text-zinc-200:is(.dark *){--tw-text-opacity:1;color:rgb(228 228 231/var(--tw-text-opacity,1))}.dark\\:text-zinc-300:is(.dark *){--tw-text-opacity:1;color:rgb(212 212 216/var(--tw-text-opacity,1))}.dark\\:text-zinc-400:is(.dark *){--tw-text-opacity:1;color:rgb(161 161 170/var(--tw-text-opacity,1))}.dark\\:text-zinc-500:is(.dark *){--tw-text-opacity:1;color:rgb(113 113 122/var(--tw-text-opacity,1))}.dark\\:hover\\:bg-indigo-900\\/40:hover:is(.dark *){background-color:rgba(49,46,129,.4)}.dark\\:hover\\:bg-red-900\\/30:hover:is(.dark *){background-color:rgba(127,29,29,.3)}.dark\\:hover\\:bg-zinc-700:hover:is(.dark *){--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.dark\\:hover\\:bg-zinc-800:hover:is(.dark *){--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.dark\\:hover\\:bg-zinc-800\\/50:hover:is(.dark *){background-color:rgba(39,39,42,.5)}.dark\\:hover\\:bg-zinc-800\\/60:hover:is(.dark *){background-color:rgba(39,39,42,.6)}.dark\\:hover\\:text-zinc-200:hover:is(.dark *){--tw-text-opacity:1;color:rgb(228 228 231/var(--tw-text-opacity,1))}@media (min-width:640px){.sm\\:mx-auto{margin-left:auto;margin-right:auto}.sm\\:my-4{margin-top:1em}.sm\\:mb-4,.sm\\:my-4{margin-bottom:1em}.sm\\:h-\\[calc\\(100dvh-2em\\)\\]{height:calc(100dvh - 2em)}.sm\\:max-w-4xl{max-width:56em}.sm\\:max-w-5xl{max-width:64em}.sm\\:max-w-6xl{max-width:72em}.sm\\:items-stretch{align-items:stretch}.sm\\:rounded-2xl{border-radius:1em}}`;
+  const TAILWIND_CSS = `.\\!container{width:100%!important}.container{width:100%}@media (min-width:640px){.\\!container{max-width:640px!important}.container{max-width:640px}}@media (min-width:768px){.\\!container{max-width:768px!important}.container{max-width:768px}}@media (min-width:1024px){.\\!container{max-width:1024px!important}.container{max-width:1024px}}@media (min-width:1280px){.\\!container{max-width:1280px!important}.container{max-width:1280px}}@media (min-width:1536px){.\\!container{max-width:1536px!important}.container{max-width:1536px}}.pointer-events-none{pointer-events:none}.pointer-events-auto{pointer-events:auto}.\\!visible{visibility:visible!important}.visible{visibility:visible}.invisible{visibility:hidden}.fixed{position:fixed}.absolute{position:absolute}.relative{position:relative}.inset-0{inset:0}.bottom-4{bottom:1em}.bottom-full{bottom:100%}.left-0{left:0}.left-1{left:.25em}.left-1\\/2{left:50%}.z-20{z-index:20}.mx-3{margin-left:.75em;margin-right:.75em}.my-1{margin-top:.25em;margin-bottom:.25em}.my-2{margin-top:.5em;margin-bottom:.5em}.my-3{margin-top:.75em;margin-bottom:.75em}.mb-1{margin-bottom:.25em}.mb-2{margin-bottom:.5em}.mb-3{margin-bottom:.75em}.ml-5{margin-left:1.25em}.mr-1{margin-right:.25em}.mr-2{margin-right:.5em}.mt-0{margin-top:0}.mt-0\\.5{margin-top:.125em}.mt-1{margin-top:.25em}.mt-1\\.5{margin-top:.375em}.mt-2{margin-top:.5em}.mt-3{margin-top:.75em}.mt-4{margin-top:1em}.line-clamp-2{-webkit-line-clamp:2}.line-clamp-2,.line-clamp-3{overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical}.line-clamp-3{-webkit-line-clamp:3}.\\!block{display:block!important}.block{display:block}.inline-block{display:inline-block}.inline{display:inline}.flex{display:flex}.inline-flex{display:inline-flex}.table{display:table}.grid{display:grid}.contents{display:contents}.hidden{display:none}.h-1{height:.25em}.h-10{height:2.5em}.h-3{height:.75em}.h-3\\.5{height:.875em}.h-4{height:1em}.h-5{height:1.25em}.h-6{height:1.5em}.h-64{height:16em}.h-7{height:1.75em}.h-8{height:2em}.h-9{height:2.25em}.h-auto{height:auto}.max-h-40{max-height:10em}.max-h-64{max-height:16em}.max-h-80{max-height:20em}.max-h-\\[160px\\]{max-height:160px}.max-h-\\[85dvh\\]{max-height:85dvh}.min-h-\\[40px\\]{min-height:40px}.w-10{width:2.5em}.w-24{width:6em}.w-3{width:.75em}.w-3\\.5{width:.875em}.w-4{width:1em}.w-5{width:1.25em}.w-6{width:1.5em}.w-7{width:1.75em}.w-72{width:18em}.w-8{width:2em}.w-9{width:2.25em}.w-full{width:100%}.min-w-0{min-width:0}.min-w-\\[220px\\]{min-width:220px}.min-w-\\[80px\\]{min-width:80px}.max-w-2xl{max-width:42em}.max-w-\\[160px\\]{max-width:160px}.max-w-\\[200px\\]{max-width:200px}.max-w-\\[85\\%\\]{max-width:85%}.max-w-\\[90\\%\\]{max-width:90%}.max-w-full{max-width:100%}.max-w-sm{max-width:24em}.max-w-xl{max-width:36em}.flex-1{flex:1 1 0%}.flex-shrink,.shrink{flex-shrink:1}.shrink-0{flex-shrink:0}.border-collapse{border-collapse:collapse}.-translate-x-1{--tw-translate-x:-0.25em}.-translate-x-1,.-translate-x-1\\/2{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.-translate-x-1\\/2{--tw-translate-x:-50%}.transform{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.cursor-pointer{cursor:pointer}.select-none{-webkit-user-select:none;-moz-user-select:none;user-select:none}.resize{resize:both}.list-decimal{list-style-type:decimal}.list-disc{list-style-type:disc}.grid-cols-6{grid-template-columns:repeat(6,minmax(0,1fr))}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.items-start{align-items:flex-start}.items-end{align-items:flex-end}.items-center{align-items:center}.justify-start{justify-content:flex-start}.justify-end{justify-content:flex-end}.justify-center{justify-content:center}.gap-1{gap:.25em}.gap-2{gap:.5em}.gap-3{gap:.75em}.space-y-1>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.25em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.25em*var(--tw-space-y-reverse))}.space-y-2>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.5em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.5em*var(--tw-space-y-reverse))}.space-y-3>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.75em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.75em*var(--tw-space-y-reverse))}.space-y-6>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(1.5em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(1.5em*var(--tw-space-y-reverse))}.divide-y>:not([hidden])~:not([hidden]){--tw-divide-y-reverse:0;border-top-width:calc(1px*(1 - var(--tw-divide-y-reverse)));border-bottom-width:calc(1px*var(--tw-divide-y-reverse))}.divide-zinc-100>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(244 244 245/var(--tw-divide-opacity,1))}.overflow-auto{overflow:auto}.overflow-hidden{overflow:hidden}.overflow-x-auto{overflow-x:auto}.overflow-y-auto{overflow-y:auto}.truncate{overflow:hidden;text-overflow:ellipsis}.truncate,.whitespace-nowrap{white-space:nowrap}.whitespace-pre-wrap{white-space:pre-wrap}.break-words{overflow-wrap:break-word}.break-all{word-break:break-all}.rounded{border-radius:.25em}.rounded-2xl{border-radius:1em}.rounded-full{border-radius:9999px}.rounded-lg{border-radius:.5em}.rounded-md{border-radius:.375em}.rounded-xl{border-radius:.75em}.rounded-r-lg{border-top-right-radius:.5em;border-bottom-right-radius:.5em}.rounded-t-2xl{border-top-left-radius:1em;border-top-right-radius:1em}.border{border-width:1px}.border-b{border-bottom-width:1px}.border-b-2{border-bottom-width:2px}.border-l-4{border-left-width:4px}.border-t{border-top-width:1px}.border-dashed{border-style:dashed}.border-indigo-200{--tw-border-opacity:1;border-color:rgb(199 210 254/var(--tw-border-opacity,1))}.border-indigo-500{--tw-border-opacity:1;border-color:rgb(99 102 241/var(--tw-border-opacity,1))}.border-indigo-600{--tw-border-opacity:1;border-color:rgb(79 70 229/var(--tw-border-opacity,1))}.border-transparent{border-color:transparent}.border-zinc-100{--tw-border-opacity:1;border-color:rgb(244 244 245/var(--tw-border-opacity,1))}.border-zinc-200{--tw-border-opacity:1;border-color:rgb(228 228 231/var(--tw-border-opacity,1))}.border-zinc-300{--tw-border-opacity:1;border-color:rgb(212 212 216/var(--tw-border-opacity,1))}.bg-black{--tw-bg-opacity:1;background-color:rgb(0 0 0/var(--tw-bg-opacity,1))}.bg-black\\/30{background-color:rgba(0,0,0,.3)}.bg-black\\/40{background-color:rgba(0,0,0,.4)}.bg-emerald-600{--tw-bg-opacity:1;background-color:rgb(5 150 105/var(--tw-bg-opacity,1))}.bg-indigo-100{--tw-bg-opacity:1;background-color:rgb(224 231 255/var(--tw-bg-opacity,1))}.bg-indigo-50{--tw-bg-opacity:1;background-color:rgb(238 242 255/var(--tw-bg-opacity,1))}.bg-indigo-600{--tw-bg-opacity:1;background-color:rgb(79 70 229/var(--tw-bg-opacity,1))}.bg-indigo-900{--tw-bg-opacity:1;background-color:rgb(49 46 129/var(--tw-bg-opacity,1))}.bg-red-50{--tw-bg-opacity:1;background-color:rgb(254 242 242/var(--tw-bg-opacity,1))}.bg-red-600{--tw-bg-opacity:1;background-color:rgb(220 38 38/var(--tw-bg-opacity,1))}.bg-red-900{--tw-bg-opacity:1;background-color:rgb(127 29 29/var(--tw-bg-opacity,1))}.bg-transparent{background-color:transparent}.bg-white{--tw-bg-opacity:1;background-color:rgb(255 255 255/var(--tw-bg-opacity,1))}.bg-zinc-100{--tw-bg-opacity:1;background-color:rgb(244 244 245/var(--tw-bg-opacity,1))}.bg-zinc-200{--tw-bg-opacity:1;background-color:rgb(228 228 231/var(--tw-bg-opacity,1))}.bg-zinc-300{--tw-bg-opacity:1;background-color:rgb(212 212 216/var(--tw-bg-opacity,1))}.bg-zinc-50{--tw-bg-opacity:1;background-color:rgb(250 250 250/var(--tw-bg-opacity,1))}.bg-zinc-700{--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.bg-zinc-800{--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.bg-zinc-900{--tw-bg-opacity:1;background-color:rgb(24 24 27/var(--tw-bg-opacity,1))}.object-cover{-o-object-fit:cover;object-fit:cover}.p-0{padding:0}.p-1{padding:.25em}.p-2{padding:.5em}.p-3{padding:.75em}.p-4{padding:1em}.p-8{padding:2em}.px-1{padding-left:.25em;padding-right:.25em}.px-1\\.5{padding-left:.375em;padding-right:.375em}.px-2{padding-left:.5em;padding-right:.5em}.px-3{padding-left:.75em;padding-right:.75em}.px-4{padding-left:1em;padding-right:1em}.py-0{padding-top:0;padding-bottom:0}.py-0\\.5{padding-top:.125em;padding-bottom:.125em}.py-1{padding-top:.25em;padding-bottom:.25em}.py-1\\.5{padding-top:.375em;padding-bottom:.375em}.py-2{padding-top:.5em;padding-bottom:.5em}.py-2\\.5{padding-top:.625em;padding-bottom:.625em}.py-3{padding-top:.75em;padding-bottom:.75em}.py-8{padding-top:2em;padding-bottom:2em}.pb-1{padding-bottom:.25em}.pb-2{padding-bottom:.5em}.pb-3{padding-bottom:.75em}.pl-3{padding-left:.75em}.pt-0{padding-top:0}.pt-0\\.5{padding-top:.125em}.pt-1{padding-top:.25em}.pt-2{padding-top:.5em}.pt-3{padding-top:.75em}.pt-4{padding-top:1em}.text-left{text-align:left}.text-center{text-align:center}.align-top{vertical-align:top}.font-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.text-\\[0\\.85em\\]{font-size:.85em}.text-\\[10px\\]{font-size:10px}.text-\\[11px\\]{font-size:11px}.text-base{font-size:16px;line-height:24px}.text-lg{font-size:18px;line-height:28px}.text-sm{font-size:14px;line-height:20px}.text-xl{font-size:20px;line-height:28px}.text-xs{font-size:12px;line-height:16px}.font-bold{font-weight:700}.font-medium{font-weight:500}.font-semibold{font-weight:600}.uppercase{text-transform:uppercase}.italic{font-style:italic}.leading-none{line-height:1}.leading-relaxed{line-height:1.625}.tracking-wide{letter-spacing:.025em}.tracking-wider{letter-spacing:.05em}.text-blue-600{--tw-text-opacity:1;color:rgb(37 99 235/var(--tw-text-opacity,1))}.text-emerald-600{--tw-text-opacity:1;color:rgb(5 150 105/var(--tw-text-opacity,1))}.text-indigo-600{--tw-text-opacity:1;color:rgb(79 70 229/var(--tw-text-opacity,1))}.text-indigo-700{--tw-text-opacity:1;color:rgb(67 56 202/var(--tw-text-opacity,1))}.text-inherit{color:inherit}.text-red-700{--tw-text-opacity:1;color:rgb(185 28 28/var(--tw-text-opacity,1))}.text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.text-zinc-100{--tw-text-opacity:1;color:rgb(244 244 245/var(--tw-text-opacity,1))}.text-zinc-400{--tw-text-opacity:1;color:rgb(161 161 170/var(--tw-text-opacity,1))}.text-zinc-500{--tw-text-opacity:1;color:rgb(113 113 122/var(--tw-text-opacity,1))}.text-zinc-600{--tw-text-opacity:1;color:rgb(82 82 91/var(--tw-text-opacity,1))}.text-zinc-700{--tw-text-opacity:1;color:rgb(63 63 70/var(--tw-text-opacity,1))}.text-zinc-800{--tw-text-opacity:1;color:rgb(39 39 42/var(--tw-text-opacity,1))}.text-zinc-900{--tw-text-opacity:1;color:rgb(24 24 27/var(--tw-text-opacity,1))}.underline{text-decoration-line:underline}.antialiased{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}.opacity-80{opacity:.8}.shadow{--tw-shadow:0 1px 3px 0 rgba(0,0,0,.1),0 1px 2px -1px rgba(0,0,0,.1);--tw-shadow-colored:0 1px 3px 0 var(--tw-shadow-color),0 1px 2px -1px var(--tw-shadow-color)}.shadow,.shadow-2xl{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-2xl{--tw-shadow:0 25px 50px -12px rgba(0,0,0,.25);--tw-shadow-colored:0 25px 50px -12px var(--tw-shadow-color)}.shadow-lg{--tw-shadow:0 10px 15px -3px rgba(0,0,0,.1),0 4px 6px -4px rgba(0,0,0,.1);--tw-shadow-colored:0 10px 15px -3px var(--tw-shadow-color),0 4px 6px -4px var(--tw-shadow-color)}.shadow-lg,.shadow-xl{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-xl{--tw-shadow:0 20px 25px -5px rgba(0,0,0,.1),0 8px 10px -6px rgba(0,0,0,.1);--tw-shadow-colored:0 20px 25px -5px var(--tw-shadow-color),0 8px 10px -6px var(--tw-shadow-color)}.outline{outline-style:solid}.ring{--tw-ring-offset-shadow:var(--tw-ring-inset) 0 0 0 var(--tw-ring-offset-width) var(--tw-ring-offset-color);--tw-ring-shadow:var(--tw-ring-inset) 0 0 0 calc(3px + var(--tw-ring-offset-width)) var(--tw-ring-color);box-shadow:var(--tw-ring-offset-shadow),var(--tw-ring-shadow),var(--tw-shadow,0 0 #0000)}.blur{--tw-blur:blur(8px)}.blur,.filter{filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.transition{transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,-webkit-backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter,-webkit-backdrop-filter;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.ease-out{transition-timing-function:cubic-bezier(0,0,.2,1)}.empty\\:hidden:empty{display:none}.hover\\:bg-indigo-50:hover{--tw-bg-opacity:1;background-color:rgb(238 242 255/var(--tw-bg-opacity,1))}.hover\\:bg-red-50:hover{--tw-bg-opacity:1;background-color:rgb(254 242 242/var(--tw-bg-opacity,1))}.hover\\:bg-zinc-100:hover{--tw-bg-opacity:1;background-color:rgb(244 244 245/var(--tw-bg-opacity,1))}.hover\\:bg-zinc-50:hover{--tw-bg-opacity:1;background-color:rgb(250 250 250/var(--tw-bg-opacity,1))}.hover\\:text-red-500:hover{--tw-text-opacity:1;color:rgb(239 68 68/var(--tw-text-opacity,1))}.hover\\:text-red-600:hover{--tw-text-opacity:1;color:rgb(220 38 38/var(--tw-text-opacity,1))}.hover\\:text-zinc-600:hover{--tw-text-opacity:1;color:rgb(82 82 91/var(--tw-text-opacity,1))}.hover\\:text-zinc-700:hover{--tw-text-opacity:1;color:rgb(63 63 70/var(--tw-text-opacity,1))}.hover\\:underline:hover{text-decoration-line:underline}.disabled\\:opacity-50:disabled{opacity:.5}.dark\\:divide-zinc-800:is(.dark *)>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(39 39 42/var(--tw-divide-opacity,1))}.dark\\:border-indigo-800:is(.dark *){--tw-border-opacity:1;border-color:rgb(55 48 163/var(--tw-border-opacity,1))}.dark\\:border-zinc-600:is(.dark *){--tw-border-opacity:1;border-color:rgb(82 82 91/var(--tw-border-opacity,1))}.dark\\:border-zinc-700:is(.dark *){--tw-border-opacity:1;border-color:rgb(63 63 70/var(--tw-border-opacity,1))}.dark\\:border-zinc-800:is(.dark *){--tw-border-opacity:1;border-color:rgb(39 39 42/var(--tw-border-opacity,1))}.dark\\:bg-indigo-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(49 46 129/var(--tw-bg-opacity,1))}.dark\\:bg-indigo-900\\/30:is(.dark *){background-color:rgba(49,46,129,.3)}.dark\\:bg-indigo-900\\/40:is(.dark *){background-color:rgba(49,46,129,.4)}.dark\\:bg-red-900\\/30:is(.dark *){background-color:rgba(127,29,29,.3)}.dark\\:bg-zinc-600:is(.dark *){--tw-bg-opacity:1;background-color:rgb(82 82 91/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-700:is(.dark *){--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-800:is(.dark *){--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-800\\/50:is(.dark *){background-color:rgba(39,39,42,.5)}.dark\\:bg-zinc-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(24 24 27/var(--tw-bg-opacity,1))}.dark\\:text-blue-400:is(.dark *){--tw-text-opacity:1;color:rgb(96 165 250/var(--tw-text-opacity,1))}.dark\\:text-indigo-200:is(.dark *){--tw-text-opacity:1;color:rgb(199 210 254/var(--tw-text-opacity,1))}.dark\\:text-indigo-300:is(.dark *){--tw-text-opacity:1;color:rgb(165 180 252/var(--tw-text-opacity,1))}.dark\\:text-indigo-400:is(.dark *){--tw-text-opacity:1;color:rgb(129 140 248/var(--tw-text-opacity,1))}.dark\\:text-red-300:is(.dark *){--tw-text-opacity:1;color:rgb(252 165 165/var(--tw-text-opacity,1))}.dark\\:text-zinc-100:is(.dark *){--tw-text-opacity:1;color:rgb(244 244 245/var(--tw-text-opacity,1))}.dark\\:text-zinc-200:is(.dark *){--tw-text-opacity:1;color:rgb(228 228 231/var(--tw-text-opacity,1))}.dark\\:text-zinc-300:is(.dark *){--tw-text-opacity:1;color:rgb(212 212 216/var(--tw-text-opacity,1))}.dark\\:text-zinc-400:is(.dark *){--tw-text-opacity:1;color:rgb(161 161 170/var(--tw-text-opacity,1))}.dark\\:text-zinc-500:is(.dark *){--tw-text-opacity:1;color:rgb(113 113 122/var(--tw-text-opacity,1))}.dark\\:hover\\:bg-indigo-900\\/40:hover:is(.dark *){background-color:rgba(49,46,129,.4)}.dark\\:hover\\:bg-red-900\\/30:hover:is(.dark *){background-color:rgba(127,29,29,.3)}.dark\\:hover\\:bg-zinc-700:hover:is(.dark *){--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.dark\\:hover\\:bg-zinc-800:hover:is(.dark *){--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.dark\\:hover\\:bg-zinc-800\\/50:hover:is(.dark *){background-color:rgba(39,39,42,.5)}.dark\\:hover\\:bg-zinc-800\\/60:hover:is(.dark *){background-color:rgba(39,39,42,.6)}.dark\\:hover\\:text-zinc-200:hover:is(.dark *){--tw-text-opacity:1;color:rgb(228 228 231/var(--tw-text-opacity,1))}@media (min-width:640px){.sm\\:mx-auto{margin-left:auto;margin-right:auto}.sm\\:my-4{margin-top:1em}.sm\\:mb-4,.sm\\:my-4{margin-bottom:1em}.sm\\:h-\\[calc\\(100dvh-2em\\)\\]{height:calc(100dvh - 2em)}.sm\\:max-w-4xl{max-width:56em}.sm\\:max-w-5xl{max-width:64em}.sm\\:max-w-6xl{max-width:72em}.sm\\:items-stretch{align-items:stretch}.sm\\:rounded-2xl{border-radius:1em}}`;
   /* @TAILWIND_CSS_END */
 
   const BASE_CSS = `
@@ -1824,6 +1869,112 @@ textarea { resize: none; }
         ok.addEventListener('click', () => { close(); done(ta.value); });
         footer.append(cancel, ok);
         setTimeout(() => ta.focus(), 50);
+      });
+    },
+
+    // Lets the user point at an element on the page. Resolves with the picked
+    // Element, or null if they cancelled.
+    //
+    // The overlay has to get out of the way for this: the chat sheet covers the
+    // viewport and the FAB sits on top of page content, so both are hidden for
+    // the duration and restored afterwards. The highlight box is
+    // `pointer-events: none` so hover and click still reach the page, and every
+    // listener is registered in the CAPTURE phase and swallows the event, which
+    // keeps the pick from also activating whatever the user clicked (links,
+    // buttons, and menus would otherwise fire).
+    pickElement({ purpose } = {}) {
+      return new Promise((resolve) => {
+        let settled = false;
+        const chatPanel = ChatPanel.panel;
+        const fab = OverlayButton.host;
+        const prevChat = chatPanel ? chatPanel.style.display : null;
+        const prevFab = fab ? fab.style.display : null;
+        if (chatPanel) chatPanel.style.display = 'none';
+        if (fab) fab.style.display = 'none';
+        OverlayButton.closeMenu();
+
+        const box = el('div', {
+          class: 'fixed',
+          style: {
+            zIndex: 60, pointerEvents: 'none', display: 'none',
+            border: '2px solid rgb(79 70 229)', borderRadius: '2px',
+            background: 'rgba(99,102,241,0.18)', transition: 'all 60ms ease-out'
+          }
+        });
+        const bar = el('div', {
+          class: 'fixed aicx-panel flex items-center gap-3 px-4 py-2 rounded-full shadow-2xl bg-zinc-900 text-white text-xs',
+          style: { zIndex: 61, top: '12px', left: '50%', transform: 'translateX(-50%)', maxWidth: 'calc(100vw - 24px)' }
+        });
+        bar.append(el('span', { class: 'truncate' }, purpose ? `要素を選択: ${purpose}` : '対象の要素をクリックしてください'));
+        const cancelBtn = el('button', { class: 'shrink-0 px-2 py-1 rounded-full bg-zinc-700 text-white aicx-tap', type: 'button' }, 'キャンセル (Esc)');
+        bar.append(cancelBtn);
+        this.root.append(box, bar);
+
+        // Elements belonging to the overlay retarget to the shadow host, which
+        // is how we tell "the user is pointing at our own UI" apart from a real
+        // page element.
+        const pageTarget = (e) => {
+          const t = e.target;
+          if (!t || t === this.hostEl || t.nodeType !== 1) return null;
+          if (this.hostEl && this.hostEl.contains(t)) return null;
+          if (t === document.documentElement || t === document.body) return null;
+          return t;
+        };
+        let current = null;
+        const onMove = (e) => {
+          const t = pageTarget(e);
+          if (!t) { box.style.display = 'none'; current = null; return; }
+          current = t;
+          const r = t.getBoundingClientRect();
+          Object.assign(box.style, {
+            display: 'block',
+            left: r.left + 'px', top: r.top + 'px',
+            width: r.width + 'px', height: r.height + 'px'
+          });
+        };
+        const finish = (elm) => {
+          if (settled) return;
+          settled = true;
+          document.removeEventListener('mousemove', onMove, true);
+          document.removeEventListener('pointerdown', onDown, true);
+          document.removeEventListener('keydown', onKey, true);
+          window.removeEventListener('scroll', onScroll, true);
+          // NOT the click swallower: the click generated by the pointerdown we
+          // just consumed has not been dispatched yet, and tearing the listener
+          // down here would let it through — the page would follow the link the
+          // user only meant to point at. It removes itself once that trailing
+          // click is eaten; the timer covers paths where no click follows
+          // (Escape, the cancel button).
+          setTimeout(() => document.removeEventListener('click', swallow, true), 1000);
+          box.remove(); bar.remove();
+          if (chatPanel) chatPanel.style.display = prevChat;
+          if (fab) fab.style.display = prevFab;
+          resolve(elm || null);
+        };
+        const onDown = (e) => {
+          if (e.target === this.hostEl || (this.hostEl && this.hostEl.contains(e.target))) return; // let the cancel button work
+          e.preventDefault(); e.stopPropagation();
+          finish(pageTarget(e) || current);
+        };
+        // The click that follows our swallowed pointerdown must die too, or the
+        // page still navigates after the picker has closed.
+        const swallow = (e) => {
+          if (e.target === this.hostEl || (this.hostEl && this.hostEl.contains(e.target))) return;
+          e.preventDefault(); e.stopPropagation();
+          // Once picking is over this is that trailing click — stop here so a
+          // later, genuine click still works.
+          if (settled) document.removeEventListener('click', swallow, true);
+        };
+        const onKey = (e) => {
+          if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); finish(null); }
+        };
+        const onScroll = () => { if (current) { const r = current.getBoundingClientRect(); Object.assign(box.style, { left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px' }); } };
+        cancelBtn.addEventListener('click', (e) => { e.stopPropagation(); finish(null); });
+        document.addEventListener('mousemove', onMove, true);
+        document.addEventListener('pointerdown', onDown, true);
+        document.addEventListener('click', swallow, true);
+        document.addEventListener('keydown', onKey, true);
+        window.addEventListener('scroll', onScroll, true);
       });
     },
 
@@ -2195,6 +2346,7 @@ textarea { resize: none; }
 2. セレクタや DOM 構造を推測しない。必ずツールで実際のページを確認する。
    - まず get_page_info でページ概要・読み込み済みリソース・推奨 @match を取得する。
    - 対象要素は query_selector で存在と構造を確かめる。広い範囲の構造を見たいときだけ get_page_html を使う。
+   - 「このボタン」「価格の部分」のように対象が言葉では特定しづらいときは pick_element でユーザーに直接クリックしてもらう。推測でセレクタを書くより確実。
    - ページ側のスクリプトやスタイルの実装を知りたいときは fetch_resource で取得する。
    - 挙動や値を確認したいときは run_snippet を使う（実行前にユーザーの承認が必要）。
 3. 既存スクリプトの修正依頼なら、まず request_existing_userscript で現行コードを受け取る。
@@ -2308,6 +2460,17 @@ textarea { resize: none; }
           }
         },
         {
+          name: 'pick_element',
+          description: 'ユーザーにページ上の要素を直接クリックで指定してもらう。「〇〇のボタン」「価格の部分」のように対象が言葉では特定しづらいときに使うと、推測でセレクタを書くより確実。選択された要素のセレクタ・属性・祖先・outerHTML が返る。同種の要素をまとめて扱うための generalized_selector も返るので、1 件だけか全件かを取り違えないこと。複数の要素が必要なときは繰り返し呼ぶ。',
+          parameters: {
+            type: 'OBJECT',
+            properties: {
+              purpose: S('何を選んでほしいかの短い指示。ユーザーの画面上部に表示される (例: 「価格が表示されている要素」)。')
+            },
+            required: ['purpose']
+          }
+        },
+        {
           name: 'ask_user_choice',
           description: '実現方法が複数考えられるときや、実装に必要な情報が足りないときに、ユーザーに選択肢を提示して選んでもらう。推測で進めずにこのツールで確認すること。長い質問文をチャットに書いて待つ代わりに使う。ユーザーはキャンセルすることもできる。',
           parameters: {
@@ -2376,6 +2539,7 @@ textarea { resize: none; }
           case 'get_page_html':               return this.toolPageHtml(args);
           case 'fetch_resource':              return await this.toolFetchResource(args);
           case 'run_snippet':                 return await this.toolRunSnippet(args, ctx);
+          case 'pick_element':                return await this.toolPickElement(args);
           case 'ask_user_choice':             return await this.toolAskUserChoice(args);
           case 'request_existing_userscript': return await this.toolRequestExisting(args);
           case 'output_userscript':           return this.toolOutputUserscript(args);
@@ -2396,6 +2560,7 @@ textarea { resize: none; }
         case 'get_page_html':               return a.selector ? `HTML を取得: ${a.selector}` : 'ページ HTML を取得';
         case 'fetch_resource':              return `リソースを取得: ${a.url || ''}`;
         case 'run_snippet':                 return `ページで検証: ${a.purpose || ''}`;
+        case 'pick_element':                return `要素の選択を依頼: ${a.purpose || ''}`;
         case 'ask_user_choice':             return `質問: ${a.question || ''}`;
         case 'request_existing_userscript': return '既存 UserScript の入力を要求';
         case 'output_userscript':           return 'UserScript を出力';
@@ -2778,6 +2943,163 @@ textarea { resize: none; }
         try { o[k] = this._safeSandbox(v[k], depth + 1, seen); } catch { o[k] = '[unreadable]'; }
       }
       return o;
+    },
+
+    // ---------------------------------------------------------------------
+    // Tool: pick_element
+    // ---------------------------------------------------------------------
+    // Class names and ids emitted by build tools (`css-1x2y3z`, `sc-AbCdEf`,
+    // `jsx-1234567`, Tailwind JIT hashes, React's `:r7:`) change on the next
+    // deploy, so a selector built from them breaks silently. Anything matching
+    // these is skipped in favour of a structural path.
+    UNSTABLE_TOKEN_RE: /^(?:css-[a-z0-9]{4,}|sc-[A-Za-z0-9]{5,}|jsx-\d{3,}|emotion-\d+|svelte-[a-z0-9]{5,}|ng-tns-[a-z0-9-]+|_[A-Za-z0-9_-]{6,}|[a-f0-9]{8,}|[A-Za-z]+_[A-Za-z0-9]{5,}__[A-Za-z0-9]{5,})$/,
+    STABLE_ATTRS: ['data-testid', 'data-test-id', 'data-test', 'data-qa', 'data-cy', 'data-id', 'data-name', 'name', 'itemprop', 'aria-label', 'role'],
+
+    _isStableToken(t) {
+      if (!t) return false;
+      if (t.length > 40) return false;
+      if (/^\d/.test(t)) return false;           // CSS ident can't start with a digit
+      if (/\d{4,}/.test(t)) return false;        // counters / hashes
+      return !this.UNSTABLE_TOKEN_RE.test(t);
+    },
+    _classTokens(node) {
+      const raw = (typeof node.className === 'string' ? node.className : (node.getAttribute && node.getAttribute('class')) || '');
+      return raw.trim().split(/\s+/).filter((c) => c && this._isStableToken(c));
+    },
+    _cssEscape(s) {
+      if (window.CSS && CSS.escape) return CSS.escape(s);
+      return String(s).replace(/([^\w-])/g, '\\$1');
+    },
+    _matches(sel) {
+      try { return document.querySelectorAll(sel).length; } catch { return -1; }
+    },
+    // One selector step for a node, preferring stable hooks over position.
+    _stepFor(node, { withNth = true } = {}) {
+      const tag = node.tagName.toLowerCase();
+      if (node.id && this._isStableToken(node.id)) {
+        const sel = `#${this._cssEscape(node.id)}`;
+        if (this._matches(sel) === 1) return { sel, unique: true };
+      }
+      for (const attr of this.STABLE_ATTRS) {
+        const v = node.getAttribute && node.getAttribute(attr);
+        if (v && v.length <= 60) {
+          const sel = `${tag}[${attr}="${CSS && CSS.escape ? v.replace(/"/g, '\\"') : v}"]`;
+          if (this._matches(sel) >= 1) return { sel, unique: this._matches(sel) === 1 };
+        }
+      }
+      const classes = this._classTokens(node);
+      if (classes.length) {
+        const sel = tag + classes.slice(0, 3).map((c) => '.' + this._cssEscape(c)).join('');
+        return { sel, unique: this._matches(sel) === 1 };
+      }
+      if (!withNth) return { sel: tag, unique: false };
+      const parent = node.parentElement;
+      if (parent) {
+        const sibs = [...parent.children].filter((c) => c.tagName === node.tagName);
+        if (sibs.length > 1) return { sel: `${tag}:nth-of-type(${sibs.indexOf(node) + 1})`, unique: false };
+      }
+      return { sel: tag, unique: false };
+    },
+    // "Every element like this one" — tag + stable classes only, no ids, no
+    // attributes, no positional steps. Those are exactly the parts that pin a
+    // selector to ONE instance (`data-id="2"`, `:nth-of-type(2)`), which is the
+    // opposite of what is wanted here: picking one price almost always means
+    // the script should act on every price.
+    //
+    // The chain is then trimmed to its shortest suffix that still matches the
+    // same set. Relaxing a descendant chain can only widen the match, so an
+    // unchanged count means the dropped ancestors were carrying no information
+    // — and the shorter form survives DOM restructuring better.
+    _generalizedSelector(node) {
+      const steps = [];
+      let cur = node;
+      for (let d = 0; cur && cur.nodeType === 1 && cur !== document.body && d < 8; d++, cur = cur.parentElement) {
+        const cls = this._classTokens(cur).slice(0, 3).map((c) => '.' + this._cssEscape(c)).join('');
+        steps.unshift(cur.tagName.toLowerCase() + cls);
+      }
+      if (!steps.length) return null;
+      let sel = steps.join(' ');
+      const n = this._matches(sel);
+      if (n < 1) return null;
+      for (let i = 1; i < steps.length; i++) {
+        const cand = steps.slice(i).join(' ');
+        if (this._matches(cand) === n) sel = cand; else break;
+      }
+      return { sel, n };
+    },
+
+    // Walks up from the element adding steps until the selector resolves to
+    // exactly one node, and pairs it with the generalized form above.
+    buildSelectors(node) {
+      const parts = [];
+      let cur = node;
+      let unique = null;
+      for (let depth = 0; cur && cur.nodeType === 1 && depth < 8; depth++) {
+        const step = this._stepFor(cur);
+        parts.unshift(step.sel);
+        const candidate = parts.join(' > ');
+        if (this._matches(candidate) === 1) { unique = candidate; break; }
+        if (step.unique && depth === 0) { unique = step.sel; break; }
+        if (cur === document.body) break;
+        cur = cur.parentElement;
+      }
+      const selector = unique || parts.join(' > ');
+      const out = { selector, match_count: this._matches(selector) };
+      const gen = this._generalizedSelector(node);
+      // Only worth reporting when it actually generalizes to siblings.
+      if (gen && gen.n > 1 && gen.sel !== selector) {
+        out.generalized_selector = gen.sel;
+        out.generalized_match_count = gen.n;
+      }
+      return out;
+    },
+
+    async toolPickElement(args) {
+      const purpose = args && args.purpose ? String(args.purpose) : '';
+      const node = await UI.pickElement({ purpose });
+      if (!node) {
+        return {
+          picked: false,
+          cancelled: true,
+          message: 'ユーザーは要素の選択をキャンセルしました。query_selector で候補を探すか、ask_user_choice で確認してください。'
+        };
+      }
+      const sels = this.buildSelectors(node);
+      const attrs = {};
+      for (const a of Array.from(node.attributes || [])) {
+        if (a.name === 'style' || a.value.length > 200) continue;
+        attrs[a.name] = a.value;
+      }
+      const ancestors = [];
+      let p = node.parentElement;
+      for (let i = 0; p && i < 5 && p !== document.documentElement; i++, p = p.parentElement) {
+        const cls = this._classTokens(p).slice(0, 3).map((c) => '.' + c).join('');
+        ancestors.push(p.tagName.toLowerCase() + (p.id ? '#' + p.id : '') + cls);
+      }
+      let rect = null;
+      try { const r = node.getBoundingClientRect(); rect = { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) }; } catch {}
+      const clone = this._cloneForHtml(node);
+      let html = clone.outerHTML || '';
+      if (html.length > 4000) html = html.slice(0, 4000) + '\n<!-- …truncated… -->';
+      const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+      return {
+        picked: true,
+        selector: sels.selector,
+        match_count: sels.match_count,
+        generalized_selector: sels.generalized_selector,
+        generalized_match_count: sels.generalized_match_count,
+        note: sels.generalized_selector
+          ? '同種の要素すべてを対象にしたい場合は generalized_selector を使ってください。1 つだけなら selector を使います。'
+          : undefined,
+        tag: node.tagName.toLowerCase(),
+        id: node.id || '',
+        classes: (typeof node.className === 'string' ? node.className : '').trim(),
+        attributes: attrs,
+        ancestors,
+        rect,
+        text: text.length > 300 ? text.slice(0, 300) + '…' : text,
+        outer_html: html
+      };
     },
 
     // ---------------------------------------------------------------------
@@ -3179,7 +3501,9 @@ textarea { resize: none; }
         const isErr = !!r.error;
         let label;
         if (isErr) label = `${fr.name}: ${r.error}`;
-        else if (fr.name === 'ask_user_choice') {
+        else if (fr.name === 'pick_element') {
+          label = r.picked ? `選択された要素: ${r.selector}` : '要素の選択: (キャンセル)';
+        } else if (fr.name === 'ask_user_choice') {
           label = r.answered
             ? `回答: ${r.selected.map((s) => `${s.index}. ${s.label}${s.free_text ? ` (${s.free_text})` : ''}`).join(' / ')}`
             : '回答: (キャンセル)';
@@ -3217,6 +3541,7 @@ textarea { resize: none; }
     _subs: new Set(),
     has(convId) { return !!convId && this._map.has(convId); },
     count() { return this._map.size; },
+    keys() { return [...this._map.keys()]; },
     add(convId, entry) { this._map.set(convId, entry); this._notify(); },
     // Entry-checked so a finished run can't delete the registration of a
     // newer run started for the same conversation.
@@ -4129,6 +4454,27 @@ textarea { resize: none; }
       return b;
     },
 
+    // Runs the retention sweep at most once per page load. Deleting history is
+    // not something to do silently, so a non-zero result is surfaced as a
+    // toast; persistence is fire-and-forget because send()'s own save follows
+    // moments later anyway.
+    _sweepHistoryOnce() {
+      if (this._sweptThisSession) return;
+      this._sweptThisSession = true;
+      try {
+        const keep = new Set();
+        if (this.conv) keep.add(this.conv.id);
+        for (const id of Runs.keys()) keep.add(id);
+        const removed = Store.sweepOldConversations(keep);
+        if (removed > 0) {
+          Store.saveDomains().catch(() => {});
+          UI.toast(`${Store.retentionDays()} 日以上前の会話 ${removed} 件を削除しました`, 'info');
+        }
+      } catch (e) {
+        console.warn('[aicx] history sweep failed:', e);
+      }
+    },
+
     async send() {
       // One generation per conversation. Another conversation may generate
       // concurrently — each run owns its own AbortController and conv object.
@@ -4139,6 +4485,12 @@ textarea { resize: none; }
       // ask "what about this?" just by highlighting a passage.
       if (!text && atts.length === 0 && !Selection.get()) return;
       if (!Store.settings.apiKey) { UI.toast('API キーを設定してください', 'error'); SettingsPanel.open(); return; }
+
+      // Sweep expired history once per page session, on the first send. Doing
+      // it here rather than at startup means pages the user never chats on pay
+      // nothing, and it runs before the new conversation is created so a fresh
+      // chat is never a sweep candidate.
+      ChatPanel._sweepHistoryOnce();
 
       // Lazily create the conversation on first send, snapshotting the page
       // URL/title at creation time so the chat header keeps showing the
@@ -4705,7 +5057,7 @@ textarea { resize: none; }
       clear(body);
       switch (this.activeTab) {
         case 'general':
-          body.append(this.sectionAPI(), this.sectionTheme(), this.sectionAbout());
+          body.append(this.sectionAPI(), this.sectionTheme(), this.sectionHistory(), this.sectionAbout());
           break;
         case 'prompts':
           body.append(this.sectionGlobalPrompt(), this.sectionUserscriptPrompt(), this.sectionPageExtract(), this.sectionGlobalTemplates());
@@ -5134,6 +5486,59 @@ textarea { resize: none; }
         }
       };
       rerender();
+      box.append(row);
+      return box;
+    },
+
+    sectionHistory() {
+      const box = el('section', { class: 'space-y-2' });
+      box.append(Form.sectionTitle('会話履歴の保持期間'));
+      box.append(el('p', { class: 'text-xs text-zinc-500' }, 'チャットの初回送信時に、最終更新がこの日数より古い会話を自動削除して、Tampermonkey のストレージを節約します。UserScript 作成モードの会話はページの HTML やスクリプト本文を含むため特に容量を使います。'));
+
+      const wrap = el('div');
+      const daysInput = Form.input(Store.retentionDays(), (v) => {
+        const n = parseInt(v, 10);
+        Store.settings.historyRetentionDays = Number.isFinite(n) && n >= 0 ? n : DEFAULT_SETTINGS.historyRetentionDays;
+        Store.saveSettings();
+        paintNote();
+      }, { type: 'number', min: '0', step: '1', inputmode: 'numeric' });
+      wrap.append(daysInput);
+      const note = el('p', { class: 'text-[11px] text-zinc-500 mt-1' });
+      const paintNote = () => {
+        const d = Store.retentionDays();
+        note.textContent = d > 0
+          ? `${d} 日以上更新されていない会話を削除します。削除が発生したときは通知します。0 を指定すると自動削除しません (既定 ${DEFAULT_SETTINGS.historyRetentionDays} 日)。`
+          : `自動削除は無効です。会話は手動で削除するまで残ります (既定 ${DEFAULT_SETTINGS.historyRetentionDays} 日)。`;
+      };
+      paintNote();
+      wrap.append(note);
+      box.append(wrap);
+
+      // Storage footprint, so the retention number is an informed choice
+      // rather than a guess.
+      const stat = el('p', { class: 'text-[11px] text-zinc-500' });
+      const paintStat = () => {
+        let convs = 0;
+        for (const d of Object.values(Store.domains)) convs += (d.conversations || []).length;
+        let kb = '?';
+        try { kb = (new Blob([JSON.stringify(Store.domains)]).size / 1024).toFixed(0); } catch {}
+        stat.textContent = `現在: ${Object.keys(Store.domains).length} ドメイン / ${convs} 会話 / 約 ${kb} KB`;
+      };
+      paintStat();
+      box.append(stat);
+
+      const row = el('div', { class: 'flex flex-wrap gap-2' });
+      row.append(Form.btn('今すぐ古い会話を削除', async () => {
+        const d = Store.retentionDays();
+        if (!(d > 0)) { UI.toast('保持期間が無効 (0) のため削除しません', 'error'); return; }
+        const keep = new Set(Runs.keys());
+        if (ChatPanel.conv) keep.add(ChatPanel.conv.id);
+        if (!await UI.confirm(`${d} 日以上更新されていない会話を削除します。続行しますか?`)) return;
+        const removed = Store.sweepOldConversations(keep);
+        await Store.saveDomains();
+        paintStat();
+        UI.toast(removed ? `${removed} 件削除しました` : '削除対象はありませんでした', removed ? 'success' : 'info');
+      }, 'bg-zinc-200 dark:bg-zinc-700 text-zinc-800 dark:text-zinc-100'));
       box.append(row);
       return box;
     },
