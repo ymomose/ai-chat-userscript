@@ -2,7 +2,7 @@
 // @name         AI Chat Overlay
 // @name:ja      AI チャット オーバーレイ
 // @namespace    https://github.com/ym/userscripts/ai-chat
-// @version      2.0.1
+// @version      2.0.2
 // @description  Floating AI chat (Gemini / Claude) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode with secret-Gist publishing. Optimized for iOS Safari.
 // @description:ja Webページの内容を文脈として Gemini / Claude と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。作ったスクリプトはシークレット Gist に公開して URL からインストール・自動更新できる。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
 // @author       ym
@@ -489,24 +489,18 @@
   const _gmXhr = (typeof GM_xmlhttpRequest !== 'undefined') ? GM_xmlhttpRequest
     : (typeof GM !== 'undefined' && GM && typeof GM.xmlHttpRequest === 'function') ? GM.xmlHttpRequest.bind(GM)
     : null;
-  // Rejections that never got an HTTP response (connection dropped, request
-  // timed out) carry `network: true`, so callers can tell them apart from an
-  // API error and retry. Safari's userscript managers report such failures
-  // through onerror with a synthetic status (e.g. "408 Load failed").
-  function gmRequest({ method = 'GET', url, headers, body, signal, timeout }) {
+  function gmRequest({ method = 'GET', url, headers, body, signal }) {
     return new Promise((resolve, reject) => {
       if (!_gmXhr) { reject(new Error('GM_xmlhttpRequest is unavailable')); return; }
       if (signal && signal.aborted) {
         reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }));
         return;
       }
-      const netErr = (msg, r) => Object.assign(new Error(msg), { network: true, status: (r && r.status) || 0 });
       const handle = _gmXhr({
         method, url, headers, data: body, responseType: 'text',
-        timeout: timeout || undefined,
         onload: (r) => resolve({ status: r.status, statusText: r.statusText, responseText: r.responseText }),
-        onerror: (r) => reject(netErr(`Network error${r && r.status ? ' ' + r.status : ''}${r && r.statusText ? ' ' + r.statusText : ''}`, r)),
-        ontimeout: () => reject(netErr('Request timed out')),
+        onerror: (r) => reject(new Error(`Network error${r && r.status ? ' ' + r.status : ''}${r && r.statusText ? ' ' + r.statusText : ''}`)),
+        ontimeout: () => reject(new Error('Request timed out')),
         onabort: () => reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }))
       });
       if (signal) {
@@ -1679,25 +1673,7 @@
     { id: 'claude-fable-5-2', display: 'Claude Fable 5.2' }
   ];
 
-  // Safari (iOS / iPadOS / macOS) userscript managers run GM_xmlhttpRequest
-  // inside the browser extension, which cannot hold a never-ending SSE
-  // response: on iOS Tampermonkey the stream is cut with "408 Load failed",
-  // and requests in flight at that moment fail with it too. Agents sessions
-  // there are driven by polling instead (AgentsMode.transport).
-  const IS_SAFARI_ENGINE = (() => {
-    try {
-      const ua = navigator.userAgent || '';
-      const ios = /iP(hone|ad|od)/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-      const safari = /Safari\//.test(ua) && !/(Chrome|Chromium|CriOS|FxiOS|EdgiOS|Edg|OPR)\//.test(ua);
-      return ios || safari;
-    } catch { return false; }
-  })();
-
   const AgentsAPI = {
-    // Per-request ceiling, so a request the extension silently stalls on
-    // fails (and is retried) instead of hanging the turn.
-    TIMEOUT_MS: 45000,
-
     available() { return !!_gmXhr; },
 
     headers(extra) {
@@ -1705,70 +1681,48 @@
         'content-type': 'application/json',
         'x-api-key': Store.settings.anthropicApiKey || '',
         'anthropic-version': CLAUDE_API_VERSION,
-        'anthropic-beta': AGENTS_BETA
+        'anthropic-beta': AGENTS_BETA,
+        // Some userscript managers (Tampermonkey on iOS Safari) send the
+        // page's Origin with GM_xmlhttpRequest; the API treats any request
+        // carrying an Origin as a browser call and answers 401 unless this
+        // opt-in is present.
+        'anthropic-dangerous-direct-browser-access': 'true'
       }, extra || {});
     },
 
-    // Worth retrying: no response at all (dropped connection, timeout — on
-    // iOS also when the app is backgrounded or the screen locks), or a
-    // timeout / rate-limit / server-side status.
-    isTransient(e) {
-      if (!e || e.name === 'AbortError') return false;
-      return !!e.network || e.status === 408 || e.status === 429 || e.status === 529 || e.status >= 500;
-    },
-
-    // `retries`: extra attempts on a transient failure. Reads retry by
-    // default. Writes only where the caller says repeating is harmless; for
-    // those, `dupeOk` treats a 400/409 on a retry as "the first attempt went
-    // through" (e.g. a tool result already recorded).
-    async request(method, path, body, { signal, retries = method === 'GET' ? 4 : 0, dupeOk = false } = {}) {
+    async request(method, path, body, { signal, retries = method === 'GET' ? 2 : 0 } = {}) {
       if (!this.available()) throw new Error('この環境では GM_xmlhttpRequest が使えないため、Agents API を利用できません。');
       if (!Store.settings.anthropicApiKey) throw new Error('Claude API キーが未設定です。設定 → 一般 で登録してください。');
       for (let attempt = 0; ; attempt++) {
-        let err = null;
-        try {
-          const r = await gmRequest({
-            method, url: CLAUDE_API_BASE + path, headers: this.headers(),
-            body: body === undefined ? undefined : JSON.stringify(body), signal, timeout: this.TIMEOUT_MS
-          });
-          if (r.status >= 200 && r.status < 300) {
-            try { return r.responseText ? JSON.parse(r.responseText) : null; } catch { return null; }
-          }
-          if (dupeOk && attempt > 0 && (r.status === 400 || r.status === 409)) return null;
-          err = Claude.httpError(r.status, r.responseText || r.statusText);
-          err.message = err.message.replace(/^Claude request failed/, 'Agents API エラー');
-        } catch (e) {
-          if (e && e.name === 'AbortError') throw e;
-          err = e;
+        const r = await gmRequest({
+          method, url: CLAUDE_API_BASE + path, headers: this.headers(),
+          body: body === undefined ? undefined : JSON.stringify(body), signal
+        });
+        if (r.status >= 200 && r.status < 300) {
+          try { return r.responseText ? JSON.parse(r.responseText) : null; } catch { return null; }
         }
-        if (this.isTransient(err) && attempt < retries) {
-          await new Promise((res) => setTimeout(res, Math.min(8000, 1000 * 2 ** attempt) + Math.random() * 300));
+        const err = Claude.httpError(r.status, r.responseText || r.statusText);
+        err.message = err.message.replace(/^Claude request failed/, 'Agents API エラー');
+        // Only idempotent reads are retried; resending a user.message twice
+        // would queue it twice.
+        if ((r.status === 429 || err.retryable) && attempt < retries) {
+          await new Promise((res) => setTimeout(res, 1000 * (attempt + 1)));
           continue;
-        }
-        if (err && err.network) {
-          err.message = `Agents API との通信に失敗しました (${err.message})。iOS ではアプリの切り替えや画面ロックで通信が中断されることがあります。エージェントの作業はサーバー側で続いているので、もう一度送信すると続きから再開します。`;
         }
         throw err;
       }
     },
 
-    // Creating again after a lost response only leaves an unused (free)
-    // environment / agent / session behind, so these retry too.
-    createEnvironment(body) { return this.request('POST', '/environments', body, { retries: 2 }); },
-    createAgent(body) { return this.request('POST', '/agents', body, { retries: 2 }); },
+    createEnvironment(body) { return this.request('POST', '/environments', body); },
+    createAgent(body) { return this.request('POST', '/agents', body); },
     // `version` omitted: the update applies unconditionally (this app is the
-    // only writer of its agent), so repeating it is harmless.
-    updateAgent(id, body) { return this.request('POST', `/agents/${encodeURIComponent(id)}`, body, { retries: 3 }); },
-    createSession(body) { return this.request('POST', '/sessions', body, { retries: 2 }); },
+    // only writer of its agent).
+    updateAgent(id, body) { return this.request('POST', `/agents/${encodeURIComponent(id)}`, body); },
+    createSession(body) { return this.request('POST', '/sessions', body); },
     getSession(id) { return this.request('GET', `/sessions/${encodeURIComponent(id)}`); },
-    updateSession(id, body) { return this.request('POST', `/sessions/${encodeURIComponent(id)}`, body, { retries: 3 }); },
-    deleteSession(id) { return this.request('DELETE', `/sessions/${encodeURIComponent(id)}`, undefined, { retries: 2 }); },
-    // Plain send: no retry (a user.message sent twice is queued twice — see
-    // AgentsMode.run for how that one is retried).
+    updateSession(id, body) { return this.request('POST', `/sessions/${encodeURIComponent(id)}`, body); },
+    deleteSession(id) { return this.request('DELETE', `/sessions/${encodeURIComponent(id)}`); },
     sendEvents(id, events, opts) { return this.request('POST', `/sessions/${encodeURIComponent(id)}/events`, { events }, opts); },
-    // Tool results, confirmations and interrupts resolve something specific,
-    // so a repeat is either a no-op or rejected as already resolved.
-    sendSettle(id, events) { return this.sendEvents(id, events, { retries: 5, dupeOk: true }); },
 
     // Persisted events at or after `since` (an event `processed_at`), oldest
     // first. `since` is inclusive because timestamps are compared at a
@@ -5215,7 +5169,7 @@ textarea { resize: none; }
             if (e.status === 404) return;
             // A running session can't be deleted yet: stop it, let it settle.
             if (i === 0 && (e.status === 400 || e.status === 409)) {
-              await AgentsAPI.sendSettle(sid, [{ type: 'user.interrupt' }]).catch(() => {});
+              await AgentsAPI.sendEvents(sid, [{ type: 'user.interrupt' }]).catch(() => {});
               await sleep(2500);
               continue;
             }
@@ -5291,18 +5245,10 @@ textarea { resize: none; }
     // never deliver anything); 'stream' and 'poll' use one method only. The
     // stream has no replay, so every (re)connect is followed by a history
     // fetch from the cursor — duplicates are dropped by the consumer.
-    // Effective receive method. 'auto' means polling on Safari engines,
-    // whose userscript managers cannot keep an SSE response open (see
-    // IS_SAFARI_ENGINE); an explicit choice is honoured as is.
-    transport() {
-      const t = Store.settings.agentsTransport || 'auto';
-      return t === 'auto' && IS_SAFARI_ENGINE ? 'poll' : t;
-    },
-
     _startFeed(sid, state, q) {
       const ctl = { stopped: false, ac: new AbortController(), lastData: Date.now() };
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-      const transport = this.transport();
+      const transport = Store.settings.agentsTransport || 'auto';
       const pollOnce = async () => {
         const evs = await AgentsAPI.listEvents(sid, state.cursor, ctl.ac.signal);
         for (const ev of evs) q.push(ev);
@@ -5453,7 +5399,7 @@ textarea { resize: none; }
 
       const sendResult = async (toolUseId, response, isError) => {
         answered.add(toolUseId);
-        await AgentsAPI.sendSettle(sid, [{
+        await AgentsAPI.sendEvents(sid, [{
           type: 'user.custom_tool_result',
           custom_tool_use_id: toolUseId,
           content: [{ type: 'text', text: JSON.stringify(response) }],
@@ -5540,7 +5486,7 @@ textarea { resize: none; }
                 });
                 allow = !!verdict.ok;
               }
-              await AgentsAPI.sendSettle(sid, [allow
+              await AgentsAPI.sendEvents(sid, [allow
                 ? { type: 'user.tool_confirmation', tool_use_id: ev.id, result: 'allow' }
                 : { type: 'user.tool_confirmation', tool_use_id: ev.id, result: 'deny', deny_message: replay ? 'ページの再読み込みなどで確認できませんでした。' : 'ユーザーが実行を拒否しました。' }]);
             }
@@ -5627,39 +5573,15 @@ textarea { resize: none; }
       let interruptAt = 0;
       const onAbort = () => {
         interruptAt = Date.now();
-        AgentsAPI.sendSettle(sid, [{ type: 'user.interrupt' }]).catch(() => {});
+        AgentsAPI.sendEvents(sid, [{ type: 'user.interrupt' }]).catch(() => {});
       };
       aborter.signal.addEventListener('abort', onAbort, { once: true });
 
-      // Sending the user message is the one write that must not simply be
-      // repeated: after a lost response the message may or may not have been
-      // recorded. So on a transient failure, look for it in the session
-      // history first and resend only if it is not there.
-      const msgText = this.composeMessage({ text, selection, snapText, attachments });
-      const sendUserMessage = async () => {
-        const events = [{ type: 'user.message', content: [{ type: 'text', text: msgText }] }];
-        let lastErr = null;
-        for (let attempt = 0; attempt < 4; attempt++) {
-          if (attempt) {
-            await new Promise((r) => setTimeout(r, 1500 * attempt));
-            const history = await AgentsAPI.listEvents(sid, null).catch(() => null);
-            if (!history) continue;
-            const mine = history.find((x) => x.type === 'user.message' && !seen.has(x.id)
-              && (x.content || []).some((b) => b && b.type === 'text' && b.text === msgText));
-            if (mine) return { data: [mine] };
-          }
-          try {
-            return await AgentsAPI.sendEvents(sid, events);
-          } catch (e) {
-            if (!AgentsAPI.isTransient(e)) throw e;
-            lastErr = e;
-          }
-        }
-        throw lastErr;
-      };
-
       try {
-        const sent = await sendUserMessage();
+        const sent = await AgentsAPI.sendEvents(sid, [{
+          type: 'user.message',
+          content: [{ type: 'text', text: this.composeMessage({ text, selection, snapText, attachments }) }]
+        }]);
         const ourId = sent && sent.data && sent.data[0] && sent.data[0].id;
         let ourProcessed = !ourId;
 
@@ -8045,7 +7967,7 @@ textarea { resize: none; }
       const transWrap = el('div');
       transWrap.append(Form.label('イベントの受信方法'));
       transWrap.append(Form.select([
-        { value: 'auto', label: IS_SAFARI_ENGINE ? '自動 (この環境では定期取得)' : '自動 (ストリーミング + 途切れたら定期取得)' },
+        { value: 'auto', label: '自動 (ストリーミング + 途切れたら定期取得)' },
         { value: 'stream', label: 'ストリーミングのみ' },
         { value: 'poll', label: '定期取得のみ (iOS などでストリーミングが届かない場合)' }
       ], s.agentsTransport || 'auto', (v) => { s.agentsTransport = v; Store.saveSettings(); }));
