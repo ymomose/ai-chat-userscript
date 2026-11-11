@@ -2,7 +2,7 @@
 // @name         AI Chat Overlay
 // @name:ja      AI チャット オーバーレイ
 // @namespace    https://github.com/ym/userscripts/ai-chat
-// @version      2.0.2
+// @version      2.1.0
 // @description  Floating AI chat (Gemini / Claude) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode with secret-Gist publishing. Optimized for iOS Safari.
 // @description:ja Webページの内容を文脈として Gemini / Claude と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。作ったスクリプトはシークレット Gist に公開して URL からインストール・自動更新できる。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
 // @author       ym
@@ -227,6 +227,17 @@
       return v ? String(v) : null;
     } catch { return null; }
   };
+  // Orders dotted version strings numerically ("2.10.0" > "2.9.1"); a
+  // missing version sorts before every real one. Returns -1, 0 or 1.
+  const compareVersions = (a, b) => {
+    const pa = String(a || '0').split('.').map((n) => parseInt(n, 10) || 0);
+    const pb = String(b || '0').split('.').map((n) => parseInt(n, 10) || 0);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+      const d = (pa[i] || 0) - (pb[i] || 0);
+      if (d) return d < 0 ? -1 : 1;
+    }
+    return 0;
+  };
   const el = (tag, props = {}, children = []) => {
     const n = document.createElement(tag);
     for (const [k, v] of Object.entries(props)) {
@@ -341,8 +352,11 @@
     agentsJpyPerUsd: 150,
     // 'auto' (SSE with a polling watchdog), 'stream' or 'poll'.
     agentsTransport: 'auto',
-    // Created on first use and reused. Bound to the API key's workspace, so a
-    // key from another workspace answers 404 and they are created afresh.
+    // Picked in Settings, or resolved on first use: one this app already
+    // created in the workspace is reused (so devices share them), otherwise
+    // a new one is created. Bound to the API key's workspace, so a key from
+    // another workspace answers 404 and they are resolved afresh. Empty
+    // agentsAgentHash means "check the agent against this script next time".
     agentsAgentId: '',
     agentsAgentVersion: 0,
     agentsAgentHash: '',
@@ -1664,6 +1678,9 @@
   // a 405), so a page-origin fetch can never reach them: every request goes
   // through GM_xmlhttpRequest, and without it the mode is unavailable.
   const AGENTS_BETA = 'managed-agents-2026-04-01';
+  // `metadata.app` of every agent, environment and session this script
+  // creates, so the ones it made on other devices can be found and reused.
+  const AGENTS_APP = 'ai-chat-overlay';
   // Models offered for Agents sessions (all supported by Managed Agents).
   // Claude models the user added in Settings are listed too.
   const AGENTS_MODELS = [
@@ -1714,15 +1731,38 @@
     },
 
     createEnvironment(body) { return this.request('POST', '/environments', body); },
+    listEnvironments(signal) { return this.listAll('/environments', signal); },
     createAgent(body) { return this.request('POST', '/agents', body); },
-    // `version` omitted: the update applies unconditionally (this app is the
-    // only writer of its agent).
+    getAgent(id) { return this.request('GET', `/agents/${encodeURIComponent(id)}`); },
+    listAgents(signal) { return this.listAll('/agents', signal); },
+    // `version` omitted: the update applies unconditionally. Devices sharing
+    // the agent decide beforehand whether they may write it (see
+    // AgentsMode.ensureAgent), so last-write-wins is acceptable here.
     updateAgent(id, body) { return this.request('POST', `/agents/${encodeURIComponent(id)}`, body); },
     createSession(body) { return this.request('POST', '/sessions', body); },
     getSession(id) { return this.request('GET', `/sessions/${encodeURIComponent(id)}`); },
     updateSession(id, body) { return this.request('POST', `/sessions/${encodeURIComponent(id)}`, body); },
     deleteSession(id) { return this.request('DELETE', `/sessions/${encodeURIComponent(id)}`); },
     sendEvents(id, events, opts) { return this.request('POST', `/sessions/${encodeURIComponent(id)}/events`, { events }, opts); },
+
+    // Every item of a list endpoint. Most endpoints page with `page` /
+    // `next_page`, but environments are documented with `after_id` /
+    // `has_more`, so both cursors are followed. Capped so an unusually large
+    // workspace can't keep the caller waiting indefinitely.
+    async listAll(path, signal, maxPages = 20) {
+      const out = [];
+      let cursor = '';
+      for (let i = 0; i < maxPages; i++) {
+        const url = cursor ? `${path}${path.includes('?') ? '&' : '?'}${cursor}` : path;
+        const data = await this.request('GET', url, undefined, { signal });
+        const items = (data && data.data) || [];
+        out.push(...items);
+        if (data && data.next_page) cursor = `page=${encodeURIComponent(data.next_page)}`;
+        else if (data && data.has_more && items.length) cursor = `after_id=${encodeURIComponent(data.last_id || items[items.length - 1].id)}`;
+        else break;
+      }
+      return out;
+    },
 
     // Persisted events at or after `since` (an event `processed_at`), oldest
     // first. `since` is inclusive because timestamps are compared at a
@@ -5070,49 +5110,142 @@ textarea { resize: none; }
       ];
     },
 
-    // The agent is created once and updated in place (a new version) when
-    // its prompt or tools change; sessions override model and effort.
-    async ensureAgent() {
-      const s = Store.settings;
-      const body = {
-        name: this.AGENT_NAME,
-        description: 'ユーザーのページを調べながら Tampermonkey 向け UserScript を作り、サンドボックスで検証する (AI Chat Overlay)',
-        model: { id: DEFAULT_SETTINGS.agentsModel, effort: DEFAULT_SETTINGS.agentsEffort },
-        system: this.systemPrompt(),
-        tools: this.tools(),
-        metadata: { app: 'ai-chat-overlay' }
-      };
-      const hash = GistPublish.hash(JSON.stringify([body.name, body.system, body.tools]));
-      if (s.agentsAgentId && s.agentsAgentHash === hash) return { id: s.agentsAgentId, version: s.agentsAgentVersion };
-      let agent = null;
-      if (s.agentsAgentId) {
-        try {
-          agent = await AgentsAPI.updateAgent(s.agentsAgentId, body);
-        } catch (e) {
-          // Gone (another workspace's key, or archived): start over below.
-          if (e.status !== 404 && e.status !== 409) throw e;
-        }
-      }
-      if (!agent) agent = await AgentsAPI.createAgent(body);
-      Object.assign(s, { agentsAgentId: agent.id, agentsAgentVersion: agent.version, agentsAgentHash: hash });
-      await Store.saveSettings();
-      return { id: agent.id, version: agent.version };
+    // An error meaning the agent / environment / session an id points at no
+    // longer accepts work: deleted, archived, or owned by another
+    // workspace's key.
+    isGone(e) {
+      return !!e && (e.status === 404 || e.status === 409
+        || (e.status === 400 && /(environment|agent|session)[^.]*(not found|archived|does not exist)/i.test(e.message || '')));
     },
 
+    // `metadata.kind` of the agents this mode runs on. Agents created before
+    // the key existed carry no kind and count as this one.
+    AGENT_KIND: 'userscript',
+    isOwnAgent(a) {
+      return !!(a && !a.archived_at && a.metadata && a.metadata.app === AGENTS_APP
+        && (a.metadata.kind || this.AGENT_KIND) === this.AGENT_KIND);
+    },
+    isUsableEnvironment(env) {
+      return !!(env && !env.archived_at && (!env.config || !env.config.type || env.config.type === 'cloud'));
+    },
+
+    // The agent definition this copy of the script wants, and its hash. The
+    // hash covers what decides behaviour (name, prompt, tools) and is also
+    // stored in the agent's metadata, so every device sharing the agent can
+    // tell whether it already matches without comparing whole prompts.
+    agentSpec() {
+      const system = this.systemPrompt();
+      const tools = this.tools();
+      const hash = GistPublish.hash(JSON.stringify([this.AGENT_NAME, system, tools]));
+      return {
+        hash,
+        body: {
+          name: this.AGENT_NAME,
+          description: 'ユーザーのページを調べながら Tampermonkey 向け UserScript を作り、サンドボックスで検証する (AI Chat Overlay)',
+          model: { id: DEFAULT_SETTINGS.agentsModel, effort: DEFAULT_SETTINGS.agentsEffort },
+          system,
+          tools,
+          metadata: { app: AGENTS_APP, kind: this.AGENT_KIND, config_hash: hash, script_version: scriptVersion() || '0' }
+        }
+      };
+    },
+
+    // Resolves the agent new sessions run on: the one picked in Settings,
+    // else one this app already created in the workspace (another device, a
+    // reinstall), else a new one. Sessions override model and effort.
+    //
+    // The agent is shared by every device on the same workspace, and each may
+    // run a different version of this script (or its own custom prompt). The
+    // agent is therefore only rewritten by a copy at least as new as the one
+    // that last wrote it; an older copy leaves it alone and passes its own
+    // prompt and tools as session overrides, so it neither rolls the shared
+    // agent back nor runs with tools it does not implement.
+    async ensureAgent() {
+      const s = Store.settings;
+      const { body, hash } = this.agentSpec();
+      if (s.agentsAgentId && s.agentsAgentHash === hash) return { id: s.agentsAgentId, version: s.agentsAgentVersion };
+
+      let overrides = null;
+      const adopt = async (id) => {
+        let cur;
+        try {
+          cur = await AgentsAPI.getAgent(id);
+        } catch (e) {
+          if (this.isGone(e)) return null;
+          throw e;
+        }
+        if (!cur || cur.archived_at) return null;
+        const meta = cur.metadata || {};
+        if (meta.config_hash === hash) return cur;
+        if (compareVersions(meta.script_version, scriptVersion()) > 0) {
+          overrides = { system: body.system, tools: body.tools };
+          return cur;
+        }
+        try {
+          // An update that changes nothing returns the current version.
+          return await AgentsAPI.updateAgent(cur.id, body);
+        } catch (e) {
+          if (this.isGone(e)) return null;
+          throw e;
+        }
+      };
+
+      let agent = s.agentsAgentId ? await adopt(s.agentsAgentId) : null;
+      if (!agent) {
+        const found = await this.findAgent().catch((e) => {
+          console.warn('[aicx] could not list agents:', e);
+          return null;
+        });
+        if (found && found.id !== s.agentsAgentId) agent = await adopt(found.id);
+      }
+      if (!agent) {
+        overrides = null;
+        agent = await AgentsAPI.createAgent(body);
+      }
+      // With overrides the agent does not match this copy, so the next
+      // session checks it again (a newer device may have moved it on).
+      Object.assign(s, { agentsAgentId: agent.id, agentsAgentVersion: agent.version, agentsAgentHash: overrides ? '' : hash });
+      await Store.saveSettings();
+      return { id: agent.id, version: agent.version, overrides };
+    },
+
+    // The agent this app created most recently in the workspace, if any.
+    async findAgent() {
+      const list = await AgentsAPI.listAgents();
+      return list.filter((a) => this.isOwnAgent(a))
+        .sort((a, b) => this.tsOf(b.updated_at || b.created_at) - this.tsOf(a.updated_at || a.created_at))[0] || null;
+    },
+
+    // The environment picked in Settings, else one this app already created
+    // in the workspace, else a new one.
     async ensureEnvironment() {
       const s = Store.settings;
       if (s.agentsEnvironmentId) return s.agentsEnvironmentId;
-      // Unrestricted networking: the agent has to load whatever site the user
-      // is writing a script for, and that is not known in advance.
-      const env = await AgentsAPI.createEnvironment({
-        name: `ai-chat-overlay-${Date.now().toString(36)}`,
-        description: 'AI Chat Overlay: UserScript の動作確認用サンドボックス',
-        config: { type: 'cloud', networking: { type: 'unrestricted' } },
-        metadata: { app: 'ai-chat-overlay' }
+      const found = await this.findEnvironment().catch((e) => {
+        console.warn('[aicx] could not list environments:', e);
+        return null;
       });
+      const env = found || await this.createEnvironment();
       s.agentsEnvironmentId = env.id;
       await Store.saveSettings();
       return env.id;
+    },
+
+    async findEnvironment() {
+      const list = await AgentsAPI.listEnvironments();
+      return list.filter((env) => this.isUsableEnvironment(env) && env.metadata && env.metadata.app === AGENTS_APP)
+        .sort((a, b) => this.tsOf(b.created_at) - this.tsOf(a.created_at))[0] || null;
+    },
+
+    createEnvironment() {
+      // Unrestricted networking: the agent has to load whatever site the user
+      // is writing a script for, and that is not known in advance.
+      return AgentsAPI.createEnvironment({
+        name: `ai-chat-overlay-${Date.now().toString(36)}`,
+        description: 'AI Chat Overlay: UserScript の動作確認用サンドボックス',
+        config: { type: 'cloud', networking: { type: 'unrestricted' } },
+        metadata: { app: AGENTS_APP }
+      });
     },
 
     async createSession(conv) {
@@ -5120,26 +5253,24 @@ textarea { resize: none; }
         const agent = await this.ensureAgent();
         const envId = await this.ensureEnvironment();
         return AgentsAPI.createSession({
-          agent: {
+          agent: Object.assign({
             type: 'agent_with_overrides', id: agent.id, version: agent.version,
             model: { id: this.modelOf(conv), effort: this.effortOf(conv) }
-          },
+          }, agent.overrides || {}),
           environment_id: envId,
           // The API rejects control / format characters (newlines included)
           // in titles, and conv.title is the first line(s) the user typed.
           title: (conv.title || '').replace(/[\p{Cc}\p{Cf}]+/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 200) || 'UserScript',
           budget: { type: 'limit', max_list_cost: { amount: String(conv.agent.budgetCents), currency: 'USD' } },
-          metadata: { app: 'ai-chat-overlay', conversation: conv.id }
+          metadata: { app: AGENTS_APP, conversation: conv.id }
         });
       };
       try {
         return await create();
       } catch (e) {
-        // A stored agent / environment id that no longer resolves (deleted,
-        // archived, or from another workspace's key): recreate both once.
-        const stale = e.status === 404 || e.status === 409
-          || (e.status === 400 && /(environment|agent)[^.]*(not found|archived|does not exist)/i.test(e.message || ''));
-        if (!stale) throw e;
+        // A stored agent / environment id that no longer resolves: drop both
+        // and resolve them again once (reusing or creating as needed).
+        if (!this.isGone(e)) throw e;
         Object.assign(Store.settings, { agentsAgentId: '', agentsAgentHash: '', agentsEnvironmentId: '' });
         await Store.saveSettings();
         return create();
@@ -7973,23 +8104,135 @@ textarea { resize: none; }
       ], s.agentsTransport || 'auto', (v) => { s.agentsTransport = v; Store.saveSettings(); }));
       box.append(transWrap);
 
-      const ids = el('div', { class: 'text-[11px] text-zinc-500 space-y-0.5 break-all' });
-      const paintIds = () => {
-        clear(ids);
-        ids.append(el('div', {}, `エージェント: ${s.agentsAgentId ? `${s.agentsAgentId} (v${s.agentsAgentVersion})` : '(未作成 — 最初の実行時に作成)'}`));
-        ids.append(el('div', {}, `環境: ${s.agentsEnvironmentId || '(未作成 — 最初の実行時に作成)'}`));
-      };
-      paintIds();
-      box.append(ids);
-      box.append(el('div', { class: 'flex flex-wrap gap-2' }, [
-        Form.btn('エージェントと環境を作り直す', async () => {
-          if (!await UI.confirm('次の実行時に、エージェントと環境を新しく作成します (既存のものは Claude Console に残ります)。続行しますか?')) return;
-          Object.assign(s, { agentsAgentId: '', agentsAgentVersion: 0, agentsAgentHash: '', agentsEnvironmentId: '' });
-          await Store.saveSettings();
-          paintIds();
-        }, 'bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200')
-      ]));
+      box.append(this.agentsResources());
       return box;
+    },
+
+    // Picks the agent and environment UserScript sessions run on. Both live
+    // in the API key's workspace, so every device using a key of the same
+    // workspace can share them. The lists are fetched when this section is
+    // shown (or on demand), never at script load.
+    agentsResources() {
+      const s = Store.settings;
+      const AUTO = '';
+      const NEW = '__new__';
+      const wrap = el('div', { class: 'space-y-3' });
+      let agents = null;
+      let envs = null;
+      let busy = false;
+      let note = '';
+
+      const tail = (id) => (id ? `…${String(id).slice(-6)}` : '');
+      const day = (iso) => { const t = AgentsMode.tsOf(iso); return t ? fmtDate(t) : ''; };
+      const agentLabel = (a) => [
+        a.name || '(名前なし)',
+        `v${a.version}`,
+        a.metadata && a.metadata.script_version && a.metadata.script_version !== '0' ? `スクリプト ${a.metadata.script_version}` : '',
+        day(a.updated_at || a.created_at) ? `${day(a.updated_at || a.created_at)} 更新` : '',
+        tail(a.id)
+      ].filter(Boolean).join(' · ');
+      const envLabel = (env) => [
+        env.name || '(名前なし)',
+        env.metadata && env.metadata.app === AGENTS_APP ? '' : 'このアプリ以外で作成',
+        day(env.created_at) ? `${day(env.created_at)} 作成` : '',
+        tail(env.id)
+      ].filter(Boolean).join(' · ');
+
+      const load = async () => {
+        if (!s.anthropicApiKey) { note = '「一般」タブで Claude API キーを登録すると、一覧を読み込めます。'; paint(); return; }
+        busy = true; note = ''; paint();
+        try {
+          const [a, e] = await Promise.all([AgentsAPI.listAgents(), AgentsAPI.listEnvironments()]);
+          const recent = (x, y) => AgentsMode.tsOf(y.updated_at || y.created_at) - AgentsMode.tsOf(x.updated_at || x.created_at);
+          agents = a.filter((x) => AgentsMode.isOwnAgent(x)).sort(recent);
+          // Environments are never modified by this app, so one made
+          // elsewhere is safe to pick; this app's own are listed first.
+          envs = e.filter((x) => AgentsMode.isUsableEnvironment(x)).sort((x, y) => {
+            const ox = x.metadata && x.metadata.app === AGENTS_APP ? 0 : 1;
+            const oy = y.metadata && y.metadata.app === AGENTS_APP ? 0 : 1;
+            return ox - oy || recent(x, y);
+          });
+        } catch (err) {
+          note = `一覧を読み込めませんでした: ${err.message || err}`;
+        }
+        busy = false;
+        paint();
+      };
+
+      const run = async (fn) => {
+        busy = true; paint();
+        try { await fn(); } catch (err) { UI.toast(err.message || String(err), 'error'); }
+        busy = false;
+        await Store.saveSettings();
+        paint();
+      };
+
+      const onAgent = (v) => run(async () => {
+        if (v === NEW) {
+          const { body, hash } = AgentsMode.agentSpec();
+          const a = await AgentsAPI.createAgent(body);
+          Object.assign(s, { agentsAgentId: a.id, agentsAgentVersion: a.version, agentsAgentHash: hash });
+          if (agents) agents.unshift(a);
+          UI.toast('エージェントを作成しました', 'success');
+        } else if (v === AUTO) {
+          Object.assign(s, { agentsAgentId: '', agentsAgentVersion: 0, agentsAgentHash: '' });
+        } else {
+          const a = (agents || []).find((x) => x.id === v);
+          // The hash is cleared so the next session checks the agent against
+          // this copy of the script (and updates or overrides as needed).
+          Object.assign(s, { agentsAgentId: v, agentsAgentVersion: a ? a.version : 0, agentsAgentHash: '' });
+        }
+      });
+
+      const onEnv = (v) => run(async () => {
+        if (v === NEW) {
+          const env = await AgentsMode.createEnvironment();
+          s.agentsEnvironmentId = env.id;
+          if (envs) envs.unshift(env);
+          UI.toast('環境を作成しました', 'success');
+        } else {
+          s.agentsEnvironmentId = v;
+        }
+      });
+
+      const picker = (title, items, current, label, onChange, autoLabel) => {
+        const row = el('div');
+        row.append(Form.label(title));
+        const opts = [{ value: AUTO, label: autoLabel }];
+        const list = items || [];
+        // The stored id stays selectable before the list is loaded, and when
+        // the list no longer has it (it will be replaced on next use).
+        if (current && !list.some((x) => x.id === current)) opts.push({ value: current, label: `使用中 ${tail(current)}${items ? ' (一覧にありません)' : ''}` });
+        for (const x of list) opts.push({ value: x.id, label: label(x) });
+        opts.push({ value: NEW, label: '+ 新しく作成する' });
+        const sel = Form.select(opts, current || AUTO, onChange);
+        sel.disabled = busy;
+        row.append(sel);
+        return row;
+      };
+
+      const paint = () => {
+        clear(wrap);
+        wrap.append(picker('エージェント', agents, s.agentsAgentId, agentLabel, onAgent,
+          '自動 (このアプリで作成済みのものを使い、なければ作成)'));
+        wrap.append(picker('環境 (サンドボックス)', envs, s.agentsEnvironmentId, envLabel, onEnv,
+          '自動 (このアプリで作成済みのものを使い、なければ作成)'));
+        wrap.append(el('p', { class: 'text-[11px] text-zinc-500' },
+          '同じワークスペースの API キーを使う他のデバイスと、同じエージェント・環境を共有できます。エージェントの設定は、そのエージェントを最後に更新したものより新しいバージョンのスクリプトからだけ更新されます。古いバージョンのスクリプトは、エージェントを書き換えずに自分の設定でセッションを実行します。'));
+        const ids = el('div', { class: 'text-[11px] text-zinc-500 space-y-0.5 break-all' });
+        ids.append(el('div', {}, `使用中のエージェント: ${s.agentsAgentId ? `${s.agentsAgentId} (v${s.agentsAgentVersion})` : '(未決定 — 次の実行時に決定)'}`));
+        ids.append(el('div', {}, `使用中の環境: ${s.agentsEnvironmentId || '(未決定 — 次の実行時に決定)'}`));
+        wrap.append(ids);
+        if (note) wrap.append(el('p', { class: 'text-[11px] text-red-600 dark:text-red-400' }, note));
+        const btn = Form.btn(busy ? '読み込み中…' : (agents ? '一覧を再読み込み' : '一覧を読み込む'), () => { if (!busy) load(); },
+          'bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200');
+        btn.disabled = busy;
+        wrap.append(el('div', { class: 'flex flex-wrap gap-2' }, [btn]));
+      };
+
+      paint();
+      if (s.anthropicApiKey) load();
+      return wrap;
     },
 
     sectionGitHub() {
