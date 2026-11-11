@@ -2,9 +2,9 @@
 // @name         AI Chat Overlay
 // @name:ja      AI チャット オーバーレイ
 // @namespace    https://github.com/ym/userscripts/ai-chat
-// @version      1.3.0
-// @description  Floating AI chat (Gemini) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode. Optimized for iOS Safari.
-// @description:ja Webページの内容を文脈として Gemini と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
+// @version      1.4.0
+// @description  Floating AI chat (Gemini / Claude) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode. Optimized for iOS Safari.
+// @description:ja Webページの内容を文脈として Gemini / Claude と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
 // @author       ym
 // @match        *://*/*
 // @run-at       document-idle
@@ -21,6 +21,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM.xmlHttpRequest
 // @connect      generativelanguage.googleapis.com
+// @connect      api.anthropic.com
 // @connect      www.googleapis.com
 // @connect      oauth2.googleapis.com
 // @connect      cdn.jsdelivr.net
@@ -231,12 +232,20 @@
   // 3. Storage + data model
   // =========================================================================
   const DEFAULT_SETTINGS = {
-    apiKey: '',
+    apiKey: '', // Gemini API key
+    // Anthropic (Claude) API key. Which key a request uses is decided by the
+    // active model's id — see Providers.of().
+    anthropicApiKey: '',
     model: 'gemini-2.5-flash',
     // Models the user has explicitly added in Settings. The chat-side picker
-    // shows only these; the full Gemini catalog is fetched only to populate
-    // the "add model" dropdown in Settings. Shape: [{ id, display }].
+    // shows only these; each provider's full catalog is fetched only to
+    // populate the "add model" dropdown in Settings. Shape: [{ id, display }],
+    // plus capability hints for Claude models (see Claude.modelInfo).
     addedModels: [],
+    // Claude `output_config.effort`. Empty means "send nothing" so the
+    // model's own default applies; a level the active model lacks is clamped
+    // to the nearest one it has (Claude.resolveEffort).
+    claudeEffort: '',
     globalSystemPrompt: 'You are a helpful AI assistant. The user is viewing a webpage; use its content as context. Respond in the same language as the user.',
     // System prompt for the UserScript authoring mode (chats started from the
     // FAB menu's "新規 UserScript" entry). Empty means "use the built-in
@@ -442,7 +451,10 @@
   // from `onprogress`. That path is best-effort: some environments buffer
   // more aggressively, which can coalesce chunks but still produces valid
   // (just chunkier) output.
-  function gmStream({ method = 'GET', url, headers, body, signal }) {
+  //
+  // `makeError(status, responseText)` builds the error for a non-2xx reply so
+  // each provider can word it (and flag it retryable) its own way.
+  function gmStream({ method = 'GET', url, headers, body, signal, makeError }) {
     return {
       [Symbol.asyncIterator]() {
         const queue = [];
@@ -543,7 +555,10 @@
             },
             onload: (r) => {
               if (r && (r.status < 200 || r.status >= 300)) {
-                finish(new Error(`Gemini request failed: ${r.status} ${(r && r.responseText) || (r && r.statusText) || ''}`));
+                const detail = (r && r.responseText) || (r && r.statusText) || '';
+                finish(typeof makeError === 'function'
+                  ? makeError(r.status, detail)
+                  : new Error(`Gemini request failed: ${r.status} ${detail}`));
                 return;
               }
               if (!usingReadableStream) {
@@ -704,6 +719,10 @@
             if (fc.id) call.id = fc.id;
             const part = { functionCall: call };
             if (fc.thoughtSignature) part.thoughtSignature = fc.thoughtSignature;
+            // A call Claude made (the user switched models mid-conversation)
+            // has no signature at all. Gemini documents this sentinel for
+            // replaying function calls that another model produced.
+            else if (m.claudeBlocks) part.thoughtSignature = 'skip_thought_signature_validator';
             parts.push(part);
           }
         }
@@ -863,6 +882,708 @@
         }
       }
     }
+  };
+
+  // =========================================================================
+  // 4b. Claude (Anthropic Messages API) client
+  // =========================================================================
+  // Talks to the Messages API over raw HTTP instead of @anthropic-ai/sdk:
+  // the userscript ships as one self-contained file with no bundler, and it
+  // needs the same fetch → GM_xmlhttpRequest fallback as the Gemini client to
+  // get past strict page CSPs, which the SDK's transport cannot provide.
+  //
+  // STORAGE. An assistant turn produced by Claude keeps the response's raw
+  // content blocks in `claudeBlocks` and replays them verbatim. Thinking
+  // blocks (with their signatures), server-tool blocks and citations only
+  // stay valid when echoed back unchanged, so rebuilding the turn from the
+  // displayed `content` string would silently lose them. `content` and
+  // `functionCalls` are still filled in for the UI and for the Gemini path,
+  // which is what makes switching models mid-conversation work.
+  //
+  // PRESERVED THINKING. Current models bind each thinking block to the exact
+  // conversation prefix (system prompt, tool list, earlier messages) it was
+  // produced under, and new accounts get a 400 when a replayed block's prefix
+  // changed. This app legitimately changes the prefix between turns — the
+  // web-search toggles add and remove tools, the system prompt carries
+  // today's date, and the user can switch models — so requests opt into
+  // `drop_block`: invalidated blocks are dropped and the turn proceeds.
+  const CLAUDE_API_BASE = 'https://api.anthropic.com/v1';
+  const CLAUDE_API_VERSION = '2026-10-21';
+  const CLAUDE_BETA_THINKING_BINDING = 'thinking-binding-controls-2026-08-01';
+  // Streaming lifts the HTTP-timeout concern, so give the model room; a
+  // model with a smaller output cap (from the Models API) lowers this.
+  const CLAUDE_DEFAULT_MAX_TOKENS = 64000;
+  const CLAUDE_EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
+  // `pause_turn` resumptions allowed within one request before giving up.
+  const CLAUDE_MAX_CONTINUATIONS = 5;
+  const CLAUDE_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+
+  const Claude = {
+    headers(apiKey, extra) {
+      return Object.assign({
+        'content-type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': CLAUDE_API_VERSION,
+        // The API only answers cross-origin browser requests (our fetch path
+        // runs from the page's origin) when this opt-in header is present.
+        'anthropic-dangerous-direct-browser-access': 'true'
+      }, extra || {});
+    },
+
+    // Compact badge for a Claude model id: "claude-opus-5-5" → "O5.5",
+    // "claude-sonnet-4-5-20250929" → "S4.5", "claude-3-5-haiku-20241022" →
+    // "H3.5". The first letter is the family, the digits the version.
+    abbreviate(id) {
+      if (!id) return '—';
+      const s = String(id).replace(/^claude-/i, '').replace(/-\d{8}$/, '');
+      const fam = (s.match(/(opus|sonnet|haiku|fable|mythos)/i) || [])[1];
+      const ver = (s.match(/\d+/g) || []).slice(0, 2).join('.');
+      const out = (fam ? fam[0].toUpperCase() : 'C') + ver;
+      return out || s.slice(0, 6).toUpperCase();
+    },
+
+    // Builds the Error for a non-2xx reply. Overload and server-side faults
+    // are transient, so they are flagged for the caller's retry loop.
+    httpError(status, text) {
+      let detail = text || '';
+      try {
+        const j = JSON.parse(text);
+        if (j && j.error) detail = `${j.error.type || ''}: ${j.error.message || ''}`;
+      } catch { /* not JSON — keep the raw text */ }
+      let hint = '';
+      if (status === 401) hint = '（API キーが正しいか確認してください）';
+      else if (status === 429) hint = '（レート制限に達しました。しばらく待ってから再送してください）';
+      const err = new Error(`Claude request failed: ${status} ${detail}${hint}`.trim());
+      err.status = status;
+      if (status === 529 || status >= 500) err.retryable = true;
+      return err;
+    },
+
+    async _getJson(url, apiKey) {
+      const headers = this.headers(apiKey);
+      let res = null;
+      try {
+        res = await fetch(url, { headers });
+      } catch (e) {
+        if (e && e.name === 'AbortError') throw e;
+        console.warn('[aicx] fetch to Claude API blocked, falling back to GM_xmlhttpRequest:', e);
+      }
+      let status, text;
+      if (res) {
+        status = res.status;
+        text = await res.text();
+      } else {
+        const r = await gmRequest({ method: 'GET', url, headers });
+        status = r.status;
+        text = r.responseText || r.statusText || '';
+      }
+      if (status < 200 || status >= 300) throw this.httpError(status, text);
+      try { return JSON.parse(text); } catch { throw new Error('Claude: invalid JSON response'); }
+    },
+
+    async listModels(apiKey) {
+      if (!apiKey) throw new Error('API key is required.');
+      const out = [];
+      let after = '';
+      // The endpoint is paginated; a handful of pages is far more than the
+      // catalog has ever needed, and the bound keeps a bad cursor from looping.
+      for (let page = 0; page < 10; page++) {
+        const url = `${CLAUDE_API_BASE}/models?limit=1000${after ? `&after_id=${encodeURIComponent(after)}` : ''}`;
+        const data = await this._getJson(url, apiKey);
+        for (const m of (data && data.data) || []) if (m && m.id) out.push(this.modelInfo(m));
+        if (!data || !data.has_more || !data.last_id) break;
+        after = data.last_id;
+      }
+      return out;
+    },
+
+    // Reduce a Models API entry to what we persist in addedModels. The
+    // capability tree is optional in the response, so absent fields are left
+    // undefined and profile() falls back to id-based heuristics.
+    modelInfo(m) {
+      const sup = (node) => !!(node && node.supported);
+      const info = {
+        id: m.id,
+        display: m.display_name || m.id,
+        maxTokens: m.max_tokens || undefined
+      };
+      const caps = m.capabilities;
+      if (caps && typeof caps === 'object') {
+        if (caps.thinking) info.adaptive = sup(caps.thinking.types && caps.thinking.types.adaptive);
+        if (caps.effort) info.effortLevels = sup(caps.effort) ? CLAUDE_EFFORT_LEVELS.filter((l) => sup(caps.effort[l])) : [];
+      }
+      return info;
+    },
+
+    // Request-shaping facts about a model: capability hints saved when it was
+    // added, else conservative guesses from its id. Models from 4.5 back use
+    // `budget_tokens` thinking (we leave thinking off there) and mostly lack
+    // `effort`; everything newer takes adaptive thinking.
+    profile(modelId) {
+      const id = String(modelId || '');
+      const saved = (Store.settings.addedModels || []).find((x) => x && x.id === id) || {};
+      const legacy = /^claude-(3|2|instant)/.test(id)
+        || /^claude-(opus|sonnet|haiku)-4-5(?:-|$)/.test(id)
+        || /^claude-opus-4-1(?:-|$)/.test(id)
+        || /^claude-(opus|sonnet)-4-\d{8}$/.test(id);
+      let effortLevels;
+      if (/^claude-opus-4-5(?:-|$)/.test(id)) effortLevels = ['low', 'medium', 'high'];
+      else if (legacy) effortLevels = [];
+      else if (/-4-6(?:-|$)/.test(id)) effortLevels = ['low', 'medium', 'high', 'max'];
+      else effortLevels = CLAUDE_EFFORT_LEVELS.slice();
+      return {
+        adaptive: typeof saved.adaptive === 'boolean' ? saved.adaptive : !legacy,
+        effortLevels: Array.isArray(saved.effortLevels) ? saved.effortLevels : effortLevels,
+        maxTokens: Math.min(CLAUDE_DEFAULT_MAX_TOKENS, saved.maxTokens || CLAUDE_DEFAULT_MAX_TOKENS),
+        // The `_20260209` web tools (dynamic filtering) exist only on these
+        // families; older models get the basic tool versions.
+        dynamicWebTools: /^claude-(fable|mythos)-/.test(id)
+          || /^claude-opus-(4-[6-9]|[5-9])/.test(id)
+          || /^claude-sonnet-(4-[6-9]|[5-9])/.test(id)
+      };
+    },
+
+    // The requested effort if the model has it; otherwise the closest level
+    // below it, or failing that the lowest level the model offers.
+    resolveEffort(level, levels) {
+      if (!level || !Array.isArray(levels) || !levels.length) return null;
+      if (levels.includes(level)) return level;
+      const want = CLAUDE_EFFORT_LEVELS.indexOf(level);
+      const below = levels.filter((l) => CLAUDE_EFFORT_LEVELS.indexOf(l) <= want);
+      if (below.length) return below.reduce((a, b) => (CLAUDE_EFFORT_LEVELS.indexOf(a) > CLAUDE_EFFORT_LEVELS.indexOf(b) ? a : b));
+      return levels[0];
+    },
+
+    // Gemini functionDeclarations (UPPERCASE OpenAPI types) → Claude tool
+    // definitions (JSON Schema). `eager_input_streaming` streams large tool
+    // inputs — output_userscript's `code` is a whole script — as they are
+    // written instead of after a long silent buffer; the price is that the
+    // server no longer validates them, so streamGenerate does it.
+    convertTools(decls) {
+      const conv = (s) => {
+        if (!s || typeof s !== 'object') return s;
+        const o = {};
+        for (const [k, v] of Object.entries(s)) {
+          if (k === 'type') o.type = String(v).toLowerCase();
+          else if (k === 'properties') o.properties = Object.fromEntries(Object.entries(v || {}).map(([pk, pv]) => [pk, conv(pv)]));
+          else if (k === 'items') o.items = conv(v);
+          else o[k] = v;
+        }
+        return o;
+      };
+      return (decls || []).map((d) => ({
+        name: d.name,
+        description: d.description || '',
+        input_schema: d.parameters ? conv(d.parameters) : { type: 'object', properties: {} },
+        eager_input_streaming: true
+      }));
+    },
+
+    // Minimal JSON Schema check for a parsed tool input: required keys and
+    // primitive types, recursing into objects and arrays. Integers also accept
+    // numeric strings, since every tool coerces them with parseInt anyway.
+    validateInput(schema, value, path = 'input') {
+      if (!schema || typeof schema !== 'object') return null;
+      const isObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+      switch (schema.type) {
+        case 'object': {
+          if (!isObj(value)) return `${path} はオブジェクトである必要があります`;
+          for (const k of schema.required || []) {
+            if (value[k] === undefined || value[k] === null) return `必須パラメータ ${path}.${k} がありません`;
+          }
+          for (const [k, sub] of Object.entries(schema.properties || {})) {
+            if (value[k] === undefined || value[k] === null) continue;
+            const e = this.validateInput(sub, value[k], `${path}.${k}`);
+            if (e) return e;
+          }
+          return null;
+        }
+        case 'array': {
+          if (!Array.isArray(value)) return `${path} は配列である必要があります`;
+          for (let i = 0; i < value.length; i++) {
+            const e = this.validateInput(schema.items, value[i], `${path}[${i}]`);
+            if (e) return e;
+          }
+          return null;
+        }
+        case 'string':
+          return typeof value === 'string' ? null : `${path} は文字列である必要があります`;
+        case 'boolean':
+          return typeof value === 'boolean' ? null : `${path} は真偽値である必要があります`;
+        case 'integer':
+        case 'number': {
+          const ok = (typeof value === 'number' && Number.isFinite(value))
+            || (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value)));
+          return ok ? null : `${path} は数値である必要があります`;
+        }
+        default:
+          return null;
+      }
+    },
+
+    // Tool ids must match ^[a-zA-Z0-9_-]+$. Gemini-made ids are mapped the
+    // same way on the call and on its response so the pair still matches.
+    toolId(id) {
+      return String(id).replace(/[^a-zA-Z0-9_-]/g, '_') || 'toolu_unknown';
+    },
+
+    toolResultText(response) {
+      try { return JSON.stringify(response == null ? {} : response); } catch { return String(response); }
+    },
+
+    _base64ToText(b64) {
+      try {
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return new TextDecoder().decode(bytes);
+      } catch { return null; }
+    },
+
+    // One chat attachment → one content block. Claude reads images, PDFs and
+    // plain text; anything else (audio, video, office files) is replaced by
+    // a note so the model knows a file was there instead of the request
+    // failing outright.
+    attachmentBlock(a) {
+      const match = /^data:([^;,]*)(?:;[^,]*)?;base64,(.*)$/.exec(a.dataUrl || '');
+      if (!match) return null;
+      let mime = (match[1] || a.mimeType || '').toLowerCase();
+      if (mime === 'image/jpg') mime = 'image/jpeg';
+      const data = match[2];
+      const name = a.name || 'file';
+      if (CLAUDE_IMAGE_TYPES.includes(mime)) {
+        return { type: 'image', source: { type: 'base64', media_type: mime, data } };
+      }
+      if (mime === 'application/pdf') {
+        return { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data }, title: name };
+      }
+      const looksText = /^text\//.test(mime)
+        || /(json|javascript|ecmascript|xml|csv|markdown|yaml|x-sh)/.test(mime)
+        || /\.(txt|md|markdown|csv|tsv|json|js|mjs|ts|css|html?|xml|ya?ml|log|ini|toml)$/i.test(name);
+      if (looksText) {
+        const text = this._base64ToText(data);
+        if (text && text.trim()) {
+          return { type: 'document', source: { type: 'text', media_type: 'text/plain', data: text }, title: name };
+        }
+      }
+      return { type: 'text', text: `[添付ファイル「${name}」(${mime || '不明な形式'}) は Claude が読み取れない形式のため送信していません]` };
+    },
+
+    // A stored turn ready to echo back. Server-tool calls whose tool is not
+    // declared on this request (the user switched web search off) are
+    // removed together with their results, and so are the citations that may
+    // point into them; nothing else is touched.
+    replayBlocks(blocks, serverToolNames) {
+      const removed = new Set();
+      for (const b of blocks) {
+        if (b && b.type === 'server_tool_use' && !serverToolNames.has(b.name)) removed.add(b.id);
+      }
+      const out = [];
+      for (const b of blocks) {
+        if (!b || !b.type) continue;
+        if (b.type === 'server_tool_use' && removed.has(b.id)) continue;
+        if (b.type !== 'tool_result' && b.tool_use_id && removed.has(b.tool_use_id)) continue;
+        if (b.type === 'text') {
+          if (!b.text) continue;
+          const t = { type: 'text', text: b.text };
+          if (!removed.size && Array.isArray(b.citations) && b.citations.length) t.citations = b.citations;
+          out.push(t);
+          continue;
+        }
+        out.push(b);
+      }
+      return out;
+    },
+
+    // Flatten our message history into Messages API `messages`. Consecutive
+    // same-role turns are merged (synthetic context pairs, skipped error
+    // turns and tool rounds can leave two in a row), and repair() then
+    // enforces the structural rules the API checks.
+    buildMessages(messages, opts = {}) {
+      const serverToolNames = opts.serverToolNames || new Set();
+      const out = [];
+      // tool_use ids of the latest assistant turn, for pairing tool results
+      // whose call carried no id (Gemini often omits one).
+      let lastCallIds = [];
+      const push = (role, content) => {
+        if (!content.length) return;
+        const prev = out[out.length - 1];
+        if (prev && prev.role === role) prev.content = prev.content.concat(content);
+        else out.push({ role, content });
+      };
+      for (const m of messages) {
+        if (!m || m.role === 'system') continue;
+        if (m.functionResponses && m.functionResponses.length) {
+          push('user', m.functionResponses.map((fr, i) => {
+            const block = {
+              type: 'tool_result',
+              tool_use_id: fr.id ? this.toolId(fr.id) : (lastCallIds[i] || `toolu_missing_${i}`),
+              content: this.toolResultText(fr.response)
+            };
+            if (fr.response && fr.response.error) block.is_error = true;
+            return block;
+          }));
+          continue;
+        }
+        if (m.role === 'assistant') {
+          // A failed or declined turn is not something the model said; the
+          // partial output of a refusal in particular must not be replayed.
+          if (m._error || m._refused) continue;
+          let content;
+          // An empty array is meaningful: a turn stopped before any text
+          // streamed, which must not fall back to the "(停止しました)" label.
+          if (Array.isArray(m.claudeBlocks)) {
+            content = this.replayBlocks(m.claudeBlocks, serverToolNames);
+          } else {
+            content = [];
+            if (m.content && m.content.trim()) content.push({ type: 'text', text: m.content });
+            (m.functionCalls || []).forEach((fc, i) => {
+              if (!fc || !fc.name) return;
+              content.push({
+                type: 'tool_use',
+                id: fc.id ? this.toolId(fc.id) : this.toolId(`toolu_${m.id || 'x'}_${i}`),
+                name: fc.name,
+                input: (fc.args && typeof fc.args === 'object' && !Array.isArray(fc.args)) ? fc.args : {}
+              });
+            });
+          }
+          lastCallIds = content.filter((b) => b.type === 'tool_use').map((b) => b.id);
+          push('assistant', content);
+          continue;
+        }
+        const content = [];
+        for (const a of m.attachments || []) {
+          const b = this.attachmentBlock(a);
+          if (b) content.push(b);
+        }
+        if (m.content && m.content.trim()) content.push({ type: 'text', text: m.content });
+        push('user', content);
+      }
+      return this.repair(out);
+    },
+
+    // Enforce what the API validates so an odd history (a reload in the
+    // middle of a tool round, a skipped turn) degrades instead of failing:
+    //   - the first message is a user turn and so is the last (assistant
+    //     prefill is rejected on current models);
+    //   - every tool_use is answered by a tool_result at the start of the
+    //     next user turn, and no tool_result is left without its tool_use.
+    repair(list) {
+      while (list.length && list[0].role !== 'user') list.shift();
+      for (let i = 0; i < list.length; i++) {
+        const msg = list[i];
+        if (msg.role !== 'user') continue;
+        const prev = list[i - 1];
+        const ids = (prev && prev.role === 'assistant')
+          ? prev.content.filter((b) => b.type === 'tool_use').map((b) => b.id)
+          : [];
+        const results = msg.content.filter((b) => b.type === 'tool_result' && ids.includes(b.tool_use_id));
+        const others = msg.content.filter((b) => b.type !== 'tool_result');
+        const answered = new Set(results.map((b) => b.tool_use_id));
+        for (const id of ids) {
+          if (!answered.has(id)) {
+            results.push({ type: 'tool_result', tool_use_id: id, is_error: true, content: 'ツールは実行されませんでした (会話が中断されました)。' });
+          }
+        }
+        msg.content = results.concat(others);
+      }
+      // A trailing assistant turn with pending calls gets a synthetic answer
+      // turn rather than being dropped, so its calls stay paired.
+      const last = list[list.length - 1];
+      if (last && last.role === 'assistant') {
+        const ids = last.content.filter((b) => b.type === 'tool_use').map((b) => b.id);
+        if (ids.length) {
+          list.push({
+            role: 'user',
+            content: ids.map((id) => ({ type: 'tool_result', tool_use_id: id, is_error: true, content: 'ツールは実行されませんでした (会話が中断されました)。' }))
+          });
+        } else {
+          list.pop();
+        }
+      }
+      return list.filter((m) => m.content.length);
+    },
+
+    // Content blocks as they should be stored for replay: drop empty text,
+    // thinking blocks that never received their signature (an interrupted
+    // stream), and the null `citations` field the stream puts on text.
+    cleanBlocks(blocks) {
+      const out = [];
+      for (const b of blocks || []) {
+        if (!b || !b.type) continue;
+        if (b.type === 'text') {
+          if (!b.text) continue;
+          const t = { type: 'text', text: b.text };
+          if (Array.isArray(b.citations) && b.citations.length) t.citations = b.citations;
+          out.push(t);
+          continue;
+        }
+        if (b.type === 'thinking' && !b.signature) continue;
+        out.push(b);
+      }
+      return out;
+    },
+
+    // What survives of an interrupted turn: its text only. Thinking and tool
+    // blocks from a stream that never finished are not valid to replay.
+    partialBlocks(out) {
+      return ((out && out.blocks) || [])
+        .filter((b) => b && b.type === 'text' && b.text)
+        .map((b) => ({ type: 'text', text: b.text }));
+    },
+
+    // Web sources announced by a server-tool result block.
+    _sourcesOf(block) {
+      const list = [];
+      if (block.type === 'web_search_tool_result' && Array.isArray(block.content)) {
+        for (const r of block.content) {
+          if (r && r.url) list.push({ uri: r.url, title: r.title || r.url });
+        }
+      } else if (block.type === 'web_fetch_tool_result' && block.content && block.content.url) {
+        const doc = block.content.content;
+        list.push({ uri: block.content.url, title: (doc && doc.title) || block.content.url });
+      }
+      return list;
+    },
+
+    // Yields assistant text as it streams. Everything else goes through
+    // callbacks or `out`:
+    //   onThinking(text)   — the thinking summary so far (all blocks joined)
+    //   onFunctionCall(fc) — a finished client tool call: { id, name, args },
+    //                        plus `errorResponse` when its input failed to
+    //                        parse or validate (report that instead of running)
+    //   onSources(list)    — [{ uri, title }] from web search / fetch results
+    //   out.blocks         — the raw content blocks, filled in as they arrive
+    //   out.stopReason / out.stopDetails — set once the response ends
+    // `pause_turn` (the server-side tool loop hit its own limit) is resumed
+    // here transparently, and the resumed blocks join the same turn.
+    async *streamGenerate({ apiKey, model, messages, systemPrompt, tools, webSearch, webFetch, effort, out, onThinking, onFunctionCall, onSources, signal }) {
+      if (!apiKey) throw new Error('Claude の API キーが設定されていません。設定画面から登録してください。');
+      if (!model) throw new Error('モデルが選択されていません。');
+      const result = out || {};
+      const prof = this.profile(model);
+      const toolDefs = (tools || []).slice();
+      const serverToolNames = new Set();
+      if (webSearch) {
+        toolDefs.push({ type: prof.dynamicWebTools ? 'web_search_20260209' : 'web_search_20250305', name: 'web_search' });
+        serverToolNames.add('web_search');
+      }
+      if (webFetch) {
+        toolDefs.push({ type: prof.dynamicWebTools ? 'web_fetch_20260209' : 'web_fetch_20250910', name: 'web_fetch' });
+        serverToolNames.add('web_fetch');
+      }
+      // Dynamic filtering runs code execution under the hood, and its
+      // blocks show up in the transcript next to the search results.
+      if ((webSearch || webFetch) && prof.dynamicWebTools) {
+        for (const n of ['code_execution', 'bash_code_execution', 'text_editor_code_execution']) serverToolNames.add(n);
+      }
+      const schemas = new Map((tools || []).map((t) => [t.name, t.input_schema]));
+
+      // Same implicit date context as the Gemini path.
+      const d = new Date();
+      const pad = (n) => String(n).padStart(2, '0');
+      const weekday = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][d.getDay()];
+      const dateLine = `Today's date: ${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} (${weekday})`;
+      const sys = systemPrompt && systemPrompt.trim() ? `${dateLine}\n\n${systemPrompt}` : dateLine;
+
+      const baseMessages = this.buildMessages(messages, { serverToolNames });
+      const body = {
+        model,
+        max_tokens: prof.maxTokens,
+        stream: true,
+        system: sys,
+        messages: baseMessages,
+        // Automatic prompt caching: every tool round and follow-up re-sends
+        // the whole conversation, so caching the prefix saves most of it.
+        cache_control: { type: 'ephemeral' }
+      };
+      if (toolDefs.length) body.tools = toolDefs;
+      const betas = [];
+      if (prof.adaptive) {
+        body.thinking = {
+          type: 'adaptive',
+          // Thinking text is omitted by default on current models; ask for a
+          // readable summary so the UI can show it.
+          display: 'summarized',
+          block_binding: { prefix_mismatch_behavior: 'drop_block' }
+        };
+        betas.push(CLAUDE_BETA_THINKING_BINDING);
+      }
+      const eff = this.resolveEffort(effort, prof.effortLevels);
+      if (eff) body.output_config = { effort: eff };
+      const headers = this.headers(apiKey, betas.length ? { 'anthropic-beta': betas.join(',') } : null);
+      const url = `${CLAUDE_API_BASE}/messages`;
+
+      const blocks = [];
+      result.blocks = blocks;
+      let thinkingText = '';
+      let yieldedText = false;
+      let lastType = null;
+
+      for (let cont = 0; ; cont++) {
+        if (cont > 0) body.messages = baseMessages.concat([{ role: 'assistant', content: this.cleanBlocks(blocks) }]);
+        const payload = JSON.stringify(body);
+
+        let chunks;
+        let res = null;
+        try {
+          res = await fetch(url, { method: 'POST', headers, body: payload, signal });
+        } catch (e) {
+          if (e && e.name === 'AbortError') throw e;
+          console.warn('[aicx] fetch to Claude API blocked, falling back to GM.xmlHttpRequest:', e);
+        }
+        if (res) {
+          if (!res.ok || !res.body) throw this.httpError(res.status, await res.text());
+          chunks = readerToTextChunks(res.body);
+        } else {
+          chunks = gmStream({
+            method: 'POST', url, headers, body: payload, signal,
+            makeError: (status, text) => this.httpError(status, text)
+          });
+        }
+
+        // Per-response state: `index` in the events is relative to this
+        // response, while `blocks` accumulates across pause_turn resumptions.
+        const open = new Map(); // index → { block, json }
+        let stopReason = null;
+        let stopDetails = null;
+        let done = false;
+        let buf = '';
+        for await (const text of chunks) {
+          buf += text;
+          const frames = buf.split(/\r?\n\r?\n/);
+          buf = frames.pop();
+          for (const frame of frames) {
+            for (const line of frame.split(/\r?\n/)) {
+              if (!line.startsWith('data:')) continue;
+              const data = line.slice(5).trim();
+              if (!data) continue;
+              let ev;
+              try { ev = JSON.parse(data); } catch { continue; }
+              switch (ev && ev.type) {
+                case 'content_block_start': {
+                  const block = Object.assign({}, ev.content_block);
+                  if (block.type === 'tool_use' || block.type === 'server_tool_use') block.input = {};
+                  if (block.type === 'thinking') {
+                    block.thinking = block.thinking || '';
+                    if (thinkingText) thinkingText += '\n\n';
+                  }
+                  if (block.type === 'text') {
+                    block.text = block.text || '';
+                    // Text resuming after a tool call or result reads as a
+                    // new paragraph; consecutive text blocks (citations split
+                    // one answer into several) continue the same one.
+                    if (yieldedText && lastType !== 'text') yield '\n\n';
+                    if (block.text) { yieldedText = true; yield block.text; }
+                  }
+                  blocks.push(block);
+                  open.set(ev.index, { block, json: '' });
+                  lastType = block.type;
+                  const found = this._sourcesOf(block);
+                  if (found.length && typeof onSources === 'function') {
+                    try { onSources(found); } catch (e) { console.warn('[aicx] onSources threw:', e); }
+                  }
+                  break;
+                }
+                case 'content_block_delta': {
+                  const entry = open.get(ev.index);
+                  const dl = ev.delta || {};
+                  if (!entry) break;
+                  if (dl.type === 'text_delta') {
+                    entry.block.text += dl.text || '';
+                    if (dl.text) { yieldedText = true; yield dl.text; }
+                  } else if (dl.type === 'thinking_delta') {
+                    entry.block.thinking += dl.thinking || '';
+                    thinkingText += dl.thinking || '';
+                    if (typeof onThinking === 'function') {
+                      try { onThinking(thinkingText); } catch (e) { console.warn('[aicx] onThinking threw:', e); }
+                    }
+                  } else if (dl.type === 'signature_delta') {
+                    entry.block.signature = (entry.block.signature || '') + (dl.signature || '');
+                  } else if (dl.type === 'input_json_delta') {
+                    entry.json += dl.partial_json || '';
+                  } else if (dl.type === 'citations_delta' && dl.citation) {
+                    if (!Array.isArray(entry.block.citations)) entry.block.citations = [];
+                    entry.block.citations.push(dl.citation);
+                  }
+                  break;
+                }
+                case 'content_block_stop': {
+                  const entry = open.get(ev.index);
+                  if (!entry) break;
+                  const b = entry.block;
+                  if (b.type === 'tool_use' || b.type === 'server_tool_use') {
+                    // Parse strictly: with eager input streaming the server
+                    // no longer guarantees well-formed JSON.
+                    let input = {};
+                    let bad = null;
+                    const raw = entry.json;
+                    if (raw && raw.trim()) {
+                      try { input = JSON.parse(raw); } catch { bad = raw; }
+                    }
+                    if (bad == null && (!input || typeof input !== 'object' || Array.isArray(input))) { bad = raw; input = {}; }
+                    b.input = bad == null ? input : {};
+                    if (b.type === 'tool_use' && typeof onFunctionCall === 'function') {
+                      const call = { id: b.id, name: b.name, args: b.input };
+                      if (bad != null) {
+                        call.errorResponse = { error: 'ツール入力の JSON を解析できませんでした。正しい JSON で再度呼び出してください。', INVALID_JSON: bad };
+                      } else {
+                        const problem = this.validateInput(schemas.get(b.name), b.input);
+                        if (problem) call.errorResponse = { error: `ツール入力がスキーマに合いません: ${problem}` };
+                      }
+                      try { onFunctionCall(call); } catch (e) { console.warn('[aicx] onFunctionCall threw:', e); }
+                    }
+                  }
+                  open.delete(ev.index);
+                  break;
+                }
+                case 'message_delta':
+                  if (ev.delta && ev.delta.stop_reason) stopReason = ev.delta.stop_reason;
+                  if (ev.delta && ev.delta.stop_details) stopDetails = ev.delta.stop_details;
+                  break;
+                case 'message_stop':
+                  // Authoritative end of the response. Returning here (rather
+                  // than waiting for the transport to close) matters for the
+                  // Tampermonkey builds whose stream never signals `done` —
+                  // see the same note in Gemini.streamGenerate.
+                  done = true;
+                  break;
+                case 'error': {
+                  const e = ev.error || {};
+                  const err = new Error(`Claude API error: ${e.type || ''} ${e.message || ''}`.trim());
+                  if (e.type === 'overloaded_error' || e.type === 'api_error') err.retryable = true;
+                  throw err;
+                }
+                default:
+                  break; // message_start, ping, and event types added later
+              }
+              if (done) break;
+            }
+            if (done) break;
+          }
+          if (done) break;
+        }
+
+        result.stopReason = stopReason;
+        result.stopDetails = stopDetails;
+        if (stopReason === 'pause_turn' && cont < CLAUDE_MAX_CONTINUATIONS) continue;
+        return;
+      }
+    }
+  };
+
+  // =========================================================================
+  // 4c. Provider dispatch
+  // =========================================================================
+  // The provider is derived from the model id rather than stored, so model
+  // entries saved by older versions (Gemini only, no provider field) and new
+  // ones resolve the same way.
+  const Providers = {
+    of(modelId) { return /^claude-/i.test(String(modelId || '')) ? 'anthropic' : 'gemini'; },
+    label(p) { return p === 'anthropic' ? 'Claude' : 'Gemini'; },
+    apiKey(p) { return (p === 'anthropic' ? Store.settings.anthropicApiKey : Store.settings.apiKey) || ''; },
+    abbreviate(id) { return this.of(id) === 'anthropic' ? Claude.abbreviate(id) : Gemini.abbreviate(id); },
+    listModels(p, apiKey) { return p === 'anthropic' ? Claude.listModels(apiKey) : Gemini.listModels(apiKey); }
   };
 
   // =========================================================================
@@ -2302,7 +3023,7 @@ textarea { resize: none; }
   // mode. It differs from a normal chat in three ways:
   //
   //   1. A dedicated system prompt (overridable in Settings → プロンプト).
-  //   2. Gemini function-calling tools that let the model inspect the live
+  //   2. Function-calling tools (Gemini / Claude) that let the model inspect the live
   //      page, fetch its assets, run verification snippets, ask the user for
   //      an existing script, and finally emit an installable userscript.
   //   3. Page-context auto-injection is off by default — the model pulls
@@ -2400,7 +3121,8 @@ textarea { resize: none; }
     },
 
     // ---------------------------------------------------------------------
-    // Tool declarations (Gemini functionDeclarations schema)
+    // Tool declarations (Gemini functionDeclarations schema; Claude gets the
+    // same set through Claude.convertTools)
     // ---------------------------------------------------------------------
     toolDeclarations() {
       const S = (description) => ({ type: 'STRING', description });
@@ -3835,7 +4557,7 @@ textarea { resize: none; }
       });
       attachWrap.append(btnAttach);
 
-      const btnWeb = el('button', { class: '', type: 'button', 'aria-label': 'Web 検索 (Grounding)', 'aria-pressed': 'false', title: 'Gemini の Google 検索 Grounding を有効/無効 (このチャット内のみ)' });
+      const btnWeb = el('button', { class: '', type: 'button', 'aria-label': 'Web 検索 (Grounding)', 'aria-pressed': 'false', title: 'Web 検索を有効/無効 (Gemini: Google 検索 Grounding / Claude: web_search。このチャット内のみ)' });
       btnWeb.appendChild(icon('web'));
       const updateWebBtn = () => {
         const on = !!this.webGrounding;
@@ -3848,7 +4570,7 @@ textarea { resize: none; }
         updateWebBtn();
       });
 
-      const btnUrlCtx = el('button', { class: '', type: 'button', 'aria-label': 'URL Context', 'aria-pressed': 'false', title: 'Gemini の URL Context を有効/無効 (プロンプト内の URL をツールが取得・解析します)' });
+      const btnUrlCtx = el('button', { class: '', type: 'button', 'aria-label': 'URL Context', 'aria-pressed': 'false', title: 'URL の取得を有効/無効 (Gemini: URL Context / Claude: web_fetch。プロンプト内の URL をツールが取得・解析します)' });
       btnUrlCtx.appendChild(icon('link'));
       const updateUrlCtxBtn = () => {
         const on = !!this.urlContext;
@@ -3948,7 +4670,7 @@ textarea { resize: none; }
       const btnModelLabel = el('span', { class: 'text-xs font-medium' }, '');
       btnModel.append(btnModelLabel);
       const paintModelBtn = () => {
-        btnModelLabel.textContent = Gemini.abbreviate(Store.settings.model || '');
+        btnModelLabel.textContent = Providers.abbreviate(Store.settings.model || '');
         btnModel.title = `モデル: ${Store.settings.model || '(未選択)'}`;
       };
       paintModelBtn();
@@ -3991,7 +4713,7 @@ textarea { resize: none; }
           const text = el('div', { class: 'flex-1 min-w-0' });
           text.append(
             el('div', { class: 'text-xs font-medium truncate' }, m.display || m.id),
-            el('div', { class: 'text-[10px] text-zinc-500 dark:text-zinc-400 truncate' }, m.id)
+            el('div', { class: 'text-[10px] text-zinc-500 dark:text-zinc-400 truncate' }, `${Providers.label(Providers.of(m.id))} · ${m.id}`)
           );
           item.append(mark, text);
           item.addEventListener('click', async () => {
@@ -4412,6 +5134,7 @@ textarea { resize: none; }
       const placeholder = (m._pending && !hasCalls)
         ? '<span class="aicx-dot"></span><span class="aicx-dot"></span><span class="aicx-dot"></span>'
         : '';
+      if (m.thinking && m.thinking.trim()) wrap.appendChild(this.renderThinking(m));
       const text = m.content || placeholder;
       if (text) {
         const body = el('div', { class: 'aicx-md' });
@@ -4422,6 +5145,25 @@ textarea { resize: none; }
       const actions = this.renderActions(m);
       if (actions) wrap.appendChild(actions);
       return wrap;
+    },
+
+    // Collapsible summary of Claude's thinking, above the answer. The bubble
+    // is rebuilt on every streamed chunk, so whether the user expanded it is
+    // remembered per message id instead of being read back from the DOM.
+    renderThinking(m) {
+      if (!this._openThinking) this._openThinking = new Set();
+      const live = !!m._pending;
+      const details = el('details', { class: 'my-2 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/50' });
+      if (this._openThinking.has(m.id)) details.open = true;
+      details.addEventListener('toggle', () => {
+        if (details.open) this._openThinking.add(m.id); else this._openThinking.delete(m.id);
+      });
+      const summary = el('summary', { class: 'cursor-pointer select-none px-3 py-2 text-xs font-semibold text-zinc-600 dark:text-zinc-300' },
+        live ? '思考中…' : '思考プロセス');
+      const body = el('div', { class: 'aicx-md px-3 pb-2 text-xs text-zinc-600 dark:text-zinc-300' });
+      body.innerHTML = MD.render(m.thinking);
+      details.append(summary, body);
+      return details;
     },
 
     // Per-message action bar. Designed to host multiple buttons — append more
@@ -4484,7 +5226,15 @@ textarea { resize: none; }
       // Allow a selection-only send (empty composer, no files) so the user can
       // ask "what about this?" just by highlighting a passage.
       if (!text && atts.length === 0 && !Selection.get()) return;
-      if (!Store.settings.apiKey) { UI.toast('API キーを設定してください', 'error'); SettingsPanel.open(); return; }
+      // Model and provider are fixed for the whole run, so switching the
+      // picker mid-generation can't send later tool rounds elsewhere.
+      const model = Store.settings.model || '';
+      const provider = Providers.of(model);
+      if (!Providers.apiKey(provider)) {
+        UI.toast(`${Providers.label(provider)} の API キーを設定してください`, 'error');
+        SettingsPanel.open();
+        return;
+      }
 
       // Sweep expired history once per page session, on the first send. Doing
       // it here rather than at startup means pages the user never chats on pay
@@ -4596,23 +5346,37 @@ textarea { resize: none; }
       // finishes one and opens the next, so `pending` — not `asstMsg` — is
       // what the error handler must annotate.
       let pending = asstMsg;
+      // The `out` object of the Claude stream currently running, so the
+      // abort handler can salvage the text of an interrupted turn.
+      let claudeOut = null;
+      const isClaude = provider === 'anthropic';
+      // The web toggles are read once: they belong to the panel, which may
+      // be showing a different conversation by the time a later round runs.
+      const webSearch = !!this.webGrounding;
+      const webFetch = !!this.urlContext;
 
       try {
-        // Google Search grounding (requires Gemini 2.0+ for `googleSearch`; 1.5 uses `googleSearchRetrieval`)
-        // URL Context asks Gemini to fetch and read URLs present in the prompt.
-        // It's a Gemini 2.x tool, so we skip it on 1.x and on 1.x only the
-        // legacy retrieval tool is offered. UserScript mode adds our local
-        // function declarations on top (unsupported on 1.x, hence the guard).
-        const modelId = Store.settings.model || '';
-        const isLegacy = /\b1\.[05]\b/.test(modelId);
+        // Gemini: Google Search grounding (requires Gemini 2.0+ for
+        // `googleSearch`; 1.5 uses `googleSearchRetrieval`). URL Context asks
+        // Gemini to fetch and read URLs present in the prompt. It's a Gemini
+        // 2.x tool, so we skip it on 1.x and on 1.x only the legacy retrieval
+        // tool is offered. UserScript mode adds our local function
+        // declarations on top (unsupported on 1.x, hence the guard).
+        //
+        // Claude: the same toggles map to the web_search / web_fetch server
+        // tools, which Claude.streamGenerate adds itself; only our local
+        // tools are converted here.
         let tools;
-        if (isLegacy) {
-          if (this.webGrounding) tools = [{ googleSearchRetrieval: {} }];
+        let claudeTools;
+        if (isClaude) {
+          if (isUserscript) claudeTools = Claude.convertTools(UserScriptMode.toolDeclarations());
+        } else if (/\b1\.[05]\b/.test(model)) {
+          if (webSearch) tools = [{ googleSearchRetrieval: {} }];
           if (isUserscript) UI.toast('UserScript モードは Gemini 2.0 以降のモデルが必要です', 'error');
         } else {
           const t = [];
-          if (this.webGrounding) t.push({ googleSearch: {} });
-          if (this.urlContext) t.push({ urlContext: {} });
+          if (webSearch) t.push({ googleSearch: {} });
+          if (webFetch) t.push({ urlContext: {} });
           if (isUserscript) t.push({ functionDeclarations: UserScriptMode.toolDeclarations() });
           if (t.length) tools = t;
         }
@@ -4630,36 +5394,64 @@ textarea { resize: none; }
           let acc = '';
           let calls = [];
           let grounding = null;
-          // Retry on MALFORMED_FUNCTION_CALL — a sporadic Gemini 2.5 fault (the
-          // model emits a stray function-call token even with no tools opted in),
-          // not a deterministic refusal, so re-running the identical request
-          // usually succeeds. The fault can fire midway through the stream, so
-          // each attempt discards whatever partial text AND partial tool calls
-          // were already collected and restarts the turn from scratch.
+          let sources = [];
+          // Retry transient failures: on Gemini, MALFORMED_FUNCTION_CALL — a
+          // sporadic Gemini 2.5 fault (the model emits a stray function-call
+          // token even with no tools opted in), not a deterministic refusal, so
+          // re-running the identical request usually succeeds; on Claude, an
+          // overloaded or 5xx reply. The fault can fire midway through the
+          // stream, so each attempt discards whatever partial text AND partial
+          // tool calls were already collected and restarts the turn from scratch.
           const MAX_ATTEMPTS = 3;
           let attempts = 0;
           while (true) {
             acc = '';
             calls = [];
             grounding = null;
+            sources = [];
             pending.content = '';
             pending._pending = true;
             delete pending.thoughtSignature;
+            delete pending.thinking;
+            delete pending.claudeBlocks;
             if (this.conv === conv) this.renderLastAssistant();
-            const stream = Gemini.streamGenerate({
-              apiKey: Store.settings.apiKey,
-              model: Store.settings.model,
-              messages: apiMessages,
-              systemPrompt,
-              tools,
-              onMetadata: (meta) => { grounding = meta; },
-              // The signature must be stored alongside the call it came with:
-              // Gemini 3 rejects the next request outright if a replayed
-              // functionCall part has lost it.
-              onFunctionCall: (fc, sig) => { calls.push({ id: fc.id, name: fc.name, args: fc.args || {}, thoughtSignature: sig }); },
-              onThoughtSignature: (sig) => { pending.thoughtSignature = sig; },
-              signal: aborter.signal
-            });
+            let stream;
+            if (isClaude) {
+              claudeOut = {};
+              stream = Claude.streamGenerate({
+                apiKey: Store.settings.anthropicApiKey,
+                model,
+                messages: apiMessages,
+                systemPrompt,
+                tools: claudeTools,
+                webSearch,
+                webFetch,
+                effort: Store.settings.claudeEffort,
+                out: claudeOut,
+                onThinking: (t) => {
+                  pending.thinking = t;
+                  if (this.conv === conv) this.renderLastAssistant();
+                },
+                onFunctionCall: (fc) => { calls.push(fc); },
+                onSources: (list) => { sources.push(...list); },
+                signal: aborter.signal
+              });
+            } else {
+              stream = Gemini.streamGenerate({
+                apiKey: Store.settings.apiKey,
+                model,
+                messages: apiMessages,
+                systemPrompt,
+                tools,
+                onMetadata: (meta) => { grounding = meta; },
+                // The signature must be stored alongside the call it came with:
+                // Gemini 3 rejects the next request outright if a replayed
+                // functionCall part has lost it.
+                onFunctionCall: (fc, sig) => { calls.push({ id: fc.id, name: fc.name, args: fc.args || {}, thoughtSignature: sig }); },
+                onThoughtSignature: (sig) => { pending.thoughtSignature = sig; },
+                signal: aborter.signal
+              });
+            }
             try {
               for await (const chunk of stream) {
                 acc += chunk;
@@ -4672,7 +5464,8 @@ textarea { resize: none; }
               if (err && err.retryable && attempts < MAX_ATTEMPTS - 1 && !aborter.signal.aborted) {
                 attempts++;
                 // Brief backoff so a transient server-side hiccup can clear.
-                await new Promise((r) => setTimeout(r, 400 * attempts));
+                // An overloaded Claude API needs longer than a Gemini glitch.
+                await new Promise((r) => setTimeout(r, (isClaude ? 1500 : 400) * attempts));
                 continue;
               }
               throw err;
@@ -4680,13 +5473,53 @@ textarea { resize: none; }
           }
           pending._pending = false;
 
+          if (isClaude) {
+            // Keep the raw blocks for verbatim replay (see the STORAGE note
+            // on the Claude client), then act on how the response ended.
+            pending.claudeBlocks = Claude.cleanBlocks(claudeOut.blocks);
+            const stop = claudeOut.stopReason;
+            const note = (s) => { pending.content = (pending.content ? `${pending.content}\n\n` : '') + s; };
+            if (stop === 'refusal') {
+              // A safety decline. Its partial output is not a usable answer
+              // (and must not be replayed), and a tool call it cut off
+              // mid-input must never run.
+              const cat = claudeOut.stopDetails && claudeOut.stopDetails.category;
+              calls = [];
+              sources = [];
+              pending._refused = true;
+              delete pending.claudeBlocks;
+              pending.content = `_(Claude の安全機能により応答が中断されました${cat ? ` [${cat}]` : ''}。表現を変えるか、別のモデルをお試しください。)_`;
+            } else if (stop === 'max_tokens') {
+              // A tool input cut off at the cap can still parse as a smaller
+              // valid object, so report it back instead of running it.
+              if (calls.length) {
+                for (const c of calls) c.errorResponse = { error: '出力が上限 (max_tokens) に達したため、ツール入力が途中で切れました。入力を小さく分けて再度呼び出してください。' };
+              } else {
+                note('_(出力が上限 (max_tokens) に達したため途中で終了しました)_');
+              }
+            } else if (stop === 'model_context_window_exceeded') {
+              note('_(会話がモデルのコンテキスト上限に達したため途中で終了しました。新しい会話を始めてください)_');
+            } else if (stop === 'pause_turn') {
+              note('_(Web 検索などのサーバー側ツールの実行回数が上限に達したため中断しました。「続けて」と送れば再開できます)_');
+            }
+            if (this.conv === conv) this.renderLastAssistant();
+          } else if (grounding && grounding.groundingChunks) {
+            for (const c of grounding.groundingChunks) {
+              if (c.web && c.web.uri) sources.push({ uri: c.web.uri, title: c.web.title });
+            }
+          }
+
           // Append grounding sources (web citations) if any.
           // Rendered as <details> so the list is collapsed by default — it can
           // get long and dominate the bubble otherwise.
-          if (grounding && grounding.groundingChunks && grounding.groundingChunks.length) {
-            const items = grounding.groundingChunks
-              .map((c) => (c.web && c.web.uri) ? `<li><a href="${esc(c.web.uri)}" target="_blank" rel="noopener noreferrer">${esc(c.web.title || c.web.uri)}</a></li>` : null)
-              .filter(Boolean);
+          if (sources.length) {
+            const seen = new Set();
+            const items = [];
+            for (const s of sources) {
+              if (!s.uri || seen.has(s.uri)) continue;
+              seen.add(s.uri);
+              items.push(`<li><a href="${esc(s.uri)}" target="_blank" rel="noopener noreferrer">${esc(s.title || s.uri)}</a></li>`);
+            }
             if (items.length) {
               const html = `\n\n<details class="aicx-sources"><summary>ソース (${items.length} 件)</summary>\n<ol>\n${items.join('\n')}\n</ol>\n</details>`;
               pending.content = (pending.content || '') + html;
@@ -4696,14 +5529,18 @@ textarea { resize: none; }
 
           if (!calls.length) break;
 
-          pending.functionCalls = calls;
+          // `errorResponse` is only needed below; keeping it out of the stored
+          // message avoids persisting a possibly huge unparseable input twice.
+          pending.functionCalls = calls.map(({ errorResponse, ...c }) => c);
           if (this.conv === conv) this.render();
 
           // Run the tools sequentially: several of them open modals, and two
-          // competing dialogs would be unusable.
+          // competing dialogs would be unusable. A call whose input failed to
+          // parse or validate is answered with the error, so the model can
+          // retry it.
           const responses = [];
           for (const call of calls) {
-            const response = await UserScriptMode.execute(call, { conv, host, panel: this });
+            const response = call.errorResponse || await UserScriptMode.execute(call, { conv, host, panel: this });
             responses.push({ id: call.id, name: call.name, response });
           }
           conv.messages.push({
@@ -4731,6 +5568,13 @@ textarea { resize: none; }
         pending._pending = false;
         const aborted = err && err.name === 'AbortError';
         failed = !aborted;
+        if (isClaude) {
+          // Only the streamed text of an interrupted turn is safe to replay;
+          // a failed turn is not replayed at all (Claude.buildMessages).
+          if (aborted && claudeOut) pending.claudeBlocks = Claude.partialBlocks(claudeOut);
+          else delete pending.claudeBlocks;
+        }
+        if (!aborted) pending._error = true;
         if (aborted) {
           pending.content = (pending.content || '') + '\n\n_(停止しました)_';
         } else if (err && err.code === 'MALFORMED_FUNCTION_CALL') {
@@ -4758,7 +5602,8 @@ textarea { resize: none; }
       }
     },
 
-    // Flatten conv.messages into the shape Gemini.buildContents expects.
+    // Flatten conv.messages into the provider-neutral shape that
+    // Gemini.buildContents and Claude.buildMessages both consume.
     // Synthetic page-context pairs and tool call/response turns are part of
     // that stream, so they flow to the model in the same chronological
     // position the user (or the agent) created them — a later-injected page
@@ -4768,7 +5613,7 @@ textarea { resize: none; }
       for (const m of conv.messages) {
         if (m === exclude) continue;
         if (m.functionResponses && m.functionResponses.length) {
-          out.push({ role: 'user', functionResponses: m.functionResponses });
+          out.push({ id: m.id, role: 'user', functionResponses: m.functionResponses });
           continue;
         }
         let content = m.content;
@@ -4781,8 +5626,9 @@ textarea { resize: none; }
           content = content ? `${quoted}\n\n${content}` : `${quoted}\n\nこの選択箇所について解説してください。`;
         }
         out.push({
-          role: m.role, content, attachments: m.attachments,
-          functionCalls: m.functionCalls, thoughtSignature: m.thoughtSignature
+          id: m.id, role: m.role, content, attachments: m.attachments,
+          functionCalls: m.functionCalls, thoughtSignature: m.thoughtSignature,
+          claudeBlocks: m.claudeBlocks, _error: m._error, _refused: m._refused
         });
       }
       return out;
@@ -5006,7 +5852,7 @@ textarea { resize: none; }
 
   const SettingsPanel = {
     panel: null,
-    models: null,
+    models: null, // { [provider]: catalog[] } — per-provider model list cache
     activeTab: 'general',
 
     TABS: [
@@ -5073,44 +5919,25 @@ textarea { resize: none; }
 
     sectionAPI() {
       const box = el('section', { class: 'space-y-3' });
-      box.append(Form.sectionTitle('Gemini API'));
-
-      const keyWrap = el('div');
-      keyWrap.append(Form.label('API キー'));
-      const keyInput = Form.input(Store.settings.apiKey, (v) => { Store.settings.apiKey = v.trim(); Store.saveSettings(); renderAvailable(); }, { type: 'password', placeholder: 'AIza...' });
-      keyWrap.append(keyInput);
-      keyWrap.append(el('p', { class: 'text-[11px] text-zinc-500 mt-1' }, [
-        'キーは ',
-        (() => { const a = el('a', { href: 'https://aistudio.google.com/apikey', target: '_blank', rel: 'noopener', class: 'underline text-indigo-600 dark:text-indigo-400' }, 'Google AI Studio'); return a; })(),
-        ' で取得できます。'
-      ]));
-      box.append(keyWrap);
+      box.append(Form.sectionTitle('AI モデル'));
 
       const modelWrap = el('div', { class: 'space-y-2' });
       modelWrap.append(Form.label('使用するモデル'));
-      modelWrap.append(el('p', { class: 'text-[11px] text-zinc-500' }, '追加したモデルだけがチャット画面のモデル選択に表示されます。チェックの付いた行が現在のアクティブモデルです。'));
-
+      modelWrap.append(el('p', { class: 'text-[11px] text-zinc-500' }, '追加したモデルだけがチャット画面のモデル選択に表示されます。Gemini と Claude のモデルを混在して追加でき、選んだモデルに応じた API キーが使われます。チェックの付いた行が現在のアクティブモデルです。'));
       const listWrap = el('div', { class: 'space-y-1' });
       modelWrap.append(listWrap);
-
-      const addRow = el('div', { class: 'flex gap-2 pt-1' });
-      const addSel = el('select', { class: 'flex-1 min-w-0 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg text-sm px-3 py-2' });
-      const addBtn = Form.btn('追加', () => addSelected(), 'bg-indigo-600 text-white shrink-0');
-      addBtn.prepend(icon('plus', 'w-3 h-3 mr-1 inline'));
-      const refreshBtn = Form.btn('再取得', () => renderAvailable(true), 'bg-zinc-200 dark:bg-zinc-700 text-zinc-800 dark:text-zinc-100 shrink-0');
-      refreshBtn.prepend(icon('refresh', 'w-3 h-3 mr-1 inline'));
-      addRow.append(addSel, addBtn, refreshBtn);
-      modelWrap.append(addRow);
-
-      const hint = el('p', { class: 'text-[11px] text-zinc-500' }, '');
-      modelWrap.append(hint);
       box.append(modelWrap);
+
+      // Each provider block registers how to repaint its "add model" picker,
+      // so adding or deleting a model refreshes every block's choices.
+      const refreshers = [];
+      const refreshAll = () => { for (const f of refreshers) f(); };
 
       const renderAdded = () => {
         clear(listWrap);
         const added = Store.settings.addedModels || [];
         if (!added.length) {
-          listWrap.append(el('p', { class: 'text-xs text-zinc-500 px-3 py-3 border border-dashed border-zinc-300 dark:border-zinc-700 rounded-lg text-center' }, 'モデルが追加されていません。下のドロップダウンから選んで「追加」してください。'));
+          listWrap.append(el('p', { class: 'text-xs text-zinc-500 px-3 py-3 border border-dashed border-zinc-300 dark:border-zinc-700 rounded-lg text-center' }, 'モデルが追加されていません。下の各 API の欄から選んで「追加」してください。'));
           return;
         }
         for (const m of added) {
@@ -5132,7 +5959,7 @@ textarea { resize: none; }
           const text = el('div', { class: 'flex-1 min-w-0' });
           text.append(
             el('div', { class: 'text-sm font-medium truncate' }, m.display || m.id),
-            el('div', { class: 'text-[11px] text-zinc-500 dark:text-zinc-400 truncate' }, m.id)
+            el('div', { class: 'text-[11px] text-zinc-500 dark:text-zinc-400 truncate' }, `${Providers.label(Providers.of(m.id))} · ${m.id}`)
           );
           const del = el('button', { class: 'w-9 h-9 shrink-0 rounded-lg text-zinc-500 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-900/30 flex items-center justify-center aicx-tap', type: 'button', 'aria-label': 'モデルを削除' });
           del.appendChild(icon('trash', 'w-4 h-4'));
@@ -5145,70 +5972,144 @@ textarea { resize: none; }
             }
             await Store.saveSettings();
             renderAdded();
-            renderAvailable();
+            refreshAll();
           });
           row.append(radio, text, del);
           listWrap.append(row);
         }
       };
 
-      const addSelected = async () => {
-        const id = addSel.value;
-        if (!id || !this.models) return;
-        const m = this.models.find((x) => x.id === id);
-        if (!m) return;
-        Store.settings.addedModels = Store.settings.addedModels || [];
-        if (Store.settings.addedModels.some((x) => x.id === id)) return;
-        Store.settings.addedModels.push({ id: m.id, display: m.display });
-        if (!Store.settings.model) Store.settings.model = m.id;
-        await Store.saveSettings();
-        renderAdded();
+      // API key + "add model" picker for one provider. The fetched catalog is
+      // cached per provider on the panel and dropped whenever the key changes.
+      const providerBlock = (p, { title, keyField, placeholder, keyUrl, keySite }) => {
+        if (!this.models || typeof this.models !== 'object') this.models = {};
+        const wrap = el('div', { class: 'space-y-2 pt-3 border-t border-zinc-200 dark:border-zinc-800' });
+        wrap.append(Form.sectionTitle(title));
+
+        const keyWrap = el('div');
+        keyWrap.append(Form.label('API キー'));
+        keyWrap.append(Form.input(Store.settings[keyField], (v) => {
+          Store.settings[keyField] = v.trim();
+          Store.saveSettings();
+          this.models[p] = null;
+          refetchSoon();
+        }, { type: 'password', placeholder }));
+        keyWrap.append(el('p', { class: 'text-[11px] text-zinc-500 mt-1' }, [
+          'キーは ',
+          el('a', { href: keyUrl, target: '_blank', rel: 'noopener', class: 'underline text-indigo-600 dark:text-indigo-400' }, keySite),
+          ' で取得できます。'
+        ]));
+        wrap.append(keyWrap);
+
+        const addRow = el('div', { class: 'flex gap-2' });
+        const addSel = el('select', { class: 'flex-1 min-w-0 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg text-sm px-3 py-2' });
+        const addBtn = Form.btn('追加', () => addSelected(), 'bg-indigo-600 text-white shrink-0');
+        addBtn.prepend(icon('plus', 'w-3 h-3 mr-1 inline'));
+        const refreshBtn = Form.btn('再取得', () => renderAvailable(true), 'bg-zinc-200 dark:bg-zinc-700 text-zinc-800 dark:text-zinc-100 shrink-0');
+        refreshBtn.prepend(icon('refresh', 'w-3 h-3 mr-1 inline'));
+        addRow.append(addSel, addBtn, refreshBtn);
+        const hint = el('p', { class: 'text-[11px] text-zinc-500' }, '');
+        const addWrap = el('div');
+        addWrap.append(Form.label('モデルを追加'), addRow, hint);
+        wrap.append(addWrap);
+
+        const addSelected = async () => {
+          const id = addSel.value;
+          const catalog = this.models[p];
+          if (!id || !catalog) return;
+          const m = catalog.find((x) => x.id === id);
+          if (!m) return;
+          Store.settings.addedModels = Store.settings.addedModels || [];
+          if (Store.settings.addedModels.some((x) => x.id === id)) return;
+          const entry = { id: m.id, display: m.display };
+          // Claude capability hints shape each request (Claude.profile).
+          if (m.maxTokens) entry.maxTokens = m.maxTokens;
+          if (typeof m.adaptive === 'boolean') entry.adaptive = m.adaptive;
+          if (Array.isArray(m.effortLevels)) entry.effortLevels = m.effortLevels;
+          Store.settings.addedModels.push(entry);
+          if (!Store.settings.model) Store.settings.model = m.id;
+          await Store.saveSettings();
+          renderAdded();
+          refreshAll();
+        };
+
+        const renderAvailable = async (force = false) => {
+          const apiKey = Providers.apiKey(p);
+          if (!apiKey) {
+            clear(addSel);
+            addSel.appendChild(el('option', { value: '' }, '(API キー未設定)'));
+            addSel.disabled = true;
+            addBtn.disabled = true;
+            refreshBtn.disabled = true;
+            hint.textContent = 'API キーを入力するとモデル一覧を取得できます。';
+            return;
+          }
+          refreshBtn.disabled = false;
+          if (!this.models[p] || force) {
+            addSel.disabled = true;
+            addBtn.disabled = true;
+            clear(addSel);
+            addSel.appendChild(el('option', { value: '' }, '取得中...'));
+            hint.textContent = 'モデル一覧を取得中...';
+            try {
+              const list = await Providers.listModels(p, apiKey);
+              // A key edited while the request was in flight wins.
+              if (Providers.apiKey(p) !== apiKey) return;
+              this.models[p] = list;
+              hint.textContent = `${list.length} 件のモデルを取得しました。`;
+            } catch (e) {
+              if (Providers.apiKey(p) !== apiKey) return;
+              hint.textContent = 'モデル一覧の取得に失敗しました: ' + (e && e.message || e);
+              this.models[p] = [];
+            }
+          }
+          clear(addSel);
+          const addedIds = new Set((Store.settings.addedModels || []).map((x) => x.id));
+          const available = (this.models[p] || []).filter((m) => !addedIds.has(m.id));
+          if (!available.length) {
+            addSel.appendChild(el('option', { value: '' }, '(追加できるモデルはありません)'));
+            addSel.disabled = true;
+            addBtn.disabled = true;
+          } else {
+            for (const m of available) {
+              addSel.appendChild(el('option', { value: m.id }, `${m.display} (${m.id})`));
+            }
+            addSel.disabled = false;
+            addBtn.disabled = false;
+          }
+        };
+        // Typing a key fires on every keystroke; only fetch once it settles.
+        const refetchSoon = debounce(() => renderAvailable(), 600);
+        refreshers.push(() => renderAvailable());
         renderAvailable();
+        return wrap;
       };
 
-      const renderAvailable = async (force = false) => {
-        if (!Store.settings.apiKey) {
-          clear(addSel);
-          addSel.appendChild(el('option', { value: '' }, '(API キー未設定)'));
-          addSel.disabled = true;
-          addBtn.disabled = true;
-          refreshBtn.disabled = true;
-          hint.textContent = 'API キーを入力するとモデル一覧を取得できます。';
-          return;
-        }
-        refreshBtn.disabled = false;
-        if (!this.models || force) {
-          addSel.disabled = true;
-          addBtn.disabled = true;
-          clear(addSel);
-          addSel.appendChild(el('option', { value: '' }, '取得中...'));
-          hint.textContent = 'モデル一覧を取得中...';
-          try {
-            this.models = await Gemini.listModels(Store.settings.apiKey);
-            hint.textContent = `${this.models.length} 件のモデルを取得しました。`;
-          } catch (e) {
-            hint.textContent = 'モデル一覧の取得に失敗しました: ' + (e && e.message || e);
-            this.models = [];
-          }
-        }
-        clear(addSel);
-        const addedIds = new Set((Store.settings.addedModels || []).map((x) => x.id));
-        const available = (this.models || []).filter((m) => !addedIds.has(m.id));
-        if (!available.length) {
-          addSel.appendChild(el('option', { value: '' }, '(追加できるモデルはありません)'));
-          addSel.disabled = true;
-          addBtn.disabled = true;
-        } else {
-          for (const m of available) {
-            addSel.appendChild(el('option', { value: m.id }, `${m.display} (${m.id})`));
-          }
-          addSel.disabled = false;
-          addBtn.disabled = false;
-        }
-      };
+      box.append(providerBlock('gemini', {
+        title: 'Gemini API', keyField: 'apiKey', placeholder: 'AIza...',
+        keyUrl: 'https://aistudio.google.com/apikey', keySite: 'Google AI Studio'
+      }));
+
+      const claudeBlock = providerBlock('anthropic', {
+        title: 'Claude API', keyField: 'anthropicApiKey', placeholder: 'sk-ant-...',
+        keyUrl: 'https://platform.claude.com/settings/keys', keySite: 'Claude Console'
+      });
+      const effortWrap = el('div');
+      effortWrap.append(Form.label('推論の深さ (effort)'));
+      effortWrap.append(Form.select([
+        { value: '', label: 'モデルの既定' },
+        { value: 'low', label: 'low (速い・低コスト)' },
+        { value: 'medium', label: 'medium' },
+        { value: 'high', label: 'high' },
+        { value: 'xhigh', label: 'xhigh' },
+        { value: 'max', label: 'max (最も深い・高コスト)' }
+      ], Store.settings.claudeEffort || '', (v) => { Store.settings.claudeEffort = v; Store.saveSettings(); }));
+      effortWrap.append(el('p', { class: 'text-[11px] text-zinc-500 mt-1' },
+        'Claude がどれだけ深く考えてから答えるか。高いほど難しい課題の精度が上がる一方、応答が遅く・高コストになります。モデルが対応していない段階は近い段階に自動で調整されます。Gemini には適用されません。'));
+      claudeBlock.append(effortWrap);
+      box.append(claudeBlock);
 
       renderAdded();
-      renderAvailable();
 
       return box;
     },
@@ -5546,7 +6447,7 @@ textarea { resize: none; }
     sectionAbout() {
       const box = el('section', { class: 'space-y-1' });
       box.append(Form.sectionTitle('情報'));
-      box.append(el('p', { class: 'text-xs text-zinc-500' }, 'AI Chat Overlay v0.1.0 · Tailwind CSS · Gemini API · Google Drive'));
+      box.append(el('p', { class: 'text-xs text-zinc-500' }, 'AI Chat Overlay v0.1.0 · Tailwind CSS · Gemini API · Claude API · Google Drive'));
       return box;
     }
   };
