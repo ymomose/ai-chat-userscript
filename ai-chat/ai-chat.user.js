@@ -2,9 +2,9 @@
 // @name         AI Chat Overlay
 // @name:ja      AI チャット オーバーレイ
 // @namespace    https://github.com/ym/userscripts/ai-chat
-// @version      1.4.0
-// @description  Floating AI chat (Gemini / Claude) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode. Optimized for iOS Safari.
-// @description:ja Webページの内容を文脈として Gemini / Claude と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
+// @version      2.0.0
+// @description  Floating AI chat (Gemini / Claude) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode with secret-Gist publishing. Optimized for iOS Safari.
+// @description:ja Webページの内容を文脈として Gemini / Claude と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。作ったスクリプトはシークレット Gist に公開して URL からインストール・自動更新できる。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
 // @author       ym
 // @match        *://*/*
 // @run-at       document-idle
@@ -22,6 +22,7 @@
 // @grant        GM.xmlHttpRequest
 // @connect      generativelanguage.googleapis.com
 // @connect      api.anthropic.com
+// @connect      api.github.com
 // @connect      www.googleapis.com
 // @connect      oauth2.googleapis.com
 // @connect      cdn.jsdelivr.net
@@ -75,6 +76,31 @@
         if (typeof GM_deleteValue === 'function') return GM_deleteValue(key);
       } catch {}
       try { localStorage.removeItem(KV_PREFIX + key); } catch {}
+    }
+  };
+
+  // Credential storage. Same GM backends as KV but with NO localStorage
+  // fallback: localStorage belongs to the page's origin, so a credential
+  // written there would be readable by every script the page runs. When the
+  // manager offers no GM storage, features that need a credential are simply
+  // unavailable (`available()` is false) and writes throw.
+  const SecretKV = {
+    available() { return hasGM || hasGMlegacy; },
+    async get(key, def) {
+      try {
+        if (hasGM) return await GM.getValue(key, def);
+        if (hasGMlegacy) return GM_getValue(key, def);
+      } catch { /* treated as unset */ }
+      return def;
+    },
+    async set(key, val) {
+      if (hasGM) return GM.setValue(key, val);
+      if (hasGMlegacy) return GM_setValue(key, val);
+      throw new Error('この環境では GM ストレージが使えないため、認証情報を保存できません。');
+    },
+    async del(key) {
+      if (hasGM) return GM.deleteValue(key);
+      if (typeof GM_deleteValue === 'function') return GM_deleteValue(key);
     }
   };
 
@@ -188,6 +214,19 @@
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
   };
   const getDomain = () => location.hostname || 'unknown';
+  // The installed version (this file's @version) as the userscript manager
+  // reports it — Tampermonkey / Violentmonkey expose GM_info, Greasemonkey 4
+  // and the iOS Userscripts app GM.info. Null when neither is available, so
+  // callers omit the version rather than show a made-up one.
+  const scriptVersion = () => {
+    try {
+      const info = (typeof GM_info !== 'undefined' && GM_info)
+        || (typeof GM !== 'undefined' && GM && GM.info)
+        || null;
+      const v = info && info.script && info.script.version;
+      return v ? String(v) : null;
+    } catch { return null; }
+  };
   const el = (tag, props = {}, children = []) => {
     const n = document.createElement(tag);
     for (const [k, v] of Object.entries(props)) {
@@ -280,7 +319,34 @@
     // session, to keep the userscript manager's storage from growing without
     // bound (UserScript-mode transcripts embed page HTML and whole scripts, so
     // they are far from small). 0 or negative disables the sweep entirely.
-    historyRetentionDays: 30
+    historyRetentionDays: 30,
+    // Userscripts published to secret Gists, keyed by GistPublish.keyOf()
+    // (`@namespace` + `@name`, the identity Tampermonkey itself uses). Each
+    // entry remembers which Gist and file a script lives in, so republishing
+    // the same script updates that Gist in place and the install URL — which
+    // installed copies poll through @updateURL — never changes. Kept in
+    // settings so it rides along with the Drive backup; the GitHub token does
+    // not (it lives in SecretKV).
+    gistPublished: {},
+    // Agents API (Claude Managed Agents). When on, new UserScript-mode chats
+    // run as a Managed Agents session: Anthropic runs the agent loop and a
+    // cloud sandbox (bash, files, Playwright) while the page-inspection tools
+    // still execute here, in the user's tab. See AgentsMode.
+    agentsEnabled: false,
+    agentsModel: 'claude-opus-5-5',
+    agentsEffort: 'high',
+    // Per-session spend cap. The API only takes USD, so the yen amount is
+    // converted with the user's rate (AgentsMode.budgetCents).
+    agentsBudgetJpy: 1000,
+    agentsJpyPerUsd: 150,
+    // 'auto' (SSE with a polling watchdog), 'stream' or 'poll'.
+    agentsTransport: 'auto',
+    // Created on first use and reused. Bound to the API key's workspace, so a
+    // key from another workspace answers 404 and they are created afresh.
+    agentsAgentId: '',
+    agentsAgentVersion: 0,
+    agentsAgentHash: '',
+    agentsEnvironmentId: ''
   };
 
   const Store = {
@@ -330,6 +396,7 @@
     },
     removeConversation(host, id) {
       const d = this.getDomain(host);
+      AgentsMode.forget(d.conversations.filter((c) => c.id === id));
       d.conversations = d.conversations.filter((c) => c.id !== id);
     },
     // True when a domain carries no conversations, no templates, no system-
@@ -370,14 +437,17 @@
         const d = this.domains[host];
         if (!d || !Array.isArray(d.conversations)) continue;
         const before = d.conversations.length;
+        const dropped = [];
         d.conversations = d.conversations.filter((c) => {
           if (keep.has(c.id)) return true;
           const ts = Number(c.updatedAt || c.createdAt) || 0;
           // A conversation with no usable timestamp is kept: deleting on a
           // parse failure is the wrong side to err on.
-          if (!ts) return true;
-          return ts >= cutoff;
+          if (!ts || ts >= cutoff) return true;
+          dropped.push(c);
+          return false;
         });
+        AgentsMode.forget(dropped);
         removed += before - d.conversations.length;
       }
       if (removed) this.pruneEmptyDomains();
@@ -1587,6 +1657,100 @@
   };
 
   // =========================================================================
+  // 4d. Claude Managed Agents (Agents API) client
+  // =========================================================================
+  // Raw HTTP for the same reasons as the Claude client above. Unlike the
+  // Messages API, these endpoints do not answer CORS preflights (OPTIONS gets
+  // a 405), so a page-origin fetch can never reach them: every request goes
+  // through GM_xmlhttpRequest, and without it the mode is unavailable.
+  const AGENTS_BETA = 'managed-agents-2026-04-01';
+  // Models offered for Agents sessions (all supported by Managed Agents).
+  // Claude models the user added in Settings are listed too.
+  const AGENTS_MODELS = [
+    { id: 'claude-opus-5-5', display: 'Claude Opus 5.5' },
+    { id: 'claude-sonnet-5-5', display: 'Claude Sonnet 5.5' },
+    { id: 'claude-haiku-5-5', display: 'Claude Haiku 5.5' },
+    { id: 'claude-fable-5-2', display: 'Claude Fable 5.2' }
+  ];
+
+  const AgentsAPI = {
+    available() { return !!_gmXhr; },
+
+    headers(extra) {
+      return Object.assign({
+        'content-type': 'application/json',
+        'x-api-key': Store.settings.anthropicApiKey || '',
+        'anthropic-version': CLAUDE_API_VERSION,
+        'anthropic-beta': AGENTS_BETA
+      }, extra || {});
+    },
+
+    async request(method, path, body, { signal, retries = method === 'GET' ? 2 : 0 } = {}) {
+      if (!this.available()) throw new Error('この環境では GM_xmlhttpRequest が使えないため、Agents API を利用できません。');
+      if (!Store.settings.anthropicApiKey) throw new Error('Claude API キーが未設定です。設定 → 一般 で登録してください。');
+      for (let attempt = 0; ; attempt++) {
+        const r = await gmRequest({
+          method, url: CLAUDE_API_BASE + path, headers: this.headers(),
+          body: body === undefined ? undefined : JSON.stringify(body), signal
+        });
+        if (r.status >= 200 && r.status < 300) {
+          try { return r.responseText ? JSON.parse(r.responseText) : null; } catch { return null; }
+        }
+        const err = Claude.httpError(r.status, r.responseText || r.statusText);
+        err.message = err.message.replace(/^Claude request failed/, 'Agents API エラー');
+        // Only idempotent reads are retried; resending a user.message twice
+        // would queue it twice.
+        if ((r.status === 429 || err.retryable) && attempt < retries) {
+          await new Promise((res) => setTimeout(res, 1000 * (attempt + 1)));
+          continue;
+        }
+        throw err;
+      }
+    },
+
+    createEnvironment(body) { return this.request('POST', '/environments', body); },
+    createAgent(body) { return this.request('POST', '/agents', body); },
+    // `version` omitted: the update applies unconditionally (this app is the
+    // only writer of its agent).
+    updateAgent(id, body) { return this.request('POST', `/agents/${encodeURIComponent(id)}`, body); },
+    createSession(body) { return this.request('POST', '/sessions', body); },
+    getSession(id) { return this.request('GET', `/sessions/${encodeURIComponent(id)}`); },
+    updateSession(id, body) { return this.request('POST', `/sessions/${encodeURIComponent(id)}`, body); },
+    deleteSession(id) { return this.request('DELETE', `/sessions/${encodeURIComponent(id)}`); },
+    sendEvents(id, events, opts) { return this.request('POST', `/sessions/${encodeURIComponent(id)}/events`, { events }, opts); },
+
+    // Persisted events at or after `since` (an event `processed_at`), oldest
+    // first. `since` is inclusive because timestamps are compared at a
+    // coarser precision than they are stored with; callers dedupe by id.
+    async listEvents(id, since, signal) {
+      const out = [];
+      let page = '';
+      for (let i = 0; i < 20; i++) {
+        const q = ['limit=1000', 'order=asc'];
+        if (since) q.push(`created_at%5Bgte%5D=${encodeURIComponent(since)}`);
+        if (page) q.push(`page=${encodeURIComponent(page)}`);
+        const data = await this.request('GET', `/sessions/${encodeURIComponent(id)}/events?${q.join('&')}`, undefined, { signal });
+        for (const ev of (data && data.data) || []) out.push(ev);
+        if (!data || !data.next_page) break;
+        page = data.next_page;
+      }
+      return out;
+    },
+
+    // Opens the SSE stream (the request is sent as soon as the iterator is
+    // created) with live previews of agent.message text.
+    openStream(id, signal) {
+      return gmStream({
+        method: 'GET',
+        url: `${CLAUDE_API_BASE}/sessions/${encodeURIComponent(id)}/events/stream?event_deltas%5B%5D=agent.message`,
+        headers: this.headers({ accept: 'text/event-stream' }),
+        signal,
+        makeError: (status, text) => Claude.httpError(status, text)
+      })[Symbol.asyncIterator]();
+    }
+  };
+
+  // =========================================================================
   // 5. Google Drive (OAuth2 Implicit flow + Drive v3)
   // =========================================================================
   const DRIVE_FILE_NAME = 'ai-chat-overlay-backup.json';
@@ -1696,6 +1860,95 @@
       Store.settings = Object.assign({}, DEFAULT_SETTINGS, data.settings, { driveToken, driveTokenExp, driveFileId });
       Store.domains = data.domains || {};
       await Store.saveAll();
+    }
+  };
+
+  // =========================================================================
+  // 5b. GitHub Gist client
+  // =========================================================================
+  // Publishes userscripts as secret Gists (see GistPublish). Requests go
+  // through GM_xmlhttpRequest only: they carry the user's token, and routing
+  // them through the page's fetch would expose it to the page's own request
+  // hooks. The token is a fine-grained PAT with the account permission
+  // "Gists: Read and write" (or a classic token with the `gist` scope) and is
+  // stored in SecretKV, never in Store.settings, so it is neither written to
+  // localStorage nor included in the Drive backup.
+  const GITHUB_API = 'https://api.github.com';
+  const GITHUB_TOKEN_KEY = 'secret:githubToken';
+
+  const GitHub = {
+    _token: '',
+    _loaded: false,
+
+    async token() {
+      if (!this._loaded) {
+        this._token = String(await SecretKV.get(GITHUB_TOKEN_KEY, '') || '');
+        this._loaded = true;
+      }
+      return this._token;
+    },
+
+    async setToken(value) {
+      const v = String(value || '').trim();
+      if (v) await SecretKV.set(GITHUB_TOKEN_KEY, v);
+      else await SecretKV.del(GITHUB_TOKEN_KEY);
+      this._token = v;
+      this._loaded = true;
+    },
+
+    async request(method, path, body) {
+      const token = await this.token();
+      if (!token) throw new Error('GitHub トークンが未設定です。設定 → GitHub で登録してください。');
+      const headers = {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${token}`,
+        'X-GitHub-Api-Version': '2022-11-28'
+      };
+      if (body !== undefined) headers['Content-Type'] = 'application/json';
+      const r = await gmRequest({ method, url: GITHUB_API + path, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+      let data = null;
+      try { data = r.responseText ? JSON.parse(r.responseText) : null; } catch { /* non-JSON body */ }
+      if (r.status < 200 || r.status >= 300) throw this.httpError(r.status, data, r.responseText);
+      return data;
+    },
+
+    httpError(status, data, text) {
+      const detail = (data && data.message) || (text || '').slice(0, 200);
+      let msg;
+      if (status === 401) msg = 'GitHub トークンが無効か期限切れです。設定 → GitHub で登録し直してください。';
+      else if (status === 403) msg = 'GitHub に拒否されました。トークンに Gists の Read and write 権限があるか確認してください (レート制限の可能性もあります)。';
+      else if (status === 404) msg = '対象の Gist が見つかりません (削除された可能性があります)。';
+      else if (status === 422) msg = 'GitHub が送信内容を受け付けませんでした。';
+      else msg = `GitHub API エラー (${status})。`;
+      const err = new Error(detail ? `${msg} [${detail}]` : msg);
+      err.status = status;
+      return err;
+    },
+
+    getUser() { return this.request('GET', '/user'); },
+    listGists() { return this.request('GET', '/gists?per_page=1'); },
+
+    createGist({ description, filename, content }) {
+      return this.request('POST', '/gists', {
+        description: description || '',
+        public: false,
+        files: { [filename]: { content } }
+      });
+    },
+
+    updateGist(id, { description, filename, content }) {
+      const body = { files: { [filename]: { content } } };
+      if (description != null) body.description = description;
+      return this.request('PATCH', `/gists/${encodeURIComponent(id)}`, body);
+    },
+
+    deleteGist(id) { return this.request('DELETE', `/gists/${encodeURIComponent(id)}`); },
+
+    // The revision-less raw URL always serves the Gist's latest revision, which
+    // is what @updateURL needs. GitHub's CDN may serve the previous revision
+    // for a few minutes after an update.
+    rawUrl(owner, id, filename) {
+      return `https://gist.githubusercontent.com/${encodeURIComponent(owner)}/${encodeURIComponent(id)}/raw/${encodeURIComponent(filename)}`;
     }
   };
 
@@ -2241,7 +2494,7 @@
   //    precompiled path above.
   // ------------------------------------------------------------------------
   /* @TAILWIND_CSS_START */
-  const TAILWIND_CSS = `.\\!container{width:100%!important}.container{width:100%}@media (min-width:640px){.\\!container{max-width:640px!important}.container{max-width:640px}}@media (min-width:768px){.\\!container{max-width:768px!important}.container{max-width:768px}}@media (min-width:1024px){.\\!container{max-width:1024px!important}.container{max-width:1024px}}@media (min-width:1280px){.\\!container{max-width:1280px!important}.container{max-width:1280px}}@media (min-width:1536px){.\\!container{max-width:1536px!important}.container{max-width:1536px}}.pointer-events-none{pointer-events:none}.pointer-events-auto{pointer-events:auto}.\\!visible{visibility:visible!important}.visible{visibility:visible}.invisible{visibility:hidden}.fixed{position:fixed}.absolute{position:absolute}.relative{position:relative}.inset-0{inset:0}.bottom-4{bottom:1em}.bottom-full{bottom:100%}.left-0{left:0}.left-1{left:.25em}.left-1\\/2{left:50%}.z-20{z-index:20}.mx-3{margin-left:.75em;margin-right:.75em}.my-1{margin-top:.25em;margin-bottom:.25em}.my-2{margin-top:.5em;margin-bottom:.5em}.my-3{margin-top:.75em;margin-bottom:.75em}.mb-1{margin-bottom:.25em}.mb-2{margin-bottom:.5em}.mb-3{margin-bottom:.75em}.ml-5{margin-left:1.25em}.mr-1{margin-right:.25em}.mr-2{margin-right:.5em}.mt-0{margin-top:0}.mt-0\\.5{margin-top:.125em}.mt-1{margin-top:.25em}.mt-1\\.5{margin-top:.375em}.mt-2{margin-top:.5em}.mt-3{margin-top:.75em}.mt-4{margin-top:1em}.line-clamp-2{-webkit-line-clamp:2}.line-clamp-2,.line-clamp-3{overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical}.line-clamp-3{-webkit-line-clamp:3}.\\!block{display:block!important}.block{display:block}.inline-block{display:inline-block}.inline{display:inline}.flex{display:flex}.inline-flex{display:inline-flex}.table{display:table}.grid{display:grid}.contents{display:contents}.hidden{display:none}.h-1{height:.25em}.h-10{height:2.5em}.h-3{height:.75em}.h-3\\.5{height:.875em}.h-4{height:1em}.h-5{height:1.25em}.h-6{height:1.5em}.h-64{height:16em}.h-7{height:1.75em}.h-8{height:2em}.h-9{height:2.25em}.h-auto{height:auto}.max-h-40{max-height:10em}.max-h-64{max-height:16em}.max-h-80{max-height:20em}.max-h-\\[160px\\]{max-height:160px}.max-h-\\[85dvh\\]{max-height:85dvh}.min-h-\\[40px\\]{min-height:40px}.w-10{width:2.5em}.w-24{width:6em}.w-3{width:.75em}.w-3\\.5{width:.875em}.w-4{width:1em}.w-5{width:1.25em}.w-6{width:1.5em}.w-7{width:1.75em}.w-72{width:18em}.w-8{width:2em}.w-9{width:2.25em}.w-full{width:100%}.min-w-0{min-width:0}.min-w-\\[220px\\]{min-width:220px}.min-w-\\[80px\\]{min-width:80px}.max-w-2xl{max-width:42em}.max-w-\\[160px\\]{max-width:160px}.max-w-\\[200px\\]{max-width:200px}.max-w-\\[85\\%\\]{max-width:85%}.max-w-\\[90\\%\\]{max-width:90%}.max-w-full{max-width:100%}.max-w-sm{max-width:24em}.max-w-xl{max-width:36em}.flex-1{flex:1 1 0%}.flex-shrink,.shrink{flex-shrink:1}.shrink-0{flex-shrink:0}.border-collapse{border-collapse:collapse}.-translate-x-1{--tw-translate-x:-0.25em}.-translate-x-1,.-translate-x-1\\/2{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.-translate-x-1\\/2{--tw-translate-x:-50%}.transform{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.cursor-pointer{cursor:pointer}.select-none{-webkit-user-select:none;-moz-user-select:none;user-select:none}.resize{resize:both}.list-decimal{list-style-type:decimal}.list-disc{list-style-type:disc}.grid-cols-6{grid-template-columns:repeat(6,minmax(0,1fr))}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.items-start{align-items:flex-start}.items-end{align-items:flex-end}.items-center{align-items:center}.justify-start{justify-content:flex-start}.justify-end{justify-content:flex-end}.justify-center{justify-content:center}.gap-1{gap:.25em}.gap-2{gap:.5em}.gap-3{gap:.75em}.space-y-1>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.25em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.25em*var(--tw-space-y-reverse))}.space-y-2>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.5em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.5em*var(--tw-space-y-reverse))}.space-y-3>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.75em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.75em*var(--tw-space-y-reverse))}.space-y-6>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(1.5em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(1.5em*var(--tw-space-y-reverse))}.divide-y>:not([hidden])~:not([hidden]){--tw-divide-y-reverse:0;border-top-width:calc(1px*(1 - var(--tw-divide-y-reverse)));border-bottom-width:calc(1px*var(--tw-divide-y-reverse))}.divide-zinc-100>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(244 244 245/var(--tw-divide-opacity,1))}.overflow-auto{overflow:auto}.overflow-hidden{overflow:hidden}.overflow-x-auto{overflow-x:auto}.overflow-y-auto{overflow-y:auto}.truncate{overflow:hidden;text-overflow:ellipsis}.truncate,.whitespace-nowrap{white-space:nowrap}.whitespace-pre-wrap{white-space:pre-wrap}.break-words{overflow-wrap:break-word}.break-all{word-break:break-all}.rounded{border-radius:.25em}.rounded-2xl{border-radius:1em}.rounded-full{border-radius:9999px}.rounded-lg{border-radius:.5em}.rounded-md{border-radius:.375em}.rounded-xl{border-radius:.75em}.rounded-r-lg{border-top-right-radius:.5em;border-bottom-right-radius:.5em}.rounded-t-2xl{border-top-left-radius:1em;border-top-right-radius:1em}.border{border-width:1px}.border-b{border-bottom-width:1px}.border-b-2{border-bottom-width:2px}.border-l-4{border-left-width:4px}.border-t{border-top-width:1px}.border-dashed{border-style:dashed}.border-indigo-200{--tw-border-opacity:1;border-color:rgb(199 210 254/var(--tw-border-opacity,1))}.border-indigo-500{--tw-border-opacity:1;border-color:rgb(99 102 241/var(--tw-border-opacity,1))}.border-indigo-600{--tw-border-opacity:1;border-color:rgb(79 70 229/var(--tw-border-opacity,1))}.border-transparent{border-color:transparent}.border-zinc-100{--tw-border-opacity:1;border-color:rgb(244 244 245/var(--tw-border-opacity,1))}.border-zinc-200{--tw-border-opacity:1;border-color:rgb(228 228 231/var(--tw-border-opacity,1))}.border-zinc-300{--tw-border-opacity:1;border-color:rgb(212 212 216/var(--tw-border-opacity,1))}.bg-black{--tw-bg-opacity:1;background-color:rgb(0 0 0/var(--tw-bg-opacity,1))}.bg-black\\/30{background-color:rgba(0,0,0,.3)}.bg-black\\/40{background-color:rgba(0,0,0,.4)}.bg-emerald-600{--tw-bg-opacity:1;background-color:rgb(5 150 105/var(--tw-bg-opacity,1))}.bg-indigo-100{--tw-bg-opacity:1;background-color:rgb(224 231 255/var(--tw-bg-opacity,1))}.bg-indigo-50{--tw-bg-opacity:1;background-color:rgb(238 242 255/var(--tw-bg-opacity,1))}.bg-indigo-600{--tw-bg-opacity:1;background-color:rgb(79 70 229/var(--tw-bg-opacity,1))}.bg-indigo-900{--tw-bg-opacity:1;background-color:rgb(49 46 129/var(--tw-bg-opacity,1))}.bg-red-50{--tw-bg-opacity:1;background-color:rgb(254 242 242/var(--tw-bg-opacity,1))}.bg-red-600{--tw-bg-opacity:1;background-color:rgb(220 38 38/var(--tw-bg-opacity,1))}.bg-red-900{--tw-bg-opacity:1;background-color:rgb(127 29 29/var(--tw-bg-opacity,1))}.bg-transparent{background-color:transparent}.bg-white{--tw-bg-opacity:1;background-color:rgb(255 255 255/var(--tw-bg-opacity,1))}.bg-zinc-100{--tw-bg-opacity:1;background-color:rgb(244 244 245/var(--tw-bg-opacity,1))}.bg-zinc-200{--tw-bg-opacity:1;background-color:rgb(228 228 231/var(--tw-bg-opacity,1))}.bg-zinc-300{--tw-bg-opacity:1;background-color:rgb(212 212 216/var(--tw-bg-opacity,1))}.bg-zinc-50{--tw-bg-opacity:1;background-color:rgb(250 250 250/var(--tw-bg-opacity,1))}.bg-zinc-700{--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.bg-zinc-800{--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.bg-zinc-900{--tw-bg-opacity:1;background-color:rgb(24 24 27/var(--tw-bg-opacity,1))}.object-cover{-o-object-fit:cover;object-fit:cover}.p-0{padding:0}.p-1{padding:.25em}.p-2{padding:.5em}.p-3{padding:.75em}.p-4{padding:1em}.p-8{padding:2em}.px-1{padding-left:.25em;padding-right:.25em}.px-1\\.5{padding-left:.375em;padding-right:.375em}.px-2{padding-left:.5em;padding-right:.5em}.px-3{padding-left:.75em;padding-right:.75em}.px-4{padding-left:1em;padding-right:1em}.py-0{padding-top:0;padding-bottom:0}.py-0\\.5{padding-top:.125em;padding-bottom:.125em}.py-1{padding-top:.25em;padding-bottom:.25em}.py-1\\.5{padding-top:.375em;padding-bottom:.375em}.py-2{padding-top:.5em;padding-bottom:.5em}.py-2\\.5{padding-top:.625em;padding-bottom:.625em}.py-3{padding-top:.75em;padding-bottom:.75em}.py-8{padding-top:2em;padding-bottom:2em}.pb-1{padding-bottom:.25em}.pb-2{padding-bottom:.5em}.pb-3{padding-bottom:.75em}.pl-3{padding-left:.75em}.pt-0{padding-top:0}.pt-0\\.5{padding-top:.125em}.pt-1{padding-top:.25em}.pt-2{padding-top:.5em}.pt-3{padding-top:.75em}.pt-4{padding-top:1em}.text-left{text-align:left}.text-center{text-align:center}.align-top{vertical-align:top}.font-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.text-\\[0\\.85em\\]{font-size:.85em}.text-\\[10px\\]{font-size:10px}.text-\\[11px\\]{font-size:11px}.text-base{font-size:16px;line-height:24px}.text-lg{font-size:18px;line-height:28px}.text-sm{font-size:14px;line-height:20px}.text-xl{font-size:20px;line-height:28px}.text-xs{font-size:12px;line-height:16px}.font-bold{font-weight:700}.font-medium{font-weight:500}.font-semibold{font-weight:600}.uppercase{text-transform:uppercase}.italic{font-style:italic}.leading-none{line-height:1}.leading-relaxed{line-height:1.625}.tracking-wide{letter-spacing:.025em}.tracking-wider{letter-spacing:.05em}.text-blue-600{--tw-text-opacity:1;color:rgb(37 99 235/var(--tw-text-opacity,1))}.text-emerald-600{--tw-text-opacity:1;color:rgb(5 150 105/var(--tw-text-opacity,1))}.text-indigo-600{--tw-text-opacity:1;color:rgb(79 70 229/var(--tw-text-opacity,1))}.text-indigo-700{--tw-text-opacity:1;color:rgb(67 56 202/var(--tw-text-opacity,1))}.text-inherit{color:inherit}.text-red-700{--tw-text-opacity:1;color:rgb(185 28 28/var(--tw-text-opacity,1))}.text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.text-zinc-100{--tw-text-opacity:1;color:rgb(244 244 245/var(--tw-text-opacity,1))}.text-zinc-400{--tw-text-opacity:1;color:rgb(161 161 170/var(--tw-text-opacity,1))}.text-zinc-500{--tw-text-opacity:1;color:rgb(113 113 122/var(--tw-text-opacity,1))}.text-zinc-600{--tw-text-opacity:1;color:rgb(82 82 91/var(--tw-text-opacity,1))}.text-zinc-700{--tw-text-opacity:1;color:rgb(63 63 70/var(--tw-text-opacity,1))}.text-zinc-800{--tw-text-opacity:1;color:rgb(39 39 42/var(--tw-text-opacity,1))}.text-zinc-900{--tw-text-opacity:1;color:rgb(24 24 27/var(--tw-text-opacity,1))}.underline{text-decoration-line:underline}.antialiased{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}.opacity-80{opacity:.8}.shadow{--tw-shadow:0 1px 3px 0 rgba(0,0,0,.1),0 1px 2px -1px rgba(0,0,0,.1);--tw-shadow-colored:0 1px 3px 0 var(--tw-shadow-color),0 1px 2px -1px var(--tw-shadow-color)}.shadow,.shadow-2xl{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-2xl{--tw-shadow:0 25px 50px -12px rgba(0,0,0,.25);--tw-shadow-colored:0 25px 50px -12px var(--tw-shadow-color)}.shadow-lg{--tw-shadow:0 10px 15px -3px rgba(0,0,0,.1),0 4px 6px -4px rgba(0,0,0,.1);--tw-shadow-colored:0 10px 15px -3px var(--tw-shadow-color),0 4px 6px -4px var(--tw-shadow-color)}.shadow-lg,.shadow-xl{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-xl{--tw-shadow:0 20px 25px -5px rgba(0,0,0,.1),0 8px 10px -6px rgba(0,0,0,.1);--tw-shadow-colored:0 20px 25px -5px var(--tw-shadow-color),0 8px 10px -6px var(--tw-shadow-color)}.outline{outline-style:solid}.ring{--tw-ring-offset-shadow:var(--tw-ring-inset) 0 0 0 var(--tw-ring-offset-width) var(--tw-ring-offset-color);--tw-ring-shadow:var(--tw-ring-inset) 0 0 0 calc(3px + var(--tw-ring-offset-width)) var(--tw-ring-color);box-shadow:var(--tw-ring-offset-shadow),var(--tw-ring-shadow),var(--tw-shadow,0 0 #0000)}.blur{--tw-blur:blur(8px)}.blur,.filter{filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.transition{transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,-webkit-backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter,-webkit-backdrop-filter;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.ease-out{transition-timing-function:cubic-bezier(0,0,.2,1)}.empty\\:hidden:empty{display:none}.hover\\:bg-indigo-50:hover{--tw-bg-opacity:1;background-color:rgb(238 242 255/var(--tw-bg-opacity,1))}.hover\\:bg-red-50:hover{--tw-bg-opacity:1;background-color:rgb(254 242 242/var(--tw-bg-opacity,1))}.hover\\:bg-zinc-100:hover{--tw-bg-opacity:1;background-color:rgb(244 244 245/var(--tw-bg-opacity,1))}.hover\\:bg-zinc-50:hover{--tw-bg-opacity:1;background-color:rgb(250 250 250/var(--tw-bg-opacity,1))}.hover\\:text-red-500:hover{--tw-text-opacity:1;color:rgb(239 68 68/var(--tw-text-opacity,1))}.hover\\:text-red-600:hover{--tw-text-opacity:1;color:rgb(220 38 38/var(--tw-text-opacity,1))}.hover\\:text-zinc-600:hover{--tw-text-opacity:1;color:rgb(82 82 91/var(--tw-text-opacity,1))}.hover\\:text-zinc-700:hover{--tw-text-opacity:1;color:rgb(63 63 70/var(--tw-text-opacity,1))}.hover\\:underline:hover{text-decoration-line:underline}.disabled\\:opacity-50:disabled{opacity:.5}.dark\\:divide-zinc-800:is(.dark *)>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(39 39 42/var(--tw-divide-opacity,1))}.dark\\:border-indigo-800:is(.dark *){--tw-border-opacity:1;border-color:rgb(55 48 163/var(--tw-border-opacity,1))}.dark\\:border-zinc-600:is(.dark *){--tw-border-opacity:1;border-color:rgb(82 82 91/var(--tw-border-opacity,1))}.dark\\:border-zinc-700:is(.dark *){--tw-border-opacity:1;border-color:rgb(63 63 70/var(--tw-border-opacity,1))}.dark\\:border-zinc-800:is(.dark *){--tw-border-opacity:1;border-color:rgb(39 39 42/var(--tw-border-opacity,1))}.dark\\:bg-indigo-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(49 46 129/var(--tw-bg-opacity,1))}.dark\\:bg-indigo-900\\/30:is(.dark *){background-color:rgba(49,46,129,.3)}.dark\\:bg-indigo-900\\/40:is(.dark *){background-color:rgba(49,46,129,.4)}.dark\\:bg-red-900\\/30:is(.dark *){background-color:rgba(127,29,29,.3)}.dark\\:bg-zinc-600:is(.dark *){--tw-bg-opacity:1;background-color:rgb(82 82 91/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-700:is(.dark *){--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-800:is(.dark *){--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-800\\/50:is(.dark *){background-color:rgba(39,39,42,.5)}.dark\\:bg-zinc-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(24 24 27/var(--tw-bg-opacity,1))}.dark\\:text-blue-400:is(.dark *){--tw-text-opacity:1;color:rgb(96 165 250/var(--tw-text-opacity,1))}.dark\\:text-indigo-200:is(.dark *){--tw-text-opacity:1;color:rgb(199 210 254/var(--tw-text-opacity,1))}.dark\\:text-indigo-300:is(.dark *){--tw-text-opacity:1;color:rgb(165 180 252/var(--tw-text-opacity,1))}.dark\\:text-indigo-400:is(.dark *){--tw-text-opacity:1;color:rgb(129 140 248/var(--tw-text-opacity,1))}.dark\\:text-red-300:is(.dark *){--tw-text-opacity:1;color:rgb(252 165 165/var(--tw-text-opacity,1))}.dark\\:text-zinc-100:is(.dark *){--tw-text-opacity:1;color:rgb(244 244 245/var(--tw-text-opacity,1))}.dark\\:text-zinc-200:is(.dark *){--tw-text-opacity:1;color:rgb(228 228 231/var(--tw-text-opacity,1))}.dark\\:text-zinc-300:is(.dark *){--tw-text-opacity:1;color:rgb(212 212 216/var(--tw-text-opacity,1))}.dark\\:text-zinc-400:is(.dark *){--tw-text-opacity:1;color:rgb(161 161 170/var(--tw-text-opacity,1))}.dark\\:text-zinc-500:is(.dark *){--tw-text-opacity:1;color:rgb(113 113 122/var(--tw-text-opacity,1))}.dark\\:hover\\:bg-indigo-900\\/40:hover:is(.dark *){background-color:rgba(49,46,129,.4)}.dark\\:hover\\:bg-red-900\\/30:hover:is(.dark *){background-color:rgba(127,29,29,.3)}.dark\\:hover\\:bg-zinc-700:hover:is(.dark *){--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.dark\\:hover\\:bg-zinc-800:hover:is(.dark *){--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.dark\\:hover\\:bg-zinc-800\\/50:hover:is(.dark *){background-color:rgba(39,39,42,.5)}.dark\\:hover\\:bg-zinc-800\\/60:hover:is(.dark *){background-color:rgba(39,39,42,.6)}.dark\\:hover\\:text-zinc-200:hover:is(.dark *){--tw-text-opacity:1;color:rgb(228 228 231/var(--tw-text-opacity,1))}@media (min-width:640px){.sm\\:mx-auto{margin-left:auto;margin-right:auto}.sm\\:my-4{margin-top:1em}.sm\\:mb-4,.sm\\:my-4{margin-bottom:1em}.sm\\:h-\\[calc\\(100dvh-2em\\)\\]{height:calc(100dvh - 2em)}.sm\\:max-w-4xl{max-width:56em}.sm\\:max-w-5xl{max-width:64em}.sm\\:max-w-6xl{max-width:72em}.sm\\:items-stretch{align-items:stretch}.sm\\:rounded-2xl{border-radius:1em}}`;
+  const TAILWIND_CSS = `.\\!container{width:100%!important}.container{width:100%}@media (min-width:640px){.\\!container{max-width:640px!important}.container{max-width:640px}}@media (min-width:768px){.\\!container{max-width:768px!important}.container{max-width:768px}}@media (min-width:1024px){.\\!container{max-width:1024px!important}.container{max-width:1024px}}@media (min-width:1280px){.\\!container{max-width:1280px!important}.container{max-width:1280px}}@media (min-width:1536px){.\\!container{max-width:1536px!important}.container{max-width:1536px}}.pointer-events-none{pointer-events:none}.pointer-events-auto{pointer-events:auto}.\\!visible{visibility:visible!important}.visible{visibility:visible}.invisible{visibility:hidden}.fixed{position:fixed}.absolute{position:absolute}.relative{position:relative}.inset-0{inset:0}.bottom-4{bottom:1em}.bottom-full{bottom:100%}.left-0{left:0}.left-1{left:.25em}.left-1\\/2{left:50%}.z-20{z-index:20}.mx-3{margin-left:.75em;margin-right:.75em}.my-1{margin-top:.25em;margin-bottom:.25em}.my-2{margin-top:.5em;margin-bottom:.5em}.my-3{margin-top:.75em;margin-bottom:.75em}.mb-1{margin-bottom:.25em}.mb-2{margin-bottom:.5em}.mb-3{margin-bottom:.75em}.ml-5{margin-left:1.25em}.mr-1{margin-right:.25em}.mr-2{margin-right:.5em}.mt-0{margin-top:0}.mt-0\\.5{margin-top:.125em}.mt-1{margin-top:.25em}.mt-1\\.5{margin-top:.375em}.mt-2{margin-top:.5em}.mt-3{margin-top:.75em}.mt-4{margin-top:1em}.line-clamp-2{-webkit-line-clamp:2}.line-clamp-2,.line-clamp-3{overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical}.line-clamp-3{-webkit-line-clamp:3}.\\!block{display:block!important}.block{display:block}.inline-block{display:inline-block}.inline{display:inline}.flex{display:flex}.inline-flex{display:inline-flex}.table{display:table}.grid{display:grid}.contents{display:contents}.hidden{display:none}.h-1{height:.25em}.h-10{height:2.5em}.h-3{height:.75em}.h-3\\.5{height:.875em}.h-4{height:1em}.h-5{height:1.25em}.h-6{height:1.5em}.h-64{height:16em}.h-7{height:1.75em}.h-8{height:2em}.h-9{height:2.25em}.h-auto{height:auto}.max-h-40{max-height:10em}.max-h-64{max-height:16em}.max-h-80{max-height:20em}.max-h-\\[160px\\]{max-height:160px}.max-h-\\[85dvh\\]{max-height:85dvh}.min-h-\\[40px\\]{min-height:40px}.w-10{width:2.5em}.w-24{width:6em}.w-3{width:.75em}.w-3\\.5{width:.875em}.w-4{width:1em}.w-5{width:1.25em}.w-6{width:1.5em}.w-7{width:1.75em}.w-72{width:18em}.w-8{width:2em}.w-9{width:2.25em}.w-full{width:100%}.min-w-0{min-width:0}.min-w-\\[220px\\]{min-width:220px}.min-w-\\[80px\\]{min-width:80px}.max-w-2xl{max-width:42em}.max-w-\\[160px\\]{max-width:160px}.max-w-\\[200px\\]{max-width:200px}.max-w-\\[85\\%\\]{max-width:85%}.max-w-\\[90\\%\\]{max-width:90%}.max-w-full{max-width:100%}.max-w-sm{max-width:24em}.max-w-xl{max-width:36em}.flex-1{flex:1 1 0%}.flex-shrink,.shrink{flex-shrink:1}.shrink-0{flex-shrink:0}.border-collapse{border-collapse:collapse}.-translate-x-1{--tw-translate-x:-0.25em}.-translate-x-1,.-translate-x-1\\/2{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.-translate-x-1\\/2{--tw-translate-x:-50%}.transform{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.cursor-pointer{cursor:pointer}.select-none{-webkit-user-select:none;-moz-user-select:none;user-select:none}.select-all{-webkit-user-select:all;-moz-user-select:all;user-select:all}.resize{resize:both}.list-decimal{list-style-type:decimal}.list-disc{list-style-type:disc}.grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}.grid-cols-6{grid-template-columns:repeat(6,minmax(0,1fr))}.grid-cols-\\[auto_1fr\\]{grid-template-columns:auto 1fr}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.items-start{align-items:flex-start}.items-end{align-items:flex-end}.items-center{align-items:center}.justify-start{justify-content:flex-start}.justify-end{justify-content:flex-end}.justify-center{justify-content:center}.gap-1{gap:.25em}.gap-2{gap:.5em}.gap-3{gap:.75em}.gap-x-3{-moz-column-gap:.75em;column-gap:.75em}.gap-y-1{row-gap:.25em}.space-y-0>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(0px*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(0px*var(--tw-space-y-reverse))}.space-y-0\\.5>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.125em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.125em*var(--tw-space-y-reverse))}.space-y-1>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.25em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.25em*var(--tw-space-y-reverse))}.space-y-2>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.5em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.5em*var(--tw-space-y-reverse))}.space-y-3>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.75em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.75em*var(--tw-space-y-reverse))}.space-y-6>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(1.5em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(1.5em*var(--tw-space-y-reverse))}.divide-y>:not([hidden])~:not([hidden]){--tw-divide-y-reverse:0;border-top-width:calc(1px*(1 - var(--tw-divide-y-reverse)));border-bottom-width:calc(1px*var(--tw-divide-y-reverse))}.divide-zinc-100>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(244 244 245/var(--tw-divide-opacity,1))}.overflow-auto{overflow:auto}.overflow-hidden{overflow:hidden}.overflow-x-auto{overflow-x:auto}.overflow-y-auto{overflow-y:auto}.truncate{overflow:hidden;text-overflow:ellipsis}.truncate,.whitespace-nowrap{white-space:nowrap}.whitespace-pre-wrap{white-space:pre-wrap}.break-words{overflow-wrap:break-word}.break-all{word-break:break-all}.rounded{border-radius:.25em}.rounded-2xl{border-radius:1em}.rounded-full{border-radius:9999px}.rounded-lg{border-radius:.5em}.rounded-md{border-radius:.375em}.rounded-xl{border-radius:.75em}.rounded-r-lg{border-top-right-radius:.5em;border-bottom-right-radius:.5em}.rounded-t-2xl{border-top-left-radius:1em;border-top-right-radius:1em}.border{border-width:1px}.border-b{border-bottom-width:1px}.border-b-2{border-bottom-width:2px}.border-l-4{border-left-width:4px}.border-t{border-top-width:1px}.border-dashed{border-style:dashed}.border-indigo-200{--tw-border-opacity:1;border-color:rgb(199 210 254/var(--tw-border-opacity,1))}.border-indigo-500{--tw-border-opacity:1;border-color:rgb(99 102 241/var(--tw-border-opacity,1))}.border-indigo-600{--tw-border-opacity:1;border-color:rgb(79 70 229/var(--tw-border-opacity,1))}.border-transparent{border-color:transparent}.border-zinc-100{--tw-border-opacity:1;border-color:rgb(244 244 245/var(--tw-border-opacity,1))}.border-zinc-200{--tw-border-opacity:1;border-color:rgb(228 228 231/var(--tw-border-opacity,1))}.border-zinc-300{--tw-border-opacity:1;border-color:rgb(212 212 216/var(--tw-border-opacity,1))}.bg-amber-50{--tw-bg-opacity:1;background-color:rgb(255 251 235/var(--tw-bg-opacity,1))}.bg-amber-900{--tw-bg-opacity:1;background-color:rgb(120 53 15/var(--tw-bg-opacity,1))}.bg-black{--tw-bg-opacity:1;background-color:rgb(0 0 0/var(--tw-bg-opacity,1))}.bg-black\\/30{background-color:rgba(0,0,0,.3)}.bg-black\\/40{background-color:rgba(0,0,0,.4)}.bg-emerald-100{--tw-bg-opacity:1;background-color:rgb(209 250 229/var(--tw-bg-opacity,1))}.bg-emerald-600{--tw-bg-opacity:1;background-color:rgb(5 150 105/var(--tw-bg-opacity,1))}.bg-indigo-100{--tw-bg-opacity:1;background-color:rgb(224 231 255/var(--tw-bg-opacity,1))}.bg-indigo-50{--tw-bg-opacity:1;background-color:rgb(238 242 255/var(--tw-bg-opacity,1))}.bg-indigo-600{--tw-bg-opacity:1;background-color:rgb(79 70 229/var(--tw-bg-opacity,1))}.bg-indigo-900{--tw-bg-opacity:1;background-color:rgb(49 46 129/var(--tw-bg-opacity,1))}.bg-red-50{--tw-bg-opacity:1;background-color:rgb(254 242 242/var(--tw-bg-opacity,1))}.bg-red-600{--tw-bg-opacity:1;background-color:rgb(220 38 38/var(--tw-bg-opacity,1))}.bg-red-900{--tw-bg-opacity:1;background-color:rgb(127 29 29/var(--tw-bg-opacity,1))}.bg-transparent{background-color:transparent}.bg-white{--tw-bg-opacity:1;background-color:rgb(255 255 255/var(--tw-bg-opacity,1))}.bg-white\\/70{background-color:hsla(0,0%,100%,.7)}.bg-zinc-100{--tw-bg-opacity:1;background-color:rgb(244 244 245/var(--tw-bg-opacity,1))}.bg-zinc-200{--tw-bg-opacity:1;background-color:rgb(228 228 231/var(--tw-bg-opacity,1))}.bg-zinc-300{--tw-bg-opacity:1;background-color:rgb(212 212 216/var(--tw-bg-opacity,1))}.bg-zinc-50{--tw-bg-opacity:1;background-color:rgb(250 250 250/var(--tw-bg-opacity,1))}.bg-zinc-700{--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.bg-zinc-800{--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.bg-zinc-900{--tw-bg-opacity:1;background-color:rgb(24 24 27/var(--tw-bg-opacity,1))}.object-cover{-o-object-fit:cover;object-fit:cover}.p-0{padding:0}.p-1{padding:.25em}.p-2{padding:.5em}.p-3{padding:.75em}.p-4{padding:1em}.p-8{padding:2em}.px-1{padding-left:.25em;padding-right:.25em}.px-1\\.5{padding-left:.375em;padding-right:.375em}.px-2{padding-left:.5em;padding-right:.5em}.px-3{padding-left:.75em;padding-right:.75em}.px-4{padding-left:1em;padding-right:1em}.py-0{padding-top:0;padding-bottom:0}.py-0\\.5{padding-top:.125em;padding-bottom:.125em}.py-1{padding-top:.25em;padding-bottom:.25em}.py-1\\.5{padding-top:.375em;padding-bottom:.375em}.py-2{padding-top:.5em;padding-bottom:.5em}.py-2\\.5{padding-top:.625em;padding-bottom:.625em}.py-3{padding-top:.75em;padding-bottom:.75em}.py-8{padding-top:2em;padding-bottom:2em}.pb-1{padding-bottom:.25em}.pb-2{padding-bottom:.5em}.pb-3{padding-bottom:.75em}.pl-3{padding-left:.75em}.pt-0{padding-top:0}.pt-0\\.5{padding-top:.125em}.pt-1{padding-top:.25em}.pt-2{padding-top:.5em}.pt-3{padding-top:.75em}.pt-4{padding-top:1em}.text-left{text-align:left}.text-center{text-align:center}.align-top{vertical-align:top}.font-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.text-\\[0\\.85em\\]{font-size:.85em}.text-\\[10px\\]{font-size:10px}.text-\\[11px\\]{font-size:11px}.text-base{font-size:16px;line-height:24px}.text-lg{font-size:18px;line-height:28px}.text-sm{font-size:14px;line-height:20px}.text-xl{font-size:20px;line-height:28px}.text-xs{font-size:12px;line-height:16px}.font-bold{font-weight:700}.font-medium{font-weight:500}.font-semibold{font-weight:600}.uppercase{text-transform:uppercase}.italic{font-style:italic}.leading-none{line-height:1}.leading-relaxed{line-height:1.625}.tracking-wide{letter-spacing:.025em}.tracking-wider{letter-spacing:.05em}.text-amber-800{--tw-text-opacity:1;color:rgb(146 64 14/var(--tw-text-opacity,1))}.text-blue-600{--tw-text-opacity:1;color:rgb(37 99 235/var(--tw-text-opacity,1))}.text-emerald-600{--tw-text-opacity:1;color:rgb(5 150 105/var(--tw-text-opacity,1))}.text-emerald-700{--tw-text-opacity:1;color:rgb(4 120 87/var(--tw-text-opacity,1))}.text-indigo-600{--tw-text-opacity:1;color:rgb(79 70 229/var(--tw-text-opacity,1))}.text-indigo-700{--tw-text-opacity:1;color:rgb(67 56 202/var(--tw-text-opacity,1))}.text-inherit{color:inherit}.text-red-600{--tw-text-opacity:1;color:rgb(220 38 38/var(--tw-text-opacity,1))}.text-red-700{--tw-text-opacity:1;color:rgb(185 28 28/var(--tw-text-opacity,1))}.text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.text-zinc-100{--tw-text-opacity:1;color:rgb(244 244 245/var(--tw-text-opacity,1))}.text-zinc-400{--tw-text-opacity:1;color:rgb(161 161 170/var(--tw-text-opacity,1))}.text-zinc-500{--tw-text-opacity:1;color:rgb(113 113 122/var(--tw-text-opacity,1))}.text-zinc-600{--tw-text-opacity:1;color:rgb(82 82 91/var(--tw-text-opacity,1))}.text-zinc-700{--tw-text-opacity:1;color:rgb(63 63 70/var(--tw-text-opacity,1))}.text-zinc-800{--tw-text-opacity:1;color:rgb(39 39 42/var(--tw-text-opacity,1))}.text-zinc-900{--tw-text-opacity:1;color:rgb(24 24 27/var(--tw-text-opacity,1))}.underline{text-decoration-line:underline}.antialiased{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}.opacity-80{opacity:.8}.shadow{--tw-shadow:0 1px 3px 0 rgba(0,0,0,.1),0 1px 2px -1px rgba(0,0,0,.1);--tw-shadow-colored:0 1px 3px 0 var(--tw-shadow-color),0 1px 2px -1px var(--tw-shadow-color)}.shadow,.shadow-2xl{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-2xl{--tw-shadow:0 25px 50px -12px rgba(0,0,0,.25);--tw-shadow-colored:0 25px 50px -12px var(--tw-shadow-color)}.shadow-lg{--tw-shadow:0 10px 15px -3px rgba(0,0,0,.1),0 4px 6px -4px rgba(0,0,0,.1);--tw-shadow-colored:0 10px 15px -3px var(--tw-shadow-color),0 4px 6px -4px var(--tw-shadow-color)}.shadow-lg,.shadow-xl{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-xl{--tw-shadow:0 20px 25px -5px rgba(0,0,0,.1),0 8px 10px -6px rgba(0,0,0,.1);--tw-shadow-colored:0 20px 25px -5px var(--tw-shadow-color),0 8px 10px -6px var(--tw-shadow-color)}.outline{outline-style:solid}.ring{--tw-ring-offset-shadow:var(--tw-ring-inset) 0 0 0 var(--tw-ring-offset-width) var(--tw-ring-offset-color);--tw-ring-shadow:var(--tw-ring-inset) 0 0 0 calc(3px + var(--tw-ring-offset-width)) var(--tw-ring-color);box-shadow:var(--tw-ring-offset-shadow),var(--tw-ring-shadow),var(--tw-shadow,0 0 #0000)}.blur{--tw-blur:blur(8px)}.blur,.filter{filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.transition{transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,-webkit-backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter,-webkit-backdrop-filter;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.ease-out{transition-timing-function:cubic-bezier(0,0,.2,1)}.empty\\:hidden:empty{display:none}.hover\\:bg-indigo-50:hover{--tw-bg-opacity:1;background-color:rgb(238 242 255/var(--tw-bg-opacity,1))}.hover\\:bg-red-50:hover{--tw-bg-opacity:1;background-color:rgb(254 242 242/var(--tw-bg-opacity,1))}.hover\\:bg-zinc-100:hover{--tw-bg-opacity:1;background-color:rgb(244 244 245/var(--tw-bg-opacity,1))}.hover\\:bg-zinc-50:hover{--tw-bg-opacity:1;background-color:rgb(250 250 250/var(--tw-bg-opacity,1))}.hover\\:text-red-500:hover{--tw-text-opacity:1;color:rgb(239 68 68/var(--tw-text-opacity,1))}.hover\\:text-red-600:hover{--tw-text-opacity:1;color:rgb(220 38 38/var(--tw-text-opacity,1))}.hover\\:text-zinc-600:hover{--tw-text-opacity:1;color:rgb(82 82 91/var(--tw-text-opacity,1))}.hover\\:text-zinc-700:hover{--tw-text-opacity:1;color:rgb(63 63 70/var(--tw-text-opacity,1))}.hover\\:underline:hover{text-decoration-line:underline}.disabled\\:opacity-50:disabled{opacity:.5}.dark\\:divide-zinc-800:is(.dark *)>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(39 39 42/var(--tw-divide-opacity,1))}.dark\\:border-indigo-800:is(.dark *){--tw-border-opacity:1;border-color:rgb(55 48 163/var(--tw-border-opacity,1))}.dark\\:border-zinc-600:is(.dark *){--tw-border-opacity:1;border-color:rgb(82 82 91/var(--tw-border-opacity,1))}.dark\\:border-zinc-700:is(.dark *){--tw-border-opacity:1;border-color:rgb(63 63 70/var(--tw-border-opacity,1))}.dark\\:border-zinc-800:is(.dark *){--tw-border-opacity:1;border-color:rgb(39 39 42/var(--tw-border-opacity,1))}.dark\\:bg-amber-900\\/30:is(.dark *){background-color:rgba(120,53,15,.3)}.dark\\:bg-emerald-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(6 78 59/var(--tw-bg-opacity,1))}.dark\\:bg-indigo-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(49 46 129/var(--tw-bg-opacity,1))}.dark\\:bg-indigo-900\\/30:is(.dark *){background-color:rgba(49,46,129,.3)}.dark\\:bg-indigo-900\\/40:is(.dark *){background-color:rgba(49,46,129,.4)}.dark\\:bg-red-900\\/30:is(.dark *){background-color:rgba(127,29,29,.3)}.dark\\:bg-zinc-600:is(.dark *){--tw-bg-opacity:1;background-color:rgb(82 82 91/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-700:is(.dark *){--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-800:is(.dark *){--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-800\\/50:is(.dark *){background-color:rgba(39,39,42,.5)}.dark\\:bg-zinc-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(24 24 27/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-900\\/40:is(.dark *){background-color:rgba(24,24,27,.4)}.dark\\:text-amber-200:is(.dark *){--tw-text-opacity:1;color:rgb(253 230 138/var(--tw-text-opacity,1))}.dark\\:text-blue-400:is(.dark *){--tw-text-opacity:1;color:rgb(96 165 250/var(--tw-text-opacity,1))}.dark\\:text-emerald-200:is(.dark *){--tw-text-opacity:1;color:rgb(167 243 208/var(--tw-text-opacity,1))}.dark\\:text-indigo-200:is(.dark *){--tw-text-opacity:1;color:rgb(199 210 254/var(--tw-text-opacity,1))}.dark\\:text-indigo-300:is(.dark *){--tw-text-opacity:1;color:rgb(165 180 252/var(--tw-text-opacity,1))}.dark\\:text-indigo-400:is(.dark *){--tw-text-opacity:1;color:rgb(129 140 248/var(--tw-text-opacity,1))}.dark\\:text-red-300:is(.dark *){--tw-text-opacity:1;color:rgb(252 165 165/var(--tw-text-opacity,1))}.dark\\:text-red-400:is(.dark *){--tw-text-opacity:1;color:rgb(248 113 113/var(--tw-text-opacity,1))}.dark\\:text-zinc-100:is(.dark *){--tw-text-opacity:1;color:rgb(244 244 245/var(--tw-text-opacity,1))}.dark\\:text-zinc-200:is(.dark *){--tw-text-opacity:1;color:rgb(228 228 231/var(--tw-text-opacity,1))}.dark\\:text-zinc-300:is(.dark *){--tw-text-opacity:1;color:rgb(212 212 216/var(--tw-text-opacity,1))}.dark\\:text-zinc-400:is(.dark *){--tw-text-opacity:1;color:rgb(161 161 170/var(--tw-text-opacity,1))}.dark\\:text-zinc-500:is(.dark *){--tw-text-opacity:1;color:rgb(113 113 122/var(--tw-text-opacity,1))}.dark\\:hover\\:bg-indigo-900\\/40:hover:is(.dark *){background-color:rgba(49,46,129,.4)}.dark\\:hover\\:bg-red-900\\/30:hover:is(.dark *){background-color:rgba(127,29,29,.3)}.dark\\:hover\\:bg-zinc-700:hover:is(.dark *){--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.dark\\:hover\\:bg-zinc-800:hover:is(.dark *){--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.dark\\:hover\\:bg-zinc-800\\/50:hover:is(.dark *){background-color:rgba(39,39,42,.5)}.dark\\:hover\\:bg-zinc-800\\/60:hover:is(.dark *){background-color:rgba(39,39,42,.6)}.dark\\:hover\\:text-zinc-200:hover:is(.dark *){--tw-text-opacity:1;color:rgb(228 228 231/var(--tw-text-opacity,1))}@media (min-width:640px){.sm\\:mx-auto{margin-left:auto;margin-right:auto}.sm\\:my-4{margin-top:1em}.sm\\:mb-4,.sm\\:my-4{margin-bottom:1em}.sm\\:h-\\[calc\\(100dvh-2em\\)\\]{height:calc(100dvh - 2em)}.sm\\:max-w-4xl{max-width:56em}.sm\\:max-w-5xl{max-width:64em}.sm\\:max-w-6xl{max-width:72em}.sm\\:items-stretch{align-items:stretch}.sm\\:rounded-2xl{border-radius:1em}}`;
   /* @TAILWIND_CSS_END */
 
   const BASE_CSS = `
@@ -3078,6 +3331,8 @@ textarea { resize: none; }
 - 完全な ==UserScript== メタデータブロックを含める（@name, @namespace, @version, @description, @author, @match, @run-at, @grant）。
 - メタデータブロックは 1 行目の \`// ==UserScript==\` で始め、\`// ==/UserScript==\` で閉じる。閉じ行の \`==\` の後のスラッシュを絶対に落とさないこと（\`// ==UserScript==\` で閉じると Tampermonkey がインストールに失敗する）。
 - @match は必要最小限のスコープにする。サイト全体が対象でないならパス単位で絞る。
+- 修正版を出すときは @version を必ず上げる（例: 1.0.0 → 1.0.1）。@name と @namespace は変えない（変えると別のスクリプトとして扱われる）。
+- @updateURL / @downloadURL は新たに書かない（Gist に公開するときにアプリが設定する）。既存スクリプトに書かれていればそのまま残す。
 - 使用する GM_* API はすべて @grant に列挙する。何も使わないなら @grant none と明記する。
 - 全体を (function(){ 'use strict'; ... })(); で囲み、グローバルを汚さない。
 - 対象要素が遅れて描画される場合や SPA の画面遷移に備え、MutationObserver や待機処理を入れる。
@@ -3276,6 +3531,20 @@ textarea { resize: none; }
     // Short human-readable label for a tool call, used on the chat pill.
     describeCall(call) {
       const a = (call && call.args) || {};
+      // Agents API sandbox tools (AgentsMode records them as `sandbox.<tool>`).
+      if (/^sandbox\./.test(call.name || '')) {
+        const tool = call.name.slice(8);
+        const path = a.file_path || a.path || '';
+        switch (tool) {
+          case 'bash':  return `サンドボックス: ${String(a.command || '').replace(/\s+/g, ' ').slice(0, 120)}`;
+          case 'write': return `サンドボックス: ファイルを書き込み ${path}`;
+          case 'edit':  return `サンドボックス: ファイルを編集 ${path}`;
+          case 'read':  return `サンドボックス: ファイルを読み込み ${path}`;
+          case 'glob':
+          case 'grep':  return `サンドボックス: 検索 ${a.pattern || ''}`;
+          default:      return `サンドボックス: ${tool}`;
+        }
+      }
       switch (call.name) {
         case 'get_page_info':               return 'ページ情報を取得';
         case 'query_selector':              return `セレクタを検索: ${a.selector || ''}`;
@@ -4079,7 +4348,10 @@ textarea { resize: none; }
       // still recoverable by hand.
       if (verdict.ok) btnRow.append(install);
       btnRow.append(copy, toggle);
-      card.append(btnRow, pre);
+      // Secret-Gist publish state and button (empty for an invalid block).
+      const gist = el('div');
+      GistPublish.paintCardSection(gist, code);
+      card.append(btnRow, gist, pre);
       return card;
     },
 
@@ -4201,7 +4473,7 @@ textarea { resize: none; }
         let detail;
         try { detail = JSON.stringify(call.args || {}, null, 2); } catch { detail = String(call.args); }
         frag.appendChild(this.renderActivityPill({
-          iconName: call.name === 'run_snippet' ? 'play' : 'wrench',
+          iconName: call.name === 'run_snippet' ? 'play' : /^sandbox\./.test(call.name || '') ? 'bolt' : 'wrench',
           label: this.describeCall(call),
           detail
         }));
@@ -4222,7 +4494,8 @@ textarea { resize: none; }
         if (detail.length > 20000) detail = detail.slice(0, 20000) + '\n…(省略)';
         const isErr = !!r.error;
         let label;
-        if (isErr) label = `${fr.name}: ${r.error}`;
+        if (/^sandbox\./.test(fr.name || '')) label = `サンドボックス ${fr.name.slice(8)}: ${isErr ? `エラー (${r.error})` : '完了'}`;
+        else if (isErr) label = `${fr.name}: ${r.error}`;
         else if (fr.name === 'pick_element') {
           label = r.picked ? `選択された要素: ${r.selector}` : '要素の選択: (キャンセル)';
         } else if (fr.name === 'ask_user_choice') {
@@ -4241,6 +4514,1151 @@ textarea { resize: none; }
         }));
       }
       return frag;
+    }
+  };
+
+  // =========================================================================
+  // 12.6 Secret-Gist publishing
+  // =========================================================================
+  //
+  // Publishes a generated userscript to a secret Gist so it can be installed
+  // from a URL and kept up to date by the userscript manager.
+  //
+  //   - Only the user starts a publish (the install card's button); the model
+  //     has no tool for it.
+  //   - One Gist per script, identified by `@namespace` + `@name`.
+  //     Republishing updates the same Gist and the same file, so the
+  //     revision-less raw URL — written into @updateURL / @downloadURL — stays
+  //     valid and installed copies pick the new version up.
+  //   - Tampermonkey only updates when @version increases, so a republish
+  //     whose @version is not above the last published one gets its last
+  //     numeric part bumped.
+  //   - A secret Gist is unlisted, not private: anyone holding the URL can read
+  //     it. Code that looks like it carries a credential is refused outright.
+  const GistPublish = {
+    // Credential shapes worth refusing to publish. Each pattern is anchored on
+    // a word boundary so ordinary identifiers that merely contain the prefix
+    // (`task-…`, `desk-…`) do not match.
+    SECRET_PATTERNS: [
+      { label: 'Anthropic API キー', re: /\bsk-ant-[A-Za-z0-9_-]{10,}/ },
+      // Long and digit-bearing, so `sk-`-prefixed CSS class names don't trip it.
+      { label: 'OpenAI 形式の API キー', re: /\bsk-(?!ant-)(?:proj-)?(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{32,}/ },
+      { label: 'GitHub トークン', re: /\bgh[pousr]_[A-Za-z0-9]{30,}/ },
+      { label: 'GitHub fine-grained トークン', re: /\bgithub_pat_[A-Za-z0-9_]{20,}/ },
+      { label: 'Google API キー', re: /\bAIza[0-9A-Za-z_-]{35}/ },
+      { label: 'Slack トークン', re: /\bxox[abprs]-[A-Za-z0-9-]{10,}/ },
+      { label: 'AWS アクセスキー', re: /\bAKIA[0-9A-Z]{16}\b/ },
+      { label: '秘密鍵', re: /-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----/ }
+    ],
+
+    // The registry lives in settings. Settings are built with a shallow
+    // Object.assign over DEFAULT_SETTINGS, so a user who never published
+    // shares the default `{}` object; copy it before the first write.
+    registry() {
+      const cur = Store.settings.gistPublished;
+      if (!cur || typeof cur !== 'object' || cur === DEFAULT_SETTINGS.gistPublished) {
+        Store.settings.gistPublished = Object.assign({}, cur && typeof cur === 'object' ? cur : {});
+      }
+      return Store.settings.gistPublished;
+    },
+
+    keyOf(meta) {
+      return `${(meta && meta.namespace) || ''}\n${(meta && meta.name) || ''}`;
+    },
+
+    entryFor(code) {
+      const meta = UserScriptMode.parseMeta(code);
+      if (!meta.name) return null;
+      return this.registry()[this.keyOf(meta)] || null;
+    },
+
+    // FNV-1a over the source the model produced (before we touch @version or
+    // the update URLs), so a card can tell whether its exact code is what was
+    // last published.
+    hash(str) {
+      let h = 0x811c9dc5;
+      const s = String(str || '');
+      for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 0x01000193);
+      }
+      return (h >>> 0).toString(16).padStart(8, '0');
+    },
+
+    // Dotted-version comparison: numeric segments compare as numbers, a
+    // missing segment counts as 0, and anything non-numeric falls back to a
+    // string comparison of that segment.
+    compareVersions(a, b) {
+      const pa = String(a || '0').split('.');
+      const pb = String(b || '0').split('.');
+      for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+        const sa = pa[i] == null ? '0' : pa[i];
+        const sb = pb[i] == null ? '0' : pb[i];
+        const na = /^\d+$/.test(sa) ? parseInt(sa, 10) : NaN;
+        const nb = /^\d+$/.test(sb) ? parseInt(sb, 10) : NaN;
+        if (!Number.isNaN(na) && !Number.isNaN(nb)) {
+          if (na !== nb) return na < nb ? -1 : 1;
+        } else if (sa !== sb) {
+          return sa < sb ? -1 : 1;
+        }
+      }
+      return 0;
+    },
+
+    // 1.0.3 → 1.0.4; 2.1-beta → 2.2; a version with no numeric tail gets ".1".
+    bumpVersion(v) {
+      const parts = String(v || '').trim().split('.');
+      if (!parts[0]) return '1.0.1';
+      const last = parts[parts.length - 1];
+      const m = /^(\d+)/.exec(last);
+      if (m) parts[parts.length - 1] = String(parseInt(m[1], 10) + 1);
+      else parts.push('1');
+      return parts.join('.');
+    },
+
+    // Rewrites `// @<key> <value>` inside the metadata block: the first line
+    // for `key` (case-insensitive) is replaced, further duplicates are dropped,
+    // and a missing key is inserted just above `// ==/UserScript==`. The value
+    // column follows the block's first entry so the result lines up.
+    setMeta(code, key, value) {
+      const text = String(code || '');
+      const eol = /\r\n/.test(text) ? '\r\n' : '\n';
+      const lines = text.split(/\r?\n/);
+      const open = lines.findIndex((l) => UserScriptMode.META_OPEN_RE.test(l));
+      if (open === -1) return text;
+      const close = lines.findIndex((l, i) => i > open && UserScriptMode.META_CLOSE_RE.test(l));
+      if (close === -1) return text;
+      const lineRe = /^(\s*\/\/\s*)@([\w:-]+)(\s+)/;
+      let prefix = '// ';
+      let valueCol = 0;
+      for (let i = open + 1; i < close; i++) {
+        const m = lineRe.exec(lines[i]);
+        if (m) { prefix = m[1]; valueCol = m[1].length + 1 + m[2].length + m[3].length; break; }
+      }
+      const head = `${prefix}@${key}`;
+      const line = head + ' '.repeat(Math.max(1, valueCol - head.length)) + value;
+      const want = key.toLowerCase();
+      const out = [];
+      let placed = false;
+      for (let i = 0; i < lines.length; i++) {
+        if (i > open && i < close) {
+          const m = /^\s*\/\/\s*@([\w:-]+)(?:\s|$)/.exec(lines[i]);
+          if (m && m[1].toLowerCase() === want) {
+            if (!placed) { out.push(line); placed = true; }
+            continue;
+          }
+        }
+        if (i === close && !placed) { out.push(line); placed = true; }
+        out.push(lines[i]);
+      }
+      return out.join(eol);
+    },
+
+    // Every credential-looking string in `code`, plus any of the user's own
+    // configured keys appearing verbatim. Matches are reported masked.
+    async scanSecrets(code) {
+      const text = String(code || '');
+      const lines = text.split(/\r?\n/);
+      const findings = [];
+      const mask = (s) => (s.length <= 8 ? s.slice(0, 2) : s.slice(0, 6)) + '…';
+      const add = (label, value) => {
+        const idx = text.indexOf(value);
+        const line = idx < 0 ? 0 : text.slice(0, idx).split(/\r?\n/).length;
+        if (!findings.some((f) => f.line === line && f.label === label)) findings.push({ label, line, excerpt: mask(value) });
+      };
+      for (const line of lines) {
+        for (const p of this.SECRET_PATTERNS) {
+          const m = p.re.exec(line);
+          if (m) add(p.label, m[0]);
+        }
+      }
+      const own = [
+        ['設定済みの Gemini API キー', Store.settings.apiKey],
+        ['設定済みの Claude API キー', Store.settings.anthropicApiKey],
+        ['設定済みの GitHub トークン', await GitHub.token()]
+      ];
+      for (const [label, val] of own) {
+        if (val && val.length >= 8 && text.includes(val)) add(label, val);
+      }
+      return findings.sort((a, b) => a.line - b.line);
+    },
+
+    // Everything the confirmation dialog shows, computed without side effects.
+    async plan(code) {
+      const src = String(code || '');
+      const verdict = UserScriptMode.validateScript(src);
+      if (!verdict.ok) return { error: verdict.error };
+      const meta = UserScriptMode.parseMeta(src);
+      if (!meta.name) return { error: 'メタデータに @name がありません。@name を付けてから公開してください。' };
+      const entry = this.registry()[this.keyOf(meta)] || null;
+      const current = meta.version || '';
+      let version = current || '1.0.0';
+      let bumped = false;
+      // A `pending` entry never got its final content written (see publish),
+      // so its version was never actually served and needs no bump.
+      if (entry && !entry.pending && entry.version && this.compareVersions(version, entry.version) <= 0) {
+        version = this.bumpVersion(entry.version);
+        bumped = true;
+      }
+      return {
+        meta,
+        entry,
+        name: meta.name,
+        filename: entry ? entry.filename : UserScriptMode.fileNameFor(meta.name),
+        currentVersion: current,
+        previousVersion: entry ? entry.version : '',
+        version,
+        bumped,
+        findings: await this.scanSecrets(src)
+      };
+    },
+
+    description(meta) {
+      const d = (meta.description || '').trim();
+      return (d ? `${meta.name} — ${d}` : meta.name).slice(0, 250);
+    },
+
+    withUrls(code, version, rawUrl) {
+      let out = this.setMeta(code, 'version', version);
+      out = this.setMeta(out, 'updateURL', rawUrl);
+      out = this.setMeta(out, 'downloadURL', rawUrl);
+      return out;
+    },
+
+    // Creates or updates the Gist and records it. `forceCreate` starts a new
+    // Gist even when one is registered (used after the registered one turned
+    // out to be deleted). Resolves with the registry entry.
+    async publish(code, { forceCreate = false } = {}) {
+      const src = String(code || '');
+      const p = await this.plan(src);
+      if (p.error) throw new Error(p.error);
+      if (p.findings.length) throw new Error('認証情報らしき文字列が含まれているため公開できません。');
+      const reg = this.registry();
+      const key = this.keyOf(p.meta);
+      const description = this.description(p.meta);
+      // A forced re-create keeps the version decided against the old entry, so
+      // copies installed from the old URL still see a newer version if the
+      // user points them at the new one.
+      let entry = forceCreate ? null : p.entry;
+      const version = p.version;
+
+      if (entry) {
+        const content = this.withUrls(src, version, entry.rawUrl);
+        await GitHub.updateGist(entry.gistId, { description, filename: entry.filename, content });
+        Object.assign(entry, {
+          name: p.meta.name, namespace: p.meta.namespace || '',
+          version, sourceHash: this.hash(src), updatedAt: now()
+        });
+        delete entry.pending;
+      } else {
+        const filename = p.filename;
+        // The raw URL embeds the Gist id, which only exists once the Gist
+        // does: create it first, then write the URLs in with an update.
+        const created = await GitHub.createGist({ description, filename, content: this.setMeta(src, 'version', version) });
+        let owner = created && created.owner && created.owner.login;
+        if (!owner) {
+          const user = await GitHub.getUser();
+          owner = user && user.login;
+        }
+        if (!created || !created.id || !owner) throw new Error('GitHub の応答から Gist の情報を取得できませんでした。');
+        const rawUrl = GitHub.rawUrl(owner, created.id, filename);
+        entry = {
+          key, name: p.meta.name, namespace: p.meta.namespace || '',
+          gistId: created.id, owner, filename, rawUrl,
+          htmlUrl: created.html_url || `https://gist.github.com/${owner}/${created.id}`,
+          version, sourceHash: '', createdAt: now(), updatedAt: now(),
+          pending: true
+        };
+        // Record the Gist before the second request: if that one fails, a
+        // retry updates this Gist rather than creating a duplicate.
+        reg[key] = entry;
+        await Store.saveSettings();
+        await GitHub.updateGist(created.id, { filename, content: this.withUrls(src, version, rawUrl) });
+        entry.sourceHash = this.hash(src);
+        entry.updatedAt = now();
+        delete entry.pending;
+      }
+      reg[key] = entry;
+      await Store.saveSettings();
+      ScheduleBackup.mark();
+      return entry;
+    },
+
+    async unregister(key) {
+      delete this.registry()[key];
+      await Store.saveSettings();
+      ScheduleBackup.mark();
+    },
+
+    async remove(key) {
+      const entry = this.registry()[key];
+      if (!entry) return;
+      try {
+        await GitHub.deleteGist(entry.gistId);
+      } catch (e) {
+        // Already gone on GitHub's side: dropping our record is all that's left.
+        if (!e || e.status !== 404) throw e;
+      }
+      await this.unregister(key);
+    },
+
+    // Opening the raw `.user.js` URL is how the manager is asked to install:
+    // Tampermonkey (and the iOS Userscripts extension) intercept navigations
+    // to such URLs and show their install / update screen.
+    openInstall(url) {
+      const gmOpen = (typeof GM_openInTab === 'function') ? GM_openInTab
+        : (typeof GM !== 'undefined' && GM && typeof GM.openInTab === 'function') ? GM.openInTab.bind(GM)
+        : null;
+      try {
+        if (gmOpen) gmOpen(url, { active: true, insert: true });
+        else window.open(url, '_blank', 'noopener');
+      } catch {
+        window.open(url, '_blank', 'noopener');
+      }
+    },
+
+    // ---------------------------------------------------------------------
+    // UI
+    // ---------------------------------------------------------------------
+    // Raw URL plus install / copy / open-Gist buttons for one registry entry.
+    renderLinks(entry, { compact = false } = {}) {
+      const wrap = el('div', { class: 'space-y-2' });
+      wrap.append(el('div', {
+        class: 'text-[11px] font-mono break-all text-zinc-700 dark:text-zinc-200 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg px-2 py-1.5 select-all'
+      }, entry.rawUrl));
+      const row = el('div', { class: 'flex flex-wrap gap-2' });
+      const btnCls = 'px-3 py-1.5 rounded-lg text-xs aicx-tap inline-flex items-center gap-1';
+      const install = el('button', { class: `${btnCls} bg-emerald-600 text-white`, type: 'button' });
+      install.append(icon('download', 'w-3.5 h-3.5'), el('span', {}, compact ? 'インストール' : 'URL からインストール'));
+      install.addEventListener('click', () => this.openInstall(entry.rawUrl));
+      const copy = el('button', { class: `${btnCls} bg-white dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200 border border-zinc-200 dark:border-zinc-700`, type: 'button' });
+      copy.append(icon('copy', 'w-3.5 h-3.5'), el('span', {}, 'URL をコピー'));
+      copy.addEventListener('click', async () => {
+        const ok = await copyToClipboard(entry.rawUrl);
+        UI.toast(ok ? 'URL をコピーしました' : 'コピーに失敗しました', ok ? 'success' : 'error');
+      });
+      const open = el('a', {
+        class: `${btnCls} bg-white dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200 border border-zinc-200 dark:border-zinc-700`,
+        href: entry.htmlUrl, target: '_blank', rel: 'noopener noreferrer'
+      });
+      open.append(icon('link', 'w-3.5 h-3.5'), el('span', {}, 'Gist を開く'));
+      row.append(install, copy, open);
+      wrap.append(row);
+      return wrap;
+    },
+
+    // Install-card section: publish state for this exact code plus the
+    // publish / update button. `container` is cleared and refilled, so the
+    // card can repaint it after a publish.
+    paintCardSection(container, code) {
+      clear(container);
+      const verdict = UserScriptMode.validateScript(code);
+      if (!verdict.ok) return;
+      const entry = this.entryFor(code);
+      const same = !!(entry && entry.sourceHash && entry.sourceHash === this.hash(code));
+
+      const box = el('div', { class: 'mx-3 mb-3 p-3 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white/70 dark:bg-zinc-900/40 space-y-2' });
+      const head = el('div', { class: 'flex items-center gap-2 text-xs font-semibold text-zinc-800 dark:text-zinc-100' });
+      head.append(icon('cloud', 'w-4 h-4'), el('span', { class: 'flex-1' }, 'シークレット Gist'));
+      box.append(head);
+
+      if (entry && entry.pending) {
+        box.append(el('p', { class: 'text-[11px] text-red-700 dark:text-red-300' },
+          '前回の公開が途中で失敗しました (Gist は作成済み)。もう一度「Gist を更新」を押すと公開を完了できます。'));
+      } else if (entry) {
+        box.append(el('p', { class: 'text-[11px] text-zinc-600 dark:text-zinc-300' }, same
+          ? `この版を公開済みです (v${entry.version} · ${fmtDate(entry.updatedAt)})。URL からインストールすると、以後は @updateURL で自動更新されます。`
+          : `このスクリプトは v${entry.version} を公開済みです (${fmtDate(entry.updatedAt)})。この版を配布するには「Gist を更新」を押してください。`));
+        box.append(this.renderLinks(entry));
+      } else {
+        box.append(el('p', { class: 'text-[11px] text-zinc-600 dark:text-zinc-300' },
+          'シークレット Gist に公開すると、URL からのインストールと @updateURL による自動更新が使えます。'));
+      }
+      if (!same) {
+        const btn = el('button', { class: 'px-3 py-1.5 rounded-lg text-xs font-medium bg-indigo-600 text-white aicx-tap inline-flex items-center gap-1', type: 'button' });
+        btn.append(icon('upload', 'w-3.5 h-3.5'), el('span', {}, entry ? 'Gist を更新' : 'Gist に公開'));
+        btn.addEventListener('click', () => this.openPublishDialog({ code, onDone: () => this.paintCardSection(container, code) }));
+        box.append(el('div', { class: 'flex flex-wrap gap-2' }, [btn]));
+      }
+      container.append(box);
+    },
+
+    async openPublishDialog({ code, onDone }) {
+      const { body, footer, close } = UI.modal({ title: 'シークレット Gist に公開', iconName: 'upload', maxWidth: 'max-w-xl' });
+      const cancel = el('button', { class: 'px-4 py-2 rounded-lg text-sm bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200 aicx-tap', type: 'button' }, 'キャンセル');
+      cancel.addEventListener('click', () => close());
+
+      const openSettings = () => { close(); SettingsPanel.activeTab = 'github'; SettingsPanel.open(); };
+      if (!SecretKV.available()) {
+        body.append(el('p', { class: 'text-xs text-red-600 dark:text-red-400' }, 'この環境では GM ストレージが使えないため、GitHub トークンを安全に保存できません。Gist への公開は利用できません。'));
+        footer.append(cancel);
+        return;
+      }
+      if (!await GitHub.token()) {
+        body.append(el('p', { class: 'text-xs text-zinc-600 dark:text-zinc-300' }, 'Gist に公開するには GitHub のトークンが必要です。設定 → GitHub でトークンを登録してください。'));
+        footer.append(cancel, Form.btn('設定を開く', openSettings));
+        return;
+      }
+
+      const p = await this.plan(code);
+      if (p.error) {
+        body.append(el('p', { class: 'text-xs text-red-600 dark:text-red-400 whitespace-pre-wrap' }, p.error));
+        footer.append(cancel);
+        return;
+      }
+
+      const notice = el('div', { class: 'flex items-start gap-2 p-2 rounded-lg bg-amber-50 dark:bg-amber-900/30 text-[11px] text-amber-800 dark:text-amber-200' });
+      notice.append(el('span', { class: 'shrink-0 pt-0.5' }, [icon('warn', 'w-3.5 h-3.5')]),
+        el('div', { class: 'flex-1 min-w-0' }, 'シークレット Gist は検索や一覧には表示されませんが、URL を知っている人は誰でも閲覧できます。個人情報や認証情報を含めないでください。'));
+      body.append(notice);
+
+      const facts = el('div', { class: 'grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs' });
+      const fact = (k, v, cls = '') => facts.append(
+        el('div', { class: 'text-zinc-500 dark:text-zinc-400' }, k),
+        el('div', { class: `text-zinc-800 dark:text-zinc-100 break-all ${cls}` }, v));
+      fact('スクリプト', p.name);
+      fact('ファイル名', p.filename, 'font-mono');
+      fact('公開先', p.entry ? `既存の Gist を更新 (${p.entry.gistId.slice(0, 8)}…)` : '新しいシークレット Gist を作成');
+      let ver = `v${p.version}`;
+      if (p.bumped) ver = `v${p.currentVersion || '(なし)'} → v${p.version} (前回公開 v${p.previousVersion} から自動で更新)`;
+      else if (!p.currentVersion) ver = `v${p.version} (@version が無いため設定)`;
+      fact('バージョン', ver);
+      body.append(facts);
+      body.append(el('p', { class: 'text-[11px] text-zinc-500' },
+        '@updateURL と @downloadURL を公開先の URL に設定してから公開します (既存の値は置き換えます)。チャット上のコードは変更しません。'));
+
+      const ok = el('button', { class: 'px-4 py-2 rounded-lg text-sm bg-indigo-600 text-white aicx-tap disabled:opacity-50', type: 'button' }, p.entry ? 'Gist を更新' : '公開');
+      if (p.findings.length) {
+        const box = el('div', { class: 'p-2 rounded-lg bg-red-50 dark:bg-red-900/30 text-[11px] text-red-700 dark:text-red-300 space-y-1' });
+        box.append(el('div', { class: 'font-semibold' }, '認証情報らしき文字列が含まれているため公開できません。該当箇所を取り除いてから公開してください。'));
+        for (const f of p.findings) box.append(el('div', { class: 'font-mono break-all' }, `${f.line} 行目: ${f.label} (${f.excerpt})`));
+        body.append(box);
+        ok.disabled = true;
+      }
+
+      const status = el('p', { class: 'text-xs text-red-600 dark:text-red-400 whitespace-pre-wrap hidden' });
+      body.append(status);
+      const showError = (msg) => { status.textContent = msg; status.classList.remove('hidden'); };
+
+      const run = async (forceCreate) => {
+        ok.disabled = true;
+        cancel.disabled = true;
+        ok.textContent = '公開中…';
+        status.classList.add('hidden');
+        try {
+          const entry = await this.publish(code, { forceCreate });
+          close();
+          UI.toast(p.entry && !forceCreate ? `Gist を更新しました (v${entry.version})` : `シークレット Gist に公開しました (v${entry.version})`, 'success');
+          if (onDone) onDone(entry);
+        } catch (e) {
+          ok.disabled = false;
+          cancel.disabled = false;
+          ok.textContent = p.entry ? 'Gist を更新' : '公開';
+          if (e && e.status === 404 && p.entry && !forceCreate) {
+            if (await UI.confirm('登録済みの Gist が見つかりません (削除された可能性があります)。新しい Gist を作成して公開しますか?\n\nURL が変わるため、この URL からインストール済みの環境では入れ直しが必要です。')) {
+              run(true);
+              return;
+            }
+          }
+          showError((e && e.message) || String(e));
+        }
+      };
+      ok.addEventListener('click', () => run(false));
+      footer.append(cancel, ok);
+    }
+  };
+
+  // =========================================================================
+  // 12.6b Agents API mode (Claude Managed Agents)
+  // =========================================================================
+  //
+  // A UserScript chat created while "Agents API" is enabled runs as a Managed
+  // Agents session instead of a local tool loop:
+  //
+  //   - Anthropic runs the agent loop and a per-session cloud sandbox (bash,
+  //     file tools, Node, Playwright + Chromium) where the agent tests the
+  //     script it writes.
+  //   - The page-inspection tools of UserScriptMode stay "custom tools": the
+  //     agent asks for them, this tab runs them against the live page (same
+  //     approvals as before) and sends the result back.
+  //   - One session per conversation, created on the first send with the
+  //     model / effort chosen at that point and a spend cap converted from
+  //     yen; it is deleted together with the conversation.
+  //
+  // The conversation is stored in the same shape as the local tool loop's
+  // (assistant turns with functionCalls, `_tool` turns with
+  // functionResponses), so the existing renderer and install cards apply.
+  // Sandbox tools appear under the name `sandbox.<tool>`.
+  const AgentsMode = {
+    AGENT_NAME: 'AI Chat Overlay — UserScript',
+    SANDBOX_PROMPT: `## 実行環境 (Agents API)
+- あなたは Anthropic のクラウド上のサンドボックス (Ubuntu / Node.js 22 / Python) で bash とファイル操作 (read / write / edit / glob / grep) を使える。サンドボックスはユーザーのブラウザとは別のマシンで、ユーザーのログイン状態や Cookie は無い。
+- ユーザーが開いているページの調査には、カスタムツール (get_page_info / query_selector / get_page_html / fetch_resource / run_snippet / pick_element / ask_user_choice / request_existing_userscript) を使う。サンドボックスからユーザーのタブは操作できない。
+- 各ユーザーメッセージの先頭に、送信時点でユーザーが開いているページの URL・タイトル・推奨 @match が付いている。
+- 作成したスクリプトは /workspace に保存し、\`node --check\` で構文を確認する。
+- Playwright (Node) と Chromium が入っている。グローバルにインストールされているので \`NODE_PATH=$(npm root -g) node test.js\` のように実行する。公開ページはサンドボックスの Chromium で開いてスクリプトを注入し、動作を確認する。GM_* API を使うスクリプトは簡単なスタブを用意して確認する。
+- ログインが必要なページや、サンドボックスから見え方が異なるページ (ボット対策・地域差など) は、run_snippet でユーザーのブラウザ上の挙動を確認する。
+- 確認が済んだら output_userscript でスクリプトを提出する。チャット本文にスクリプト全文を貼らない。
+- 確認できなかった点があれば、最後の説明で正直に伝える。`,
+    // Sandbox tool output kept in the transcript (the agent sees all of it).
+    RESULT_KEEP_CHARS: 4000,
+    // How long to wait for the session to settle after the user pressed stop.
+    INTERRUPT_GRACE_MS: 20000,
+
+    enabled() { return !!Store.settings.agentsEnabled; },
+
+    // A chat's engine is fixed when the conversation is created; until then
+    // (a fresh panel) it follows the setting.
+    usesAgents(conv, mode) {
+      if (mode !== UserScriptMode.ID) return false;
+      return conv ? conv.engine === 'agents' : this.enabled();
+    },
+
+    models() {
+      const list = AGENTS_MODELS.slice();
+      for (const m of Store.settings.addedModels || []) {
+        if (m && /^claude-/.test(m.id) && !list.some((x) => x.id === m.id)) list.push({ id: m.id, display: m.display || m.id });
+      }
+      return list;
+    },
+    modelLabel(id) {
+      const m = this.models().find((x) => x.id === id);
+      return (m && m.display) || id || '';
+    },
+    modelOf(conv) { return (conv && conv.agent && conv.agent.model) || Store.settings.agentsModel || DEFAULT_SETTINGS.agentsModel; },
+    effortOf(conv) { return (conv && conv.agent && conv.agent.effort) || Store.settings.agentsEffort || DEFAULT_SETTINGS.agentsEffort; },
+
+    rate() {
+      const r = Number(Store.settings.agentsJpyPerUsd);
+      return r > 0 ? r : DEFAULT_SETTINGS.agentsJpyPerUsd;
+    },
+    // The yen cap in US cents (the API's only currency), rounded down so the
+    // cap never exceeds what the user set.
+    budgetCents() {
+      const y = Number(Store.settings.agentsBudgetJpy);
+      const jpy = y > 0 ? y : DEFAULT_SETTINGS.agentsBudgetJpy;
+      return Math.max(1, Math.floor((jpy / this.rate()) * 100));
+    },
+    formatCost(cents) {
+      const usd = (Number(cents) || 0) / 100;
+      return `$${usd.toFixed(2)} (約 ${Math.round(usd * this.rate()).toLocaleString()} 円)`;
+    },
+
+    systemPrompt() {
+      const custom = Store.settings.userscriptSystemPrompt;
+      const base = (custom && custom.trim()) || UserScriptMode.DEFAULT_SYSTEM_PROMPT;
+      return `${base}\n\n${this.SANDBOX_PROMPT}`;
+    },
+
+    tools() {
+      // Same declarations as the local loop. Managed Agents custom tools take
+      // no `eager_input_streaming`.
+      const custom = Claude.convertTools(UserScriptMode.toolDeclarations())
+        .map(({ eager_input_streaming, ...t }) => Object.assign({ type: 'custom' }, t));
+      return [
+        {
+          type: 'agent_toolset_20260401',
+          default_config: { enabled: true, permission_policy: { type: 'auto' } },
+          configs: [{ name: 'web_fetch', enabled: false }, { name: 'web_search', enabled: false }]
+        },
+        ...custom
+      ];
+    },
+
+    // The agent is created once and updated in place (a new version) when
+    // its prompt or tools change; sessions override model and effort.
+    async ensureAgent() {
+      const s = Store.settings;
+      const body = {
+        name: this.AGENT_NAME,
+        description: 'ユーザーのページを調べながら Tampermonkey 向け UserScript を作り、サンドボックスで検証する (AI Chat Overlay)',
+        model: { id: DEFAULT_SETTINGS.agentsModel, effort: DEFAULT_SETTINGS.agentsEffort },
+        system: this.systemPrompt(),
+        tools: this.tools(),
+        metadata: { app: 'ai-chat-overlay' }
+      };
+      const hash = GistPublish.hash(JSON.stringify([body.name, body.system, body.tools]));
+      if (s.agentsAgentId && s.agentsAgentHash === hash) return { id: s.agentsAgentId, version: s.agentsAgentVersion };
+      let agent = null;
+      if (s.agentsAgentId) {
+        try {
+          agent = await AgentsAPI.updateAgent(s.agentsAgentId, body);
+        } catch (e) {
+          // Gone (another workspace's key, or archived): start over below.
+          if (e.status !== 404 && e.status !== 409) throw e;
+        }
+      }
+      if (!agent) agent = await AgentsAPI.createAgent(body);
+      Object.assign(s, { agentsAgentId: agent.id, agentsAgentVersion: agent.version, agentsAgentHash: hash });
+      await Store.saveSettings();
+      return { id: agent.id, version: agent.version };
+    },
+
+    async ensureEnvironment() {
+      const s = Store.settings;
+      if (s.agentsEnvironmentId) return s.agentsEnvironmentId;
+      // Unrestricted networking: the agent has to load whatever site the user
+      // is writing a script for, and that is not known in advance.
+      const env = await AgentsAPI.createEnvironment({
+        name: `ai-chat-overlay-${Date.now().toString(36)}`,
+        description: 'AI Chat Overlay: UserScript の動作確認用サンドボックス',
+        config: { type: 'cloud', networking: { type: 'unrestricted' } },
+        metadata: { app: 'ai-chat-overlay' }
+      });
+      s.agentsEnvironmentId = env.id;
+      await Store.saveSettings();
+      return env.id;
+    },
+
+    async createSession(conv) {
+      const create = async () => {
+        const agent = await this.ensureAgent();
+        const envId = await this.ensureEnvironment();
+        return AgentsAPI.createSession({
+          agent: {
+            type: 'agent_with_overrides', id: agent.id, version: agent.version,
+            model: { id: this.modelOf(conv), effort: this.effortOf(conv) }
+          },
+          environment_id: envId,
+          // The API rejects control / format characters (newlines included)
+          // in titles, and conv.title is the first line(s) the user typed.
+          title: (conv.title || '').replace(/[\p{Cc}\p{Cf}]+/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 200) || 'UserScript',
+          budget: { type: 'limit', max_list_cost: { amount: String(conv.agent.budgetCents), currency: 'USD' } },
+          metadata: { app: 'ai-chat-overlay', conversation: conv.id }
+        });
+      };
+      try {
+        return await create();
+      } catch (e) {
+        // A stored agent / environment id that no longer resolves (deleted,
+        // archived, or from another workspace's key): recreate both once.
+        const stale = e.status === 404 || e.status === 409
+          || (e.status === 400 && /(environment|agent)[^.]*(not found|archived|does not exist)/i.test(e.message || ''));
+        if (!stale) throw e;
+        Object.assign(Store.settings, { agentsAgentId: '', agentsAgentHash: '', agentsEnvironmentId: '' });
+        await Store.saveSettings();
+        return create();
+      }
+    },
+
+    // Deletes the sessions of conversations being removed (user delete,
+    // retention sweep, bulk wipe). Fire-and-forget: a failure only leaves a
+    // session behind, which costs nothing while idle.
+    forget(convs) {
+      for (const c of convs || []) {
+        const sid = c && c.agent && c.agent.sessionId;
+        if (!sid) continue;
+        c.agent.sessionId = null;
+        this.deleteSession(sid);
+      }
+    },
+
+    async deleteSession(sid) {
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      try {
+        for (let i = 0; i < 2; i++) {
+          try {
+            await AgentsAPI.deleteSession(sid);
+            return;
+          } catch (e) {
+            if (e.status === 404) return;
+            // A running session can't be deleted yet: stop it, let it settle.
+            if (i === 0 && (e.status === 400 || e.status === 409)) {
+              await AgentsAPI.sendEvents(sid, [{ type: 'user.interrupt' }]).catch(() => {});
+              await sleep(2500);
+              continue;
+            }
+            throw e;
+          }
+        }
+      } catch (e) {
+        console.warn('[aicx] could not delete Agents session', sid, e);
+      }
+    },
+
+    // Processed-at timestamps carry up to nanoseconds; compare them as
+    // milliseconds so every engine's Date parser agrees.
+    tsOf(iso) {
+      if (!iso) return 0;
+      const s = String(iso).replace(/(\.\d{3})\d+/, '$1');
+      const t = Date.parse(s);
+      return Number.isFinite(t) ? t : 0;
+    },
+
+    // Text of a user turn as the agent receives it: where the user is, what
+    // they shared, then what they typed.
+    composeMessage({ text, selection, snapText, attachments }) {
+      const parts = [[
+        '[ユーザーが開いているページ (送信時点)]',
+        `URL: ${location.href}`,
+        `Title: ${document.title || '(なし)'}`,
+        `推奨 @match: ${UserScriptMode.suggestedMatches().join(' / ')}`
+      ].join('\n')];
+      if (snapText) parts.push(`[ユーザーが共有したページ内容]\n${snapText}`);
+      for (const a of attachments || []) {
+        const textual = /^text\/|json|javascript|xml/.test(a.mimeType || '') || /\.(js|ts|json|css|html?|txt|md)$/i.test(a.name || '');
+        let body = null;
+        if (textual && a.dataUrl) {
+          try {
+            const b64 = a.dataUrl.slice(a.dataUrl.indexOf(',') + 1);
+            body = new TextDecoder().decode(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)));
+          } catch { body = null; }
+        }
+        parts.push(body != null
+          ? `[添付ファイル: ${a.name}]\n${body}`
+          : `[添付ファイル: ${a.name}] (画像などのファイルは Agents API モードでは送信されません)`);
+      }
+      if (selection) parts.push(`[ユーザーがページで選択しているテキスト。このターンの主な対象]\n"""\n${selection}\n"""`);
+      parts.push(text || (selection ? 'この選択箇所について対応してください。' : '続けてください。'));
+      return parts.join('\n\n');
+    },
+
+    // Minimal single-consumer queue fed by the stream and the poller.
+    _queue() {
+      const items = [];
+      let wake = null;
+      return {
+        push(ev) {
+          items.push(ev);
+          if (wake) { const w = wake; wake = null; w(); }
+        },
+        async take(ms) {
+          if (!items.length) {
+            await new Promise((resolve) => {
+              wake = resolve;
+              setTimeout(() => { if (wake === resolve) { wake = null; resolve(); } }, ms);
+            });
+          }
+          return items.shift();
+        }
+      };
+    },
+
+    // Starts the producers for one run. 'auto' streams over SSE and polls
+    // whenever the stream has been silent for a while (Tampermonkey builds
+    // and the iOS Userscripts app that buffer the response would otherwise
+    // never deliver anything); 'stream' and 'poll' use one method only. The
+    // stream has no replay, so every (re)connect is followed by a history
+    // fetch from the cursor — duplicates are dropped by the consumer.
+    _startFeed(sid, state, q) {
+      const ctl = { stopped: false, ac: new AbortController(), lastData: Date.now() };
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      const transport = Store.settings.agentsTransport || 'auto';
+      const pollOnce = async () => {
+        const evs = await AgentsAPI.listEvents(sid, state.cursor, ctl.ac.signal);
+        for (const ev of evs) q.push(ev);
+      };
+      const pollLoop = async (ms) => {
+        while (!ctl.stopped) {
+          try { await pollOnce(); } catch (e) {
+            if (ctl.stopped) return;
+            console.warn('[aicx] Agents poll failed:', e);
+          }
+          await sleep(ms);
+        }
+      };
+      const streamLoop = async () => {
+        let failures = 0;
+        while (!ctl.stopped) {
+          let got = false;
+          try {
+            const it = AgentsAPI.openStream(sid, ctl.ac.signal);
+            try { await pollOnce(); } catch { /* the watchdog / next connect retries */ }
+            let buf = '';
+            while (!ctl.stopped) {
+              const { value, done } = await it.next();
+              if (done) break;
+              got = true;
+              ctl.lastData = Date.now();
+              buf += value;
+              const frames = buf.split(/\r?\n\r?\n/);
+              buf = frames.pop();
+              for (const f of frames) {
+                const data = f.split(/\r?\n/).filter((l) => l.startsWith('data:')).map((l) => l.slice(5).replace(/^ /, '')).join('\n');
+                if (!data) continue; // heartbeat
+                try { q.push(JSON.parse(data)); } catch { /* partial or malformed frame */ }
+              }
+            }
+            try { if (it.return) it.return(); } catch {}
+          } catch (e) {
+            if (ctl.stopped) return;
+            console.warn('[aicx] Agents stream error:', e);
+          }
+          if (ctl.stopped) return;
+          failures = got ? 0 : failures + 1;
+          if (failures >= 2 && transport === 'auto') { pollLoop(1500); return; }
+          await sleep(1000);
+        }
+      };
+      const watchdog = async () => {
+        while (!ctl.stopped) {
+          await sleep(3000);
+          if (ctl.stopped) return;
+          if (Date.now() - ctl.lastData > 12000) {
+            try { await pollOnce(); } catch { /* next tick */ }
+          }
+        }
+      };
+      if (transport === 'poll') pollLoop(1500);
+      else {
+        streamLoop();
+        if (transport === 'auto') watchdog();
+      }
+      return {
+        stop() { ctl.stopped = true; try { ctl.ac.abort(); } catch {} },
+        pollOnce
+      };
+    },
+
+    // Runs one user turn of an Agents conversation. The user message and an
+    // empty pending assistant message have already been appended to `conv`.
+    // `onPending(msg)` tells the caller which message to annotate if this
+    // throws. Resolves when the session settles (end of turn, stop, budget
+    // pause the user declined, or termination).
+    async run({ conv, host, panel, userMsg, text, selection, snapText, attachments, onPending, aborter }) {
+      const st = conv.agent || (conv.agent = { model: this.modelOf(null), effort: this.effortOf(null) });
+      const view = () => { if (panel.conv === conv) panel.render(); };
+      const viewLast = () => { if (panel.conv === conv) panel.renderLastAssistant(); };
+      const save = () => { Store.upsertConversation(host, conv); Store.saveDomains(); };
+
+      // The assistant message currently receiving output (null after a tool
+      // result, so the next output starts a new one below it).
+      let cur = conv.messages[conv.messages.length - 1];
+      const newAssistant = () => {
+        if (cur && cur.role === 'assistant') cur._pending = false;
+        cur = { id: uid(), role: 'assistant', content: '', createdAt: now(), _pending: true };
+        conv.messages.push(cur);
+        onPending(cur);
+        return cur;
+      };
+      const ensureCur = ({ forText = false } = {}) => {
+        if (!cur || cur.role !== 'assistant') return newAssistant();
+        // Text after tool calls goes below them, in its own message.
+        if (forText && cur.functionCalls && cur.functionCalls.length) return newAssistant();
+        return cur;
+      };
+      const note = (s) => {
+        const m = ensureCur({ forText: true });
+        m.content = (m.content ? `${m.content}\n\n` : '') + s;
+      };
+      const pushResult = (resp) => {
+        const last = conv.messages[conv.messages.length - 1];
+        if (last && last._tool) last.functionResponses.push(resp);
+        else conv.messages.push({ id: uid(), role: 'user', _tool: true, functionResponses: [resp], createdAt: now() });
+        if (cur && cur.role === 'assistant') cur._pending = false;
+        cur = null;
+      };
+
+      // ---- session ---------------------------------------------------
+      let session = null;
+      if (st.sessionId) {
+        try {
+          session = await AgentsAPI.getSession(st.sessionId);
+        } catch (e) {
+          if (e.status !== 404) throw e;
+        }
+        if (!session || session.status === 'terminated') {
+          st.sessionId = null;
+          note('_(前のセッションは終了していたため、新しいセッションで続けます。サンドボックスの状態は引き継がれません。)_');
+          view();
+        }
+      }
+      if (!st.sessionId) {
+        st.model = this.modelOf(conv);
+        st.effort = this.effortOf(conv);
+        st.budgetCents = this.budgetCents();
+        st.costCents = 0;
+        st.cursor = null;
+        st.seen = [];
+        session = await this.createSession(conv);
+        st.sessionId = session.id;
+        save();
+      }
+      const sid = st.sessionId;
+
+      const seen = new Set(st.seen || []);
+      const answered = new Set();
+      const state = {
+        get cursor() { return st.cursor; }
+      };
+      const advance = (ev) => {
+        if (ev.processed_at && this.tsOf(ev.processed_at) >= this.tsOf(st.cursor)) st.cursor = ev.processed_at;
+        seen.add(ev.id);
+        st.seen = [...seen].slice(-300);
+      };
+      const usageOf = (ev) => {
+        const u = ev.usage || ev;
+        const amt = u && u.list_cost && u.list_cost.amount;
+        if (amt != null) st.costCents = parseInt(amt, 10) || 0;
+      };
+
+      const sendResult = async (toolUseId, response, isError) => {
+        answered.add(toolUseId);
+        await AgentsAPI.sendEvents(sid, [{
+          type: 'user.custom_tool_result',
+          custom_tool_use_id: toolUseId,
+          content: [{ type: 'text', text: JSON.stringify(response) }],
+          is_error: !!isError
+        }]);
+      };
+
+      const raiseBudget = async () => {
+        const step = this.budgetCents();
+        const ok = await UI.confirm(`費用の上限に達したため、エージェントを一時停止しました。\n\nこのセッションの累計: ${this.formatCost(st.costCents)}\n上限を ${this.formatCost(step)} 分引き上げて続けますか?`);
+        if (!ok) return false;
+        const amount = (st.costCents || 0) + step;
+        await AgentsAPI.updateSession(sid, { budget: { type: 'limit', max_list_cost: { amount: String(amount), currency: 'USD' } } });
+        st.budgetCents = amount;
+        save();
+        return true;
+      };
+
+      // ---- event handling ----------------------------------------------
+      // `replay` = catching up on events from before this send (the page was
+      // reloaded mid-run, say). Tool requests from then are answered with an
+      // error instead of popping dialogs about a turn the user has left.
+      // Live preview state: which agent.message is being previewed, the text
+      // of `cur` before it, and the deltas so far. The buffered agent.message
+      // replaces the preview (deltas may have been shed).
+      let previewFor = null;
+      let previewBase = '';
+      let previewText = '';
+      const joinText = (base, add) => base + (base && add ? '\n\n' : '') + add;
+      const handle = async (ev, { replay = false } = {}) => {
+        switch (ev.type) {
+          case 'agent.message': {
+            const textOut = (ev.content || []).filter((b) => b && b.type === 'text').map((b) => b.text).join('');
+            if (previewFor === ev.id && cur && cur.role === 'assistant') {
+              cur.content = joinText(previewBase, textOut);
+              previewFor = null;
+            } else if (textOut) {
+              const m = ensureCur({ forText: true });
+              m.content = (m.content ? `${m.content}\n\n` : '') + textOut;
+            }
+            view();
+            return;
+          }
+          case 'agent.custom_tool_use': {
+            const m = ensureCur();
+            const call = { id: ev.id, name: ev.name, args: ev.input || {} };
+            (m.functionCalls || (m.functionCalls = [])).push(call);
+            view();
+            if (answered.has(ev.id)) return;
+            let response;
+            let isError = false;
+            if (replay) {
+              response = { error: 'ページの再読み込みなどで、このツール呼び出しは実行されませんでした。必要ならもう一度呼び出してください。' };
+              isError = true;
+            } else {
+              const decl = UserScriptMode.toolDeclarations().find((d) => d.name === ev.name);
+              const schema = decl ? Claude.convertTools([decl])[0].input_schema : null;
+              const problem = schema ? Claude.validateInput(schema, call.args) : null;
+              response = problem
+                ? { error: `ツール入力が不正です: ${problem}` }
+                : await UserScriptMode.execute(call, { conv, host, panel });
+              isError = !!(response && response.error);
+            }
+            pushResult({ id: ev.id, name: ev.name, response });
+            view();
+            save();
+            await sendResult(ev.id, response, isError);
+            return;
+          }
+          case 'agent.tool_use': {
+            const m = ensureCur();
+            const call = { id: ev.id, name: `sandbox.${ev.name}`, args: ev.input || {} };
+            (m.functionCalls || (m.functionCalls = [])).push(call);
+            view();
+            if (ev.evaluated_permission === 'ask' && !answered.has(ev.id)) {
+              answered.add(ev.id);
+              let allow = false;
+              if (!replay) {
+                const verdict = await UI.confirmCode({
+                  title: 'サンドボックスでの実行を確認',
+                  description: `エージェントがサンドボックスで「${ev.name}」を実行しようとしています。自動では安全と判断できなかったため、確認が必要です。`,
+                  code: JSON.stringify(ev.input || {}, null, 2),
+                  okLabel: '許可'
+                });
+                allow = !!verdict.ok;
+              }
+              await AgentsAPI.sendEvents(sid, [allow
+                ? { type: 'user.tool_confirmation', tool_use_id: ev.id, result: 'allow' }
+                : { type: 'user.tool_confirmation', tool_use_id: ev.id, result: 'deny', deny_message: replay ? 'ページの再読み込みなどで確認できませんでした。' : 'ユーザーが実行を拒否しました。' }]);
+            }
+            return;
+          }
+          case 'agent.tool_result': {
+            const out = (ev.content || []).filter((b) => b && b.type === 'text').map((b) => b.text).join('');
+            const callMsg = [...conv.messages].reverse().find((x) => x.functionCalls && x.functionCalls.some((c) => c.id === ev.tool_use_id));
+            const call = callMsg && callMsg.functionCalls.find((c) => c.id === ev.tool_use_id);
+            const response = { output: out.length > this.RESULT_KEEP_CHARS ? `${out.slice(0, this.RESULT_KEEP_CHARS)}\n…(省略)` : out };
+            if (ev.is_error) response.error = out.split('\n')[0].slice(0, 200) || 'エラー';
+            pushResult({ id: ev.tool_use_id, name: (call && call.name) || 'sandbox.tool', response });
+            view();
+            save();
+            return;
+          }
+          case 'span.model_request_start':
+            if (!cur || cur.role !== 'assistant') { newAssistant(); view(); }
+            else if (!cur._pending) { cur._pending = true; viewLast(); }
+            return;
+          case 'session.usage':
+            usageOf(ev);
+            return;
+          case 'session.error': {
+            const err = ev.error || {};
+            note(`_(エージェントでエラーが発生しました: ${esc(err.message || err.type || '不明なエラー')})_`);
+            view();
+            return;
+          }
+          case 'agent.thread_context_compacted':
+            note('_(会話が長くなったため、エージェントがこれまでの内容を要約しました)_');
+            view();
+            return;
+          default:
+            return;
+        }
+      };
+
+      // ---- catch up on anything since the last run ---------------------
+      // Output the session produced after this tab stopped listening (page
+      // reload mid-run) belongs ABOVE the message being sent now, so the new
+      // user turn and its placeholder are lifted off while it is replayed.
+      if (st.cursor || seen.size) {
+        const backlog = await AgentsAPI.listEvents(sid, st.cursor);
+        // Results already sent for a request must not be sent again.
+        for (const ev of backlog) {
+          if (ev.type === 'user.custom_tool_result' && ev.custom_tool_use_id) answered.add(ev.custom_tool_use_id);
+          if (ev.type === 'user.tool_confirmation' && ev.tool_use_id) answered.add(ev.tool_use_id);
+        }
+        const fresh = backlog.filter((ev) => ev.id && ev.processed_at && !seen.has(ev.id));
+        if (fresh.length) {
+          const at = conv.messages.indexOf(userMsg);
+          const tail = at >= 0 ? conv.messages.splice(at) : [];
+          cur = null;
+          for (const ev of fresh) {
+            advance(ev);
+            if (ev.type === 'session.usage') { usageOf(ev); continue; }
+            await handle(ev, { replay: true });
+          }
+          for (const m of conv.messages) if (m._pending) m._pending = false;
+          conv.messages.push(...tail);
+          cur = tail.length ? tail[tail.length - 1] : null;
+          if (cur) onPending(cur);
+          view();
+          save();
+        }
+      }
+
+      // A session paused at its cap only accepts settle events.
+      const latest = await AgentsAPI.getSession(sid);
+      if (latest && latest.usage) usageOf(latest.usage);
+      const capped = latest && latest.budget && latest.budget.max_list_cost
+        && (st.costCents || 0) >= (parseInt(latest.budget.max_list_cost.amount, 10) || 0);
+      if (capped && !(await raiseBudget())) {
+        note('_(費用の上限に達しているため送信しませんでした。上限を引き上げると続けられます。)_');
+        if (cur) cur._pending = false;
+        view();
+        return;
+      }
+
+      // ---- live turn ------------------------------------------------------
+      const q = this._queue();
+      const feed = this._startFeed(sid, state, q);
+      let interruptAt = 0;
+      const onAbort = () => {
+        interruptAt = Date.now();
+        AgentsAPI.sendEvents(sid, [{ type: 'user.interrupt' }]).catch(() => {});
+      };
+      aborter.signal.addEventListener('abort', onAbort, { once: true });
+
+      try {
+        const sent = await AgentsAPI.sendEvents(sid, [{
+          type: 'user.message',
+          content: [{ type: 'text', text: this.composeMessage({ text, selection, snapText, attachments }) }]
+        }]);
+        const ourId = sent && sent.data && sent.data[0] && sent.data[0].id;
+        let ourProcessed = !ourId;
+
+        while (true) {
+          const ev = await q.take(1000);
+          if (interruptAt && Date.now() - interruptAt > this.INTERRUPT_GRACE_MS) break;
+          if (!ev) continue;
+
+          // Live preview of agent.message text (stream only, never persisted).
+          if (ev.type === 'event_start') {
+            if (ev.event && ev.event.type === 'agent.message' && !seen.has(ev.event.id)) {
+              const m = ensureCur({ forText: true });
+              previewFor = ev.event.id;
+              previewBase = m.content || '';
+              previewText = '';
+            }
+            continue;
+          }
+          if (ev.type === 'event_delta') {
+            const piece = ev.delta && ev.delta.content && ev.delta.content.text;
+            if (previewFor && ev.event_id === previewFor && piece && cur && cur.role === 'assistant') {
+              previewText += piece;
+              cur.content = joinText(previewBase, previewText);
+              viewLast();
+            }
+            continue;
+          }
+
+          if (!ev.id || !ev.processed_at || seen.has(ev.id)) continue;
+          advance(ev);
+          if (ev.type === 'user.message' && ev.id === ourId) ourProcessed = true;
+
+          if (ev.type === 'session.status_terminated') {
+            note('_(セッションが終了しました。次の送信では新しいセッションを作成します。)_');
+            st.sessionId = null;
+            break;
+          }
+          if (ev.type === 'session.status_idle') {
+            const reason = (ev.stop_reason && ev.stop_reason.type) || 'end_turn';
+            if (reason === 'requires_action') {
+              // Requests we never received (a gap in the feed): fetch them.
+              const missing = ((ev.stop_reason && ev.stop_reason.event_ids) || []).filter((id) => !seen.has(id) && !answered.has(id));
+              if (missing.length) await feed.pollOnce().catch(() => {});
+              continue;
+            }
+            if (reason === 'budget_reached') {
+              if (await raiseBudget()) continue;
+              note(`_(費用の上限に達したため停止しました。このセッションの累計: ${this.formatCost(st.costCents)})_`);
+              break;
+            }
+            if (interruptAt) break;
+            if (!ourProcessed) {
+              // An idle left over from before our message was picked up (the
+              // session was still busy when we sent): keep waiting unless the
+              // history says our message has been processed.
+              const recent = await AgentsAPI.listEvents(sid, st.cursor).catch(() => []);
+              if (recent.some((x) => x.id === ourId && x.processed_at)) ourProcessed = true;
+              if (!ourProcessed) continue;
+            }
+            if (reason === 'retries_exhausted') note('_(エージェントの処理がエラーまたは上限により停止しました。「続けて」と送ると再開できます。)_');
+            break;
+          }
+          await handle(ev);
+        }
+      } finally {
+        feed.stop();
+        aborter.signal.removeEventListener('abort', onAbort);
+      }
+
+      if (interruptAt) note('_(停止しました)_');
+      // Close the turn: no message left spinning, and the last assistant
+      // message carries the session's running cost.
+      for (const m of conv.messages) if (m._pending) m._pending = false;
+      let last = [...conv.messages].reverse().find((m) => m.role === 'assistant');
+      if (!last || last !== conv.messages[conv.messages.length - 1]) {
+        last = { id: uid(), role: 'assistant', content: '', createdAt: now() };
+        conv.messages.push(last);
+      }
+      last.agentsInfo = { model: st.model, effort: st.effort, costCents: st.costCents || 0 };
+      onPending(last);
+      view();
+      save();
     }
   };
 
@@ -4420,6 +5838,12 @@ textarea { resize: none; }
           class: 'shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-900 text-indigo-700 dark:text-indigo-200'
         }, 'UserScript'));
       }
+      if (AgentsMode.usesAgents(conv, this.mode)) {
+        titleRow.append(el('span', {
+          class: 'shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-900 text-emerald-700 dark:text-emerald-200',
+          title: 'Agents API (クラウドのサンドボックスで検証しながら作成)'
+        }, 'Agents'));
+      }
       titleRow.append(titleTop);
       const titleSub = el('div', { class: 'text-[11px] text-zinc-500 dark:text-zinc-400 flex items-center gap-1 min-w-0' });
       // Rebuild the subtitle from the stored pageUrl/pageTitle on the conv
@@ -4436,7 +5860,9 @@ textarea { resize: none; }
         }, pageTitle);
         link.addEventListener('click', (e) => e.stopPropagation());
         const tail = el('span', { class: 'shrink-0 text-zinc-500 dark:text-zinc-400' },
-          ` · ${Store.settings.model || '(モデル未選択)'}`);
+          AgentsMode.usesAgents(this.conv, this.mode)
+            ? ` · ${AgentsMode.modelOf(this.conv)} (effort ${AgentsMode.effortOf(this.conv)})`
+            : ` · ${Store.settings.model || '(モデル未選択)'}`);
         titleSub.append(link, tail);
       };
       updateTitleSub();
@@ -4670,6 +6096,12 @@ textarea { resize: none; }
       const btnModelLabel = el('span', { class: 'text-xs font-medium' }, '');
       btnModel.append(btnModelLabel);
       const paintModelBtn = () => {
+        if (AgentsMode.usesAgents(this.conv, this.mode)) {
+          const id = AgentsMode.modelOf(this.conv);
+          btnModelLabel.textContent = `${Providers.abbreviate(id)} ${AgentsMode.effortOf(this.conv)}`;
+          btnModel.title = `Agents API モデル: ${id} / effort ${AgentsMode.effortOf(this.conv)}`;
+          return;
+        }
         btnModelLabel.textContent = Providers.abbreviate(Store.settings.model || '');
         btnModel.title = `モデル: ${Store.settings.model || '(未選択)'}`;
       };
@@ -4693,6 +6125,49 @@ textarea { resize: none; }
         modelBtnWrap.append(modelPopover);
         btnModel.setAttribute('aria-expanded', 'true');
         setTimeout(() => document.addEventListener('pointerdown', onModelDocDown, true), 0);
+
+        // Agents API chats: model + effort for the session. A session keeps
+        // the model it was created with, so once one exists the choice only
+        // becomes the default for new chats.
+        if (AgentsMode.usesAgents(this.conv, this.mode)) {
+          const locked = !!(this.conv && this.conv.agent && this.conv.agent.sessionId);
+          const pick = async (field, value) => {
+            Store.settings[field === 'model' ? 'agentsModel' : 'agentsEffort'] = value;
+            await Store.saveSettings();
+            if (this.conv && this.conv.agent && !locked) this.conv.agent[field] = value;
+            if (locked) UI.toast('このチャットのセッションは作成済みのため、新しい UserScript チャットから反映されます', 'info');
+            paintModelBtn();
+            updateTitleSub();
+            closeModelPop();
+          };
+          const item = (label, sub, active, onClick) => {
+            const b = el('button', {
+              type: 'button',
+              class: `w-full text-left px-3 py-2 rounded flex items-start gap-2 aicx-tap ${active ? 'bg-indigo-50 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-200' : 'hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200'}`,
+              role: 'menuitemradio', 'aria-checked': active ? 'true' : 'false'
+            });
+            const mark = el('span', { class: 'w-3.5 h-3.5 inline-flex items-center justify-center shrink-0 mt-0.5' });
+            if (active) mark.appendChild(icon('check', 'w-3.5 h-3.5'));
+            const t = el('div', { class: 'flex-1 min-w-0' });
+            t.append(el('div', { class: 'text-xs font-medium truncate' }, label));
+            if (sub) t.append(el('div', { class: 'text-[10px] text-zinc-500 dark:text-zinc-400 truncate' }, sub));
+            b.append(mark, t);
+            b.addEventListener('click', onClick);
+            return b;
+          };
+          const head = (t) => el('div', { class: 'px-3 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-500' }, t);
+          if (locked) {
+            modelPopover.append(el('div', { class: 'text-[11px] text-zinc-500 px-3 py-2' },
+              `このチャットは ${AgentsMode.modelOf(this.conv)} / effort ${AgentsMode.effortOf(this.conv)} で実行中です。変更は新しい UserScript チャットから反映されます。`));
+          }
+          const curModel = locked ? Store.settings.agentsModel : AgentsMode.modelOf(this.conv);
+          const curEffort = locked ? Store.settings.agentsEffort : AgentsMode.effortOf(this.conv);
+          modelPopover.append(head('Agents API モデル'));
+          for (const m of AgentsMode.models()) modelPopover.append(item(m.display, m.id, m.id === curModel, () => pick('model', m.id)));
+          modelPopover.append(head('effort'));
+          for (const e of CLAUDE_EFFORT_LEVELS) modelPopover.append(item(e, null, e === curEffort, () => pick('effort', e)));
+          return;
+        }
 
         const models = Store.settings.addedModels || [];
         if (!models.length) {
@@ -5144,6 +6619,15 @@ textarea { resize: none; }
       if (hasCalls) wrap.appendChild(UserScriptMode.renderCalls(m));
       const actions = this.renderActions(m);
       if (actions) wrap.appendChild(actions);
+      // End of an Agents API turn: which model ran it and what the session
+      // has cost so far.
+      if (m.agentsInfo && !m._pending) {
+        const i = m.agentsInfo;
+        wrap.appendChild(el('div', { class: 'mt-1 text-[10px] text-zinc-500 dark:text-zinc-400 flex items-center gap-1' }, [
+          icon('cloud', 'w-3 h-3'),
+          el('span', {}, `Agents API · ${AgentsMode.modelLabel(i.model)} · effort ${i.effort} · このセッションの累計 ${AgentsMode.formatCost(i.costCents)}`)
+        ]));
+      }
       return wrap;
     },
 
@@ -5230,7 +6714,19 @@ textarea { resize: none; }
       // picker mid-generation can't send later tool rounds elsewhere.
       const model = Store.settings.model || '';
       const provider = Providers.of(model);
-      if (!Providers.apiKey(provider)) {
+      // Agents API chats use the Claude key whatever the chat picker shows.
+      const useAgents = AgentsMode.usesAgents(this.conv, this.mode);
+      if (useAgents) {
+        if (!Store.settings.anthropicApiKey) {
+          UI.toast('Agents API モードには Claude API キーが必要です', 'error');
+          SettingsPanel.open();
+          return;
+        }
+        if (!AgentsAPI.available()) {
+          UI.toast('この環境では GM_xmlhttpRequest が使えないため、Agents API モードを利用できません', 'error');
+          return;
+        }
+      } else if (!Providers.apiKey(provider)) {
         UI.toast(`${Providers.label(provider)} の API キーを設定してください`, 'error');
         SettingsPanel.open();
         return;
@@ -5249,6 +6745,12 @@ textarea { resize: none; }
         this.conv = Store.newConversation(this.host, this.mode === UserScriptMode.ID ? UserScriptMode.ID : undefined);
         this.conv.pageUrl = location.href;
         this.conv.pageTitle = document.title || '';
+        if (useAgents) {
+          // The engine and the model / effort the session will be created
+          // with are fixed from here on.
+          this.conv.engine = 'agents';
+          this.conv.agent = { model: AgentsMode.modelOf(null), effort: AgentsMode.effortOf(null) };
+        }
         if (this.els && this.els.updateTitleSub) this.els.updateTitleSub();
       }
 
@@ -5356,6 +6858,17 @@ textarea { resize: none; }
       const webFetch = !!this.urlContext;
 
       try {
+        if (useAgents) {
+          await AgentsMode.run({
+            conv, host, panel: this, userMsg, text,
+            selection: selectedText || '',
+            snapText: pendingSnap ? Page.formatForPrompt(pendingSnap) : '',
+            attachments: userMsg.attachments || [],
+            onPending: (m) => { pending = m; },
+            aborter
+          });
+          return;
+        }
         // Gemini: Google Search grounding (requires Gemini 2.0+ for
         // `googleSearch`; 1.5 uses `googleSearchRetrieval`). URL Context asks
         // Gemini to fetch and read URLs present in the prompt. It's a Gemini
@@ -5859,6 +7372,8 @@ textarea { resize: none; }
       { id: 'general', label: '一般' },
       { id: 'prompts', label: 'プロンプト' },
       { id: 'domains', label: 'ドメイン' },
+      { id: 'agents',  label: 'Agents API' },
+      { id: 'github',  label: 'GitHub' },
       { id: 'backup',  label: 'バックアップ' }
     ],
 
@@ -5910,6 +7425,12 @@ textarea { resize: none; }
           break;
         case 'domains':
           body.append(this.sectionDomains());
+          break;
+        case 'agents':
+          body.append(this.sectionAgents());
+          break;
+        case 'github':
+          body.append(this.sectionGitHub(), this.sectionGists());
           break;
         case 'backup':
           body.append(this.sectionBackup());
@@ -6293,7 +7814,9 @@ textarea { resize: none; }
         if (!totals.convs) return;
         if (!await UI.confirm(`全 ${totals.domains} ドメインの会話履歴 (${totals.convs.toLocaleString()} 件) をすべて削除します。テンプレート・プロンプト上書き・その他設定は残ります。続行しますか?`)) return;
         for (const host of Object.keys(Store.domains)) {
-          if (Store.domains[host]) Store.domains[host].conversations = [];
+          if (!Store.domains[host]) continue;
+          AgentsMode.forget(Store.domains[host].conversations);
+          Store.domains[host].conversations = [];
         }
         // After the wipe, drop any domain entry whose templates / prompt
         // override / extract-mode are also empty — otherwise domains that
@@ -6373,6 +7896,202 @@ textarea { resize: none; }
       return box;
     },
 
+    sectionAgents() {
+      const s = Store.settings;
+      const box = el('section', { class: 'space-y-3' });
+      box.append(Form.sectionTitle('Agents API (サンドボックス実行)'));
+
+      const info = el('div', { class: 'text-xs text-zinc-500 space-y-1' });
+      info.append(el('p', {}, 'オンにすると、新しく始める UserScript チャットを Claude の Agents API (Managed Agents) で実行します。エージェントは Anthropic のクラウド上のサンドボックス (bash・Node.js・Playwright + Chromium) で、作ったスクリプトを実際に動かして確認しながら作業します。ページの調査は今までどおりこのタブで行います。'));
+      info.append(el('p', {}, '「一般」タブの Claude API キーを使います。料金はトークン代と、エージェントが動いている間のサンドボックス稼働料金 ($0.08/時間) です。待機中は稼働料金はかかりません。'));
+      info.append(el('p', {}, 'セッションの記録 (ページの HTML や作成したスクリプトを含む) は Anthropic 側に保存され、チャットを削除すると一緒に削除されます。'));
+      box.append(info);
+
+      if (!AgentsAPI.available()) {
+        box.append(el('p', { class: 'text-xs text-red-600 dark:text-red-400' }, 'この環境では GM_xmlhttpRequest が使えないため、Agents API モードは利用できません。'));
+        return box;
+      }
+
+      box.append(Form.checkbox('UserScript 作成モードで Agents API を使う', s.agentsEnabled, (v) => {
+        s.agentsEnabled = v; Store.saveSettings();
+      }));
+
+      const models = AgentsMode.models();
+      const modelWrap = el('div');
+      modelWrap.append(Form.label('モデル'));
+      modelWrap.append(Form.select(models.map((m) => ({ value: m.id, label: `${m.display} (${m.id})` })),
+        s.agentsModel, (v) => { s.agentsModel = v; Store.saveSettings(); }));
+      box.append(modelWrap);
+
+      const effortWrap = el('div');
+      effortWrap.append(Form.label('推論の深さ (effort)'));
+      effortWrap.append(Form.select([
+        { value: 'low', label: 'low (速い・低コスト)' },
+        { value: 'medium', label: 'medium' },
+        { value: 'high', label: 'high (既定)' },
+        { value: 'xhigh', label: 'xhigh' },
+        { value: 'max', label: 'max (最も深い・高コスト)' }
+      ], s.agentsEffort, (v) => { s.agentsEffort = v; Store.saveSettings(); }));
+      effortWrap.append(el('p', { class: 'text-[11px] text-zinc-500 mt-1' }, 'モデルと effort はチャット画面のモデルボタンからも変更できます。変更は次に作成するセッションから反映されます。'));
+      box.append(effortWrap);
+
+      const budgetNote = el('p', { class: 'text-[11px] text-zinc-500 mt-1' });
+      const paintBudget = () => {
+        budgetNote.textContent = `1 セッションあたり ${AgentsMode.formatCost(AgentsMode.budgetCents())} を上限に設定します (API はドル建てのため換算)。上限に達するとエージェントは一時停止し、上限を引き上げて続けるか確認します。上限の判定はモデル呼び出しの前に行われるため、最後の 1 回分だけ上限をわずかに超えることがあります。`;
+      };
+      const budgetRow = el('div', { class: 'grid grid-cols-2 gap-2' });
+      const budgetCol = el('div');
+      budgetCol.append(Form.label('費用の上限 (円 / セッション)'));
+      budgetCol.append(Form.input(s.agentsBudgetJpy, (v) => {
+        const n = parseInt(v, 10);
+        s.agentsBudgetJpy = Number.isFinite(n) && n > 0 ? n : DEFAULT_SETTINGS.agentsBudgetJpy;
+        Store.saveSettings(); paintBudget();
+      }, { type: 'number', min: '1', step: '100', inputmode: 'numeric' }));
+      const rateCol = el('div');
+      rateCol.append(Form.label('換算レート (円 / ドル)'));
+      rateCol.append(Form.input(s.agentsJpyPerUsd, (v) => {
+        const n = parseFloat(v);
+        s.agentsJpyPerUsd = Number.isFinite(n) && n > 0 ? n : DEFAULT_SETTINGS.agentsJpyPerUsd;
+        Store.saveSettings(); paintBudget();
+      }, { type: 'number', min: '1', step: '1', inputmode: 'decimal' }));
+      budgetRow.append(budgetCol, rateCol);
+      box.append(budgetRow);
+      paintBudget();
+      box.append(budgetNote);
+
+      const transWrap = el('div');
+      transWrap.append(Form.label('イベントの受信方法'));
+      transWrap.append(Form.select([
+        { value: 'auto', label: '自動 (ストリーミング + 途切れたら定期取得)' },
+        { value: 'stream', label: 'ストリーミングのみ' },
+        { value: 'poll', label: '定期取得のみ (iOS などでストリーミングが届かない場合)' }
+      ], s.agentsTransport || 'auto', (v) => { s.agentsTransport = v; Store.saveSettings(); }));
+      box.append(transWrap);
+
+      const ids = el('div', { class: 'text-[11px] text-zinc-500 space-y-0.5 break-all' });
+      const paintIds = () => {
+        clear(ids);
+        ids.append(el('div', {}, `エージェント: ${s.agentsAgentId ? `${s.agentsAgentId} (v${s.agentsAgentVersion})` : '(未作成 — 最初の実行時に作成)'}`));
+        ids.append(el('div', {}, `環境: ${s.agentsEnvironmentId || '(未作成 — 最初の実行時に作成)'}`));
+      };
+      paintIds();
+      box.append(ids);
+      box.append(el('div', { class: 'flex flex-wrap gap-2' }, [
+        Form.btn('エージェントと環境を作り直す', async () => {
+          if (!await UI.confirm('次の実行時に、エージェントと環境を新しく作成します (既存のものは Claude Console に残ります)。続行しますか?')) return;
+          Object.assign(s, { agentsAgentId: '', agentsAgentVersion: 0, agentsAgentHash: '', agentsEnvironmentId: '' });
+          await Store.saveSettings();
+          paintIds();
+        }, 'bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200')
+      ]));
+      return box;
+    },
+
+    sectionGitHub() {
+      const box = el('section', { class: 'space-y-3' });
+      box.append(Form.sectionTitle('GitHub (シークレット Gist への公開)'));
+
+      const link = (href, text) => el('a', { href, target: '_blank', rel: 'noopener noreferrer', class: 'underline text-indigo-600 dark:text-indigo-400' }, text);
+      const info = el('div', { class: 'text-xs text-zinc-500 space-y-1' });
+      info.append(el('p', {}, 'UserScript 作成モードで作ったスクリプトをシークレット Gist に公開するためのトークンを登録します。'));
+      info.append(el('p', {}, ['1. ', link('https://github.com/settings/personal-access-tokens/new', 'Fine-grained トークンの作成ページ'), ' を開く。']));
+      info.append(el('p', {}, '2. Account permissions の「Gists」を Read and write にする (リポジトリの権限は不要)。有効期限も設定する。'));
+      info.append(el('p', {}, '3. 作成したトークンを下に貼り付け、「保存して接続テスト」を押す。classic トークンを使う場合は gist スコープだけを付けてください。'));
+      info.append(el('p', {}, 'トークンはこのユーザースクリプトの GM ストレージにだけ保存され、Google Drive のバックアップには含まれません。Gist の権限はアカウントのすべての Gist に及ぶため、有効期限付きのトークンを使ってください。'));
+      box.append(info);
+
+      if (!SecretKV.available()) {
+        box.append(el('p', { class: 'text-xs text-red-600 dark:text-red-400' }, 'この環境では GM ストレージが使えないため、GitHub 連携は利用できません。'));
+        return box;
+      }
+
+      box.append(Form.label('GitHub トークン'));
+      let draft = '';
+      const input = Form.input('', (v) => { draft = v; }, { type: 'password', placeholder: 'github_pat_... または ghp_...', autocomplete: 'off' });
+      box.append(input);
+      GitHub.token().then((t) => { if (!draft) { input.value = t; draft = t; } });
+
+      const status = el('div', { class: 'text-xs text-zinc-500' });
+      const setStatus = (text, tone) => {
+        status.className = 'text-xs whitespace-pre-wrap ' + (tone === 'ok' ? 'text-emerald-600' : tone === 'error' ? 'text-red-600 dark:text-red-400' : 'text-zinc-500');
+        status.textContent = text;
+      };
+      GitHub.token().then((t) => setStatus(t ? '登録済み (「保存して接続テスト」で確認できます)' : '未登録'));
+      box.append(status);
+
+      const row = el('div', { class: 'flex flex-wrap gap-2' });
+      row.append(Form.btn('保存して接続テスト', async () => {
+        try {
+          await GitHub.setToken(input.value);
+          if (!input.value.trim()) { setStatus('未登録'); return; }
+          setStatus('接続を確認中…');
+          const user = await GitHub.getUser();
+          const login = (user && user.login) || '?';
+          try {
+            await GitHub.listGists();
+            setStatus(`接続 OK: @${login}`, 'ok');
+          } catch (e) {
+            setStatus(`@${login} として認証できましたが、Gist にアクセスできませんでした。トークンの Gists 権限を確認してください。${e && e.message ? `\n${e.message}` : ''}`, 'error');
+          }
+        } catch (e) {
+          setStatus((e && e.message) || String(e), 'error');
+        }
+      }));
+      row.append(Form.btn('トークンを削除', async () => {
+        if (!await UI.confirm('登録済みの GitHub トークンを削除しますか? (公開済みの Gist は削除されません)')) return;
+        await GitHub.setToken('');
+        input.value = '';
+        draft = '';
+        setStatus('未登録');
+      }, 'bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200'));
+      box.append(row);
+      return box;
+    },
+
+    sectionGists() {
+      const box = el('section', { class: 'space-y-3' });
+      box.append(Form.sectionTitle('公開済みスクリプト'));
+      const list = el('div', { class: 'space-y-3' });
+      box.append(list);
+
+      const render = () => {
+        clear(list);
+        const entries = Object.entries(GistPublish.registry())
+          .sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0));
+        if (!entries.length) {
+          list.append(el('p', { class: 'text-xs text-zinc-500' }, 'まだ公開したスクリプトはありません。UserScript 作成モードのインストールカードから公開できます。'));
+          return;
+        }
+        for (const [key, entry] of entries) {
+          const card = el('div', { class: 'p-3 rounded-lg border border-zinc-200 dark:border-zinc-700 space-y-2' });
+          card.append(el('div', { class: 'text-sm font-semibold break-words' }, entry.name || '(名前なし)'));
+          card.append(el('div', { class: 'text-[11px] text-zinc-500 break-all' },
+            `v${entry.version || '?'} · 更新: ${fmtDate(entry.updatedAt || entry.createdAt)}${entry.namespace ? ` · @namespace ${entry.namespace}` : ''}`));
+          card.append(GistPublish.renderLinks(entry, { compact: true }));
+          const row = el('div', { class: 'flex flex-wrap gap-2' });
+          row.append(Form.btn('一覧から外す', async () => {
+            if (!await UI.confirm(`「${entry.name}」を公開済み一覧から外しますか?\n\nGist 自体は残ります。次に同じスクリプトを公開すると、新しい Gist (別の URL) が作られます。`)) return;
+            await GistPublish.unregister(key);
+            render();
+          }, 'bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200'));
+          row.append(Form.btn('Gist を削除', async () => {
+            if (!await UI.confirm(`「${entry.name}」の Gist を GitHub から削除しますか?\n\nこの URL からインストールした環境では、以後は自動更新されなくなります。`)) return;
+            try {
+              await GistPublish.remove(key);
+              UI.toast('Gist を削除しました', 'success');
+              render();
+            } catch (e) {
+              UI.toast((e && e.message) || String(e), 'error');
+            }
+          }, 'bg-red-600 text-white'));
+          card.append(row);
+          list.append(card);
+        }
+      };
+      render();
+      return box;
+    },
+
     sectionTheme() {
       const box = el('section', { class: 'space-y-2' });
       box.append(Form.sectionTitle('テーマ'));
@@ -6447,7 +8166,8 @@ textarea { resize: none; }
     sectionAbout() {
       const box = el('section', { class: 'space-y-1' });
       box.append(Form.sectionTitle('情報'));
-      box.append(el('p', { class: 'text-xs text-zinc-500' }, 'AI Chat Overlay v0.1.0 · Tailwind CSS · Gemini API · Claude API · Google Drive'));
+      const v = scriptVersion();
+      box.append(el('p', { class: 'text-xs text-zinc-500' }, `AI Chat Overlay${v ? ` v${v}` : ''} · Tailwind CSS · Gemini API · Claude API · GitHub Gist · Google Drive`));
       return box;
     }
   };
@@ -6626,6 +8346,7 @@ textarea { resize: none; }
       box.append(Form.sectionTitle('危険な操作'));
       const btn = Form.btn('このドメインの全データを削除', async () => {
         if (!await UI.confirm(`${host} の会話・テンプレート・プロンプト設定を全て削除します。続行しますか?`)) return;
+        if (Store.domains[host]) AgentsMode.forget(Store.domains[host].conversations);
         delete Store.domains[host];
         await Store.saveDomains();
         UI.toast('削除しました', 'success');
