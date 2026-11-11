@@ -2,9 +2,9 @@
 // @name         AI Chat Overlay
 // @name:ja      AI チャット オーバーレイ
 // @namespace    https://github.com/ym/userscripts/ai-chat
-// @version      1.4.0
-// @description  Floating AI chat (Gemini / Claude) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode. Optimized for iOS Safari.
-// @description:ja Webページの内容を文脈として Gemini / Claude と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
+// @version      1.5.0
+// @description  Floating AI chat (Gemini / Claude) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode with secret-Gist publishing. Optimized for iOS Safari.
+// @description:ja Webページの内容を文脈として Gemini / Claude と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。作ったスクリプトはシークレット Gist に公開して URL からインストール・自動更新できる。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
 // @author       ym
 // @match        *://*/*
 // @run-at       document-idle
@@ -22,6 +22,7 @@
 // @grant        GM.xmlHttpRequest
 // @connect      generativelanguage.googleapis.com
 // @connect      api.anthropic.com
+// @connect      api.github.com
 // @connect      www.googleapis.com
 // @connect      oauth2.googleapis.com
 // @connect      cdn.jsdelivr.net
@@ -75,6 +76,31 @@
         if (typeof GM_deleteValue === 'function') return GM_deleteValue(key);
       } catch {}
       try { localStorage.removeItem(KV_PREFIX + key); } catch {}
+    }
+  };
+
+  // Credential storage. Same GM backends as KV but with NO localStorage
+  // fallback: localStorage belongs to the page's origin, so a credential
+  // written there would be readable by every script the page runs. When the
+  // manager offers no GM storage, features that need a credential are simply
+  // unavailable (`available()` is false) and writes throw.
+  const SecretKV = {
+    available() { return hasGM || hasGMlegacy; },
+    async get(key, def) {
+      try {
+        if (hasGM) return await GM.getValue(key, def);
+        if (hasGMlegacy) return GM_getValue(key, def);
+      } catch { /* treated as unset */ }
+      return def;
+    },
+    async set(key, val) {
+      if (hasGM) return GM.setValue(key, val);
+      if (hasGMlegacy) return GM_setValue(key, val);
+      throw new Error('この環境では GM ストレージが使えないため、認証情報を保存できません。');
+    },
+    async del(key) {
+      if (hasGM) return GM.deleteValue(key);
+      if (typeof GM_deleteValue === 'function') return GM_deleteValue(key);
     }
   };
 
@@ -280,7 +306,15 @@
     // session, to keep the userscript manager's storage from growing without
     // bound (UserScript-mode transcripts embed page HTML and whole scripts, so
     // they are far from small). 0 or negative disables the sweep entirely.
-    historyRetentionDays: 30
+    historyRetentionDays: 30,
+    // Userscripts published to secret Gists, keyed by GistPublish.keyOf()
+    // (`@namespace` + `@name`, the identity Tampermonkey itself uses). Each
+    // entry remembers which Gist and file a script lives in, so republishing
+    // the same script updates that Gist in place and the install URL — which
+    // installed copies poll through @updateURL — never changes. Kept in
+    // settings so it rides along with the Drive backup; the GitHub token does
+    // not (it lives in SecretKV).
+    gistPublished: {}
   };
 
   const Store = {
@@ -1700,6 +1734,95 @@
   };
 
   // =========================================================================
+  // 5b. GitHub Gist client
+  // =========================================================================
+  // Publishes userscripts as secret Gists (see GistPublish). Requests go
+  // through GM_xmlhttpRequest only: they carry the user's token, and routing
+  // them through the page's fetch would expose it to the page's own request
+  // hooks. The token is a fine-grained PAT with the account permission
+  // "Gists: Read and write" (or a classic token with the `gist` scope) and is
+  // stored in SecretKV, never in Store.settings, so it is neither written to
+  // localStorage nor included in the Drive backup.
+  const GITHUB_API = 'https://api.github.com';
+  const GITHUB_TOKEN_KEY = 'secret:githubToken';
+
+  const GitHub = {
+    _token: '',
+    _loaded: false,
+
+    async token() {
+      if (!this._loaded) {
+        this._token = String(await SecretKV.get(GITHUB_TOKEN_KEY, '') || '');
+        this._loaded = true;
+      }
+      return this._token;
+    },
+
+    async setToken(value) {
+      const v = String(value || '').trim();
+      if (v) await SecretKV.set(GITHUB_TOKEN_KEY, v);
+      else await SecretKV.del(GITHUB_TOKEN_KEY);
+      this._token = v;
+      this._loaded = true;
+    },
+
+    async request(method, path, body) {
+      const token = await this.token();
+      if (!token) throw new Error('GitHub トークンが未設定です。設定 → GitHub で登録してください。');
+      const headers = {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${token}`,
+        'X-GitHub-Api-Version': '2022-11-28'
+      };
+      if (body !== undefined) headers['Content-Type'] = 'application/json';
+      const r = await gmRequest({ method, url: GITHUB_API + path, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+      let data = null;
+      try { data = r.responseText ? JSON.parse(r.responseText) : null; } catch { /* non-JSON body */ }
+      if (r.status < 200 || r.status >= 300) throw this.httpError(r.status, data, r.responseText);
+      return data;
+    },
+
+    httpError(status, data, text) {
+      const detail = (data && data.message) || (text || '').slice(0, 200);
+      let msg;
+      if (status === 401) msg = 'GitHub トークンが無効か期限切れです。設定 → GitHub で登録し直してください。';
+      else if (status === 403) msg = 'GitHub に拒否されました。トークンに Gists の Read and write 権限があるか確認してください (レート制限の可能性もあります)。';
+      else if (status === 404) msg = '対象の Gist が見つかりません (削除された可能性があります)。';
+      else if (status === 422) msg = 'GitHub が送信内容を受け付けませんでした。';
+      else msg = `GitHub API エラー (${status})。`;
+      const err = new Error(detail ? `${msg} [${detail}]` : msg);
+      err.status = status;
+      return err;
+    },
+
+    getUser() { return this.request('GET', '/user'); },
+    listGists() { return this.request('GET', '/gists?per_page=1'); },
+
+    createGist({ description, filename, content }) {
+      return this.request('POST', '/gists', {
+        description: description || '',
+        public: false,
+        files: { [filename]: { content } }
+      });
+    },
+
+    updateGist(id, { description, filename, content }) {
+      const body = { files: { [filename]: { content } } };
+      if (description != null) body.description = description;
+      return this.request('PATCH', `/gists/${encodeURIComponent(id)}`, body);
+    },
+
+    deleteGist(id) { return this.request('DELETE', `/gists/${encodeURIComponent(id)}`); },
+
+    // The revision-less raw URL always serves the Gist's latest revision, which
+    // is what @updateURL needs. GitHub's CDN may serve the previous revision
+    // for a few minutes after an update.
+    rawUrl(owner, id, filename) {
+      return `https://gist.githubusercontent.com/${encodeURIComponent(owner)}/${encodeURIComponent(id)}/raw/${encodeURIComponent(filename)}`;
+    }
+  };
+
+  // =========================================================================
   // 6. Page context extractor
   // =========================================================================
   const Page = {
@@ -2241,7 +2364,7 @@
   //    precompiled path above.
   // ------------------------------------------------------------------------
   /* @TAILWIND_CSS_START */
-  const TAILWIND_CSS = `.\\!container{width:100%!important}.container{width:100%}@media (min-width:640px){.\\!container{max-width:640px!important}.container{max-width:640px}}@media (min-width:768px){.\\!container{max-width:768px!important}.container{max-width:768px}}@media (min-width:1024px){.\\!container{max-width:1024px!important}.container{max-width:1024px}}@media (min-width:1280px){.\\!container{max-width:1280px!important}.container{max-width:1280px}}@media (min-width:1536px){.\\!container{max-width:1536px!important}.container{max-width:1536px}}.pointer-events-none{pointer-events:none}.pointer-events-auto{pointer-events:auto}.\\!visible{visibility:visible!important}.visible{visibility:visible}.invisible{visibility:hidden}.fixed{position:fixed}.absolute{position:absolute}.relative{position:relative}.inset-0{inset:0}.bottom-4{bottom:1em}.bottom-full{bottom:100%}.left-0{left:0}.left-1{left:.25em}.left-1\\/2{left:50%}.z-20{z-index:20}.mx-3{margin-left:.75em;margin-right:.75em}.my-1{margin-top:.25em;margin-bottom:.25em}.my-2{margin-top:.5em;margin-bottom:.5em}.my-3{margin-top:.75em;margin-bottom:.75em}.mb-1{margin-bottom:.25em}.mb-2{margin-bottom:.5em}.mb-3{margin-bottom:.75em}.ml-5{margin-left:1.25em}.mr-1{margin-right:.25em}.mr-2{margin-right:.5em}.mt-0{margin-top:0}.mt-0\\.5{margin-top:.125em}.mt-1{margin-top:.25em}.mt-1\\.5{margin-top:.375em}.mt-2{margin-top:.5em}.mt-3{margin-top:.75em}.mt-4{margin-top:1em}.line-clamp-2{-webkit-line-clamp:2}.line-clamp-2,.line-clamp-3{overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical}.line-clamp-3{-webkit-line-clamp:3}.\\!block{display:block!important}.block{display:block}.inline-block{display:inline-block}.inline{display:inline}.flex{display:flex}.inline-flex{display:inline-flex}.table{display:table}.grid{display:grid}.contents{display:contents}.hidden{display:none}.h-1{height:.25em}.h-10{height:2.5em}.h-3{height:.75em}.h-3\\.5{height:.875em}.h-4{height:1em}.h-5{height:1.25em}.h-6{height:1.5em}.h-64{height:16em}.h-7{height:1.75em}.h-8{height:2em}.h-9{height:2.25em}.h-auto{height:auto}.max-h-40{max-height:10em}.max-h-64{max-height:16em}.max-h-80{max-height:20em}.max-h-\\[160px\\]{max-height:160px}.max-h-\\[85dvh\\]{max-height:85dvh}.min-h-\\[40px\\]{min-height:40px}.w-10{width:2.5em}.w-24{width:6em}.w-3{width:.75em}.w-3\\.5{width:.875em}.w-4{width:1em}.w-5{width:1.25em}.w-6{width:1.5em}.w-7{width:1.75em}.w-72{width:18em}.w-8{width:2em}.w-9{width:2.25em}.w-full{width:100%}.min-w-0{min-width:0}.min-w-\\[220px\\]{min-width:220px}.min-w-\\[80px\\]{min-width:80px}.max-w-2xl{max-width:42em}.max-w-\\[160px\\]{max-width:160px}.max-w-\\[200px\\]{max-width:200px}.max-w-\\[85\\%\\]{max-width:85%}.max-w-\\[90\\%\\]{max-width:90%}.max-w-full{max-width:100%}.max-w-sm{max-width:24em}.max-w-xl{max-width:36em}.flex-1{flex:1 1 0%}.flex-shrink,.shrink{flex-shrink:1}.shrink-0{flex-shrink:0}.border-collapse{border-collapse:collapse}.-translate-x-1{--tw-translate-x:-0.25em}.-translate-x-1,.-translate-x-1\\/2{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.-translate-x-1\\/2{--tw-translate-x:-50%}.transform{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.cursor-pointer{cursor:pointer}.select-none{-webkit-user-select:none;-moz-user-select:none;user-select:none}.resize{resize:both}.list-decimal{list-style-type:decimal}.list-disc{list-style-type:disc}.grid-cols-6{grid-template-columns:repeat(6,minmax(0,1fr))}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.items-start{align-items:flex-start}.items-end{align-items:flex-end}.items-center{align-items:center}.justify-start{justify-content:flex-start}.justify-end{justify-content:flex-end}.justify-center{justify-content:center}.gap-1{gap:.25em}.gap-2{gap:.5em}.gap-3{gap:.75em}.space-y-1>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.25em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.25em*var(--tw-space-y-reverse))}.space-y-2>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.5em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.5em*var(--tw-space-y-reverse))}.space-y-3>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.75em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.75em*var(--tw-space-y-reverse))}.space-y-6>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(1.5em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(1.5em*var(--tw-space-y-reverse))}.divide-y>:not([hidden])~:not([hidden]){--tw-divide-y-reverse:0;border-top-width:calc(1px*(1 - var(--tw-divide-y-reverse)));border-bottom-width:calc(1px*var(--tw-divide-y-reverse))}.divide-zinc-100>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(244 244 245/var(--tw-divide-opacity,1))}.overflow-auto{overflow:auto}.overflow-hidden{overflow:hidden}.overflow-x-auto{overflow-x:auto}.overflow-y-auto{overflow-y:auto}.truncate{overflow:hidden;text-overflow:ellipsis}.truncate,.whitespace-nowrap{white-space:nowrap}.whitespace-pre-wrap{white-space:pre-wrap}.break-words{overflow-wrap:break-word}.break-all{word-break:break-all}.rounded{border-radius:.25em}.rounded-2xl{border-radius:1em}.rounded-full{border-radius:9999px}.rounded-lg{border-radius:.5em}.rounded-md{border-radius:.375em}.rounded-xl{border-radius:.75em}.rounded-r-lg{border-top-right-radius:.5em;border-bottom-right-radius:.5em}.rounded-t-2xl{border-top-left-radius:1em;border-top-right-radius:1em}.border{border-width:1px}.border-b{border-bottom-width:1px}.border-b-2{border-bottom-width:2px}.border-l-4{border-left-width:4px}.border-t{border-top-width:1px}.border-dashed{border-style:dashed}.border-indigo-200{--tw-border-opacity:1;border-color:rgb(199 210 254/var(--tw-border-opacity,1))}.border-indigo-500{--tw-border-opacity:1;border-color:rgb(99 102 241/var(--tw-border-opacity,1))}.border-indigo-600{--tw-border-opacity:1;border-color:rgb(79 70 229/var(--tw-border-opacity,1))}.border-transparent{border-color:transparent}.border-zinc-100{--tw-border-opacity:1;border-color:rgb(244 244 245/var(--tw-border-opacity,1))}.border-zinc-200{--tw-border-opacity:1;border-color:rgb(228 228 231/var(--tw-border-opacity,1))}.border-zinc-300{--tw-border-opacity:1;border-color:rgb(212 212 216/var(--tw-border-opacity,1))}.bg-black{--tw-bg-opacity:1;background-color:rgb(0 0 0/var(--tw-bg-opacity,1))}.bg-black\\/30{background-color:rgba(0,0,0,.3)}.bg-black\\/40{background-color:rgba(0,0,0,.4)}.bg-emerald-600{--tw-bg-opacity:1;background-color:rgb(5 150 105/var(--tw-bg-opacity,1))}.bg-indigo-100{--tw-bg-opacity:1;background-color:rgb(224 231 255/var(--tw-bg-opacity,1))}.bg-indigo-50{--tw-bg-opacity:1;background-color:rgb(238 242 255/var(--tw-bg-opacity,1))}.bg-indigo-600{--tw-bg-opacity:1;background-color:rgb(79 70 229/var(--tw-bg-opacity,1))}.bg-indigo-900{--tw-bg-opacity:1;background-color:rgb(49 46 129/var(--tw-bg-opacity,1))}.bg-red-50{--tw-bg-opacity:1;background-color:rgb(254 242 242/var(--tw-bg-opacity,1))}.bg-red-600{--tw-bg-opacity:1;background-color:rgb(220 38 38/var(--tw-bg-opacity,1))}.bg-red-900{--tw-bg-opacity:1;background-color:rgb(127 29 29/var(--tw-bg-opacity,1))}.bg-transparent{background-color:transparent}.bg-white{--tw-bg-opacity:1;background-color:rgb(255 255 255/var(--tw-bg-opacity,1))}.bg-zinc-100{--tw-bg-opacity:1;background-color:rgb(244 244 245/var(--tw-bg-opacity,1))}.bg-zinc-200{--tw-bg-opacity:1;background-color:rgb(228 228 231/var(--tw-bg-opacity,1))}.bg-zinc-300{--tw-bg-opacity:1;background-color:rgb(212 212 216/var(--tw-bg-opacity,1))}.bg-zinc-50{--tw-bg-opacity:1;background-color:rgb(250 250 250/var(--tw-bg-opacity,1))}.bg-zinc-700{--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.bg-zinc-800{--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.bg-zinc-900{--tw-bg-opacity:1;background-color:rgb(24 24 27/var(--tw-bg-opacity,1))}.object-cover{-o-object-fit:cover;object-fit:cover}.p-0{padding:0}.p-1{padding:.25em}.p-2{padding:.5em}.p-3{padding:.75em}.p-4{padding:1em}.p-8{padding:2em}.px-1{padding-left:.25em;padding-right:.25em}.px-1\\.5{padding-left:.375em;padding-right:.375em}.px-2{padding-left:.5em;padding-right:.5em}.px-3{padding-left:.75em;padding-right:.75em}.px-4{padding-left:1em;padding-right:1em}.py-0{padding-top:0;padding-bottom:0}.py-0\\.5{padding-top:.125em;padding-bottom:.125em}.py-1{padding-top:.25em;padding-bottom:.25em}.py-1\\.5{padding-top:.375em;padding-bottom:.375em}.py-2{padding-top:.5em;padding-bottom:.5em}.py-2\\.5{padding-top:.625em;padding-bottom:.625em}.py-3{padding-top:.75em;padding-bottom:.75em}.py-8{padding-top:2em;padding-bottom:2em}.pb-1{padding-bottom:.25em}.pb-2{padding-bottom:.5em}.pb-3{padding-bottom:.75em}.pl-3{padding-left:.75em}.pt-0{padding-top:0}.pt-0\\.5{padding-top:.125em}.pt-1{padding-top:.25em}.pt-2{padding-top:.5em}.pt-3{padding-top:.75em}.pt-4{padding-top:1em}.text-left{text-align:left}.text-center{text-align:center}.align-top{vertical-align:top}.font-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.text-\\[0\\.85em\\]{font-size:.85em}.text-\\[10px\\]{font-size:10px}.text-\\[11px\\]{font-size:11px}.text-base{font-size:16px;line-height:24px}.text-lg{font-size:18px;line-height:28px}.text-sm{font-size:14px;line-height:20px}.text-xl{font-size:20px;line-height:28px}.text-xs{font-size:12px;line-height:16px}.font-bold{font-weight:700}.font-medium{font-weight:500}.font-semibold{font-weight:600}.uppercase{text-transform:uppercase}.italic{font-style:italic}.leading-none{line-height:1}.leading-relaxed{line-height:1.625}.tracking-wide{letter-spacing:.025em}.tracking-wider{letter-spacing:.05em}.text-blue-600{--tw-text-opacity:1;color:rgb(37 99 235/var(--tw-text-opacity,1))}.text-emerald-600{--tw-text-opacity:1;color:rgb(5 150 105/var(--tw-text-opacity,1))}.text-indigo-600{--tw-text-opacity:1;color:rgb(79 70 229/var(--tw-text-opacity,1))}.text-indigo-700{--tw-text-opacity:1;color:rgb(67 56 202/var(--tw-text-opacity,1))}.text-inherit{color:inherit}.text-red-700{--tw-text-opacity:1;color:rgb(185 28 28/var(--tw-text-opacity,1))}.text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.text-zinc-100{--tw-text-opacity:1;color:rgb(244 244 245/var(--tw-text-opacity,1))}.text-zinc-400{--tw-text-opacity:1;color:rgb(161 161 170/var(--tw-text-opacity,1))}.text-zinc-500{--tw-text-opacity:1;color:rgb(113 113 122/var(--tw-text-opacity,1))}.text-zinc-600{--tw-text-opacity:1;color:rgb(82 82 91/var(--tw-text-opacity,1))}.text-zinc-700{--tw-text-opacity:1;color:rgb(63 63 70/var(--tw-text-opacity,1))}.text-zinc-800{--tw-text-opacity:1;color:rgb(39 39 42/var(--tw-text-opacity,1))}.text-zinc-900{--tw-text-opacity:1;color:rgb(24 24 27/var(--tw-text-opacity,1))}.underline{text-decoration-line:underline}.antialiased{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}.opacity-80{opacity:.8}.shadow{--tw-shadow:0 1px 3px 0 rgba(0,0,0,.1),0 1px 2px -1px rgba(0,0,0,.1);--tw-shadow-colored:0 1px 3px 0 var(--tw-shadow-color),0 1px 2px -1px var(--tw-shadow-color)}.shadow,.shadow-2xl{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-2xl{--tw-shadow:0 25px 50px -12px rgba(0,0,0,.25);--tw-shadow-colored:0 25px 50px -12px var(--tw-shadow-color)}.shadow-lg{--tw-shadow:0 10px 15px -3px rgba(0,0,0,.1),0 4px 6px -4px rgba(0,0,0,.1);--tw-shadow-colored:0 10px 15px -3px var(--tw-shadow-color),0 4px 6px -4px var(--tw-shadow-color)}.shadow-lg,.shadow-xl{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-xl{--tw-shadow:0 20px 25px -5px rgba(0,0,0,.1),0 8px 10px -6px rgba(0,0,0,.1);--tw-shadow-colored:0 20px 25px -5px var(--tw-shadow-color),0 8px 10px -6px var(--tw-shadow-color)}.outline{outline-style:solid}.ring{--tw-ring-offset-shadow:var(--tw-ring-inset) 0 0 0 var(--tw-ring-offset-width) var(--tw-ring-offset-color);--tw-ring-shadow:var(--tw-ring-inset) 0 0 0 calc(3px + var(--tw-ring-offset-width)) var(--tw-ring-color);box-shadow:var(--tw-ring-offset-shadow),var(--tw-ring-shadow),var(--tw-shadow,0 0 #0000)}.blur{--tw-blur:blur(8px)}.blur,.filter{filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.transition{transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,-webkit-backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter,-webkit-backdrop-filter;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.ease-out{transition-timing-function:cubic-bezier(0,0,.2,1)}.empty\\:hidden:empty{display:none}.hover\\:bg-indigo-50:hover{--tw-bg-opacity:1;background-color:rgb(238 242 255/var(--tw-bg-opacity,1))}.hover\\:bg-red-50:hover{--tw-bg-opacity:1;background-color:rgb(254 242 242/var(--tw-bg-opacity,1))}.hover\\:bg-zinc-100:hover{--tw-bg-opacity:1;background-color:rgb(244 244 245/var(--tw-bg-opacity,1))}.hover\\:bg-zinc-50:hover{--tw-bg-opacity:1;background-color:rgb(250 250 250/var(--tw-bg-opacity,1))}.hover\\:text-red-500:hover{--tw-text-opacity:1;color:rgb(239 68 68/var(--tw-text-opacity,1))}.hover\\:text-red-600:hover{--tw-text-opacity:1;color:rgb(220 38 38/var(--tw-text-opacity,1))}.hover\\:text-zinc-600:hover{--tw-text-opacity:1;color:rgb(82 82 91/var(--tw-text-opacity,1))}.hover\\:text-zinc-700:hover{--tw-text-opacity:1;color:rgb(63 63 70/var(--tw-text-opacity,1))}.hover\\:underline:hover{text-decoration-line:underline}.disabled\\:opacity-50:disabled{opacity:.5}.dark\\:divide-zinc-800:is(.dark *)>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(39 39 42/var(--tw-divide-opacity,1))}.dark\\:border-indigo-800:is(.dark *){--tw-border-opacity:1;border-color:rgb(55 48 163/var(--tw-border-opacity,1))}.dark\\:border-zinc-600:is(.dark *){--tw-border-opacity:1;border-color:rgb(82 82 91/var(--tw-border-opacity,1))}.dark\\:border-zinc-700:is(.dark *){--tw-border-opacity:1;border-color:rgb(63 63 70/var(--tw-border-opacity,1))}.dark\\:border-zinc-800:is(.dark *){--tw-border-opacity:1;border-color:rgb(39 39 42/var(--tw-border-opacity,1))}.dark\\:bg-indigo-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(49 46 129/var(--tw-bg-opacity,1))}.dark\\:bg-indigo-900\\/30:is(.dark *){background-color:rgba(49,46,129,.3)}.dark\\:bg-indigo-900\\/40:is(.dark *){background-color:rgba(49,46,129,.4)}.dark\\:bg-red-900\\/30:is(.dark *){background-color:rgba(127,29,29,.3)}.dark\\:bg-zinc-600:is(.dark *){--tw-bg-opacity:1;background-color:rgb(82 82 91/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-700:is(.dark *){--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-800:is(.dark *){--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-800\\/50:is(.dark *){background-color:rgba(39,39,42,.5)}.dark\\:bg-zinc-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(24 24 27/var(--tw-bg-opacity,1))}.dark\\:text-blue-400:is(.dark *){--tw-text-opacity:1;color:rgb(96 165 250/var(--tw-text-opacity,1))}.dark\\:text-indigo-200:is(.dark *){--tw-text-opacity:1;color:rgb(199 210 254/var(--tw-text-opacity,1))}.dark\\:text-indigo-300:is(.dark *){--tw-text-opacity:1;color:rgb(165 180 252/var(--tw-text-opacity,1))}.dark\\:text-indigo-400:is(.dark *){--tw-text-opacity:1;color:rgb(129 140 248/var(--tw-text-opacity,1))}.dark\\:text-red-300:is(.dark *){--tw-text-opacity:1;color:rgb(252 165 165/var(--tw-text-opacity,1))}.dark\\:text-zinc-100:is(.dark *){--tw-text-opacity:1;color:rgb(244 244 245/var(--tw-text-opacity,1))}.dark\\:text-zinc-200:is(.dark *){--tw-text-opacity:1;color:rgb(228 228 231/var(--tw-text-opacity,1))}.dark\\:text-zinc-300:is(.dark *){--tw-text-opacity:1;color:rgb(212 212 216/var(--tw-text-opacity,1))}.dark\\:text-zinc-400:is(.dark *){--tw-text-opacity:1;color:rgb(161 161 170/var(--tw-text-opacity,1))}.dark\\:text-zinc-500:is(.dark *){--tw-text-opacity:1;color:rgb(113 113 122/var(--tw-text-opacity,1))}.dark\\:hover\\:bg-indigo-900\\/40:hover:is(.dark *){background-color:rgba(49,46,129,.4)}.dark\\:hover\\:bg-red-900\\/30:hover:is(.dark *){background-color:rgba(127,29,29,.3)}.dark\\:hover\\:bg-zinc-700:hover:is(.dark *){--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.dark\\:hover\\:bg-zinc-800:hover:is(.dark *){--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.dark\\:hover\\:bg-zinc-800\\/50:hover:is(.dark *){background-color:rgba(39,39,42,.5)}.dark\\:hover\\:bg-zinc-800\\/60:hover:is(.dark *){background-color:rgba(39,39,42,.6)}.dark\\:hover\\:text-zinc-200:hover:is(.dark *){--tw-text-opacity:1;color:rgb(228 228 231/var(--tw-text-opacity,1))}@media (min-width:640px){.sm\\:mx-auto{margin-left:auto;margin-right:auto}.sm\\:my-4{margin-top:1em}.sm\\:mb-4,.sm\\:my-4{margin-bottom:1em}.sm\\:h-\\[calc\\(100dvh-2em\\)\\]{height:calc(100dvh - 2em)}.sm\\:max-w-4xl{max-width:56em}.sm\\:max-w-5xl{max-width:64em}.sm\\:max-w-6xl{max-width:72em}.sm\\:items-stretch{align-items:stretch}.sm\\:rounded-2xl{border-radius:1em}}`;
+  const TAILWIND_CSS = `.\\!container{width:100%!important}.container{width:100%}@media (min-width:640px){.\\!container{max-width:640px!important}.container{max-width:640px}}@media (min-width:768px){.\\!container{max-width:768px!important}.container{max-width:768px}}@media (min-width:1024px){.\\!container{max-width:1024px!important}.container{max-width:1024px}}@media (min-width:1280px){.\\!container{max-width:1280px!important}.container{max-width:1280px}}@media (min-width:1536px){.\\!container{max-width:1536px!important}.container{max-width:1536px}}.pointer-events-none{pointer-events:none}.pointer-events-auto{pointer-events:auto}.\\!visible{visibility:visible!important}.visible{visibility:visible}.invisible{visibility:hidden}.fixed{position:fixed}.absolute{position:absolute}.relative{position:relative}.inset-0{inset:0}.bottom-4{bottom:1em}.bottom-full{bottom:100%}.left-0{left:0}.left-1{left:.25em}.left-1\\/2{left:50%}.z-20{z-index:20}.mx-3{margin-left:.75em;margin-right:.75em}.my-1{margin-top:.25em;margin-bottom:.25em}.my-2{margin-top:.5em;margin-bottom:.5em}.my-3{margin-top:.75em;margin-bottom:.75em}.mb-1{margin-bottom:.25em}.mb-2{margin-bottom:.5em}.mb-3{margin-bottom:.75em}.ml-5{margin-left:1.25em}.mr-1{margin-right:.25em}.mr-2{margin-right:.5em}.mt-0{margin-top:0}.mt-0\\.5{margin-top:.125em}.mt-1{margin-top:.25em}.mt-1\\.5{margin-top:.375em}.mt-2{margin-top:.5em}.mt-3{margin-top:.75em}.mt-4{margin-top:1em}.line-clamp-2{-webkit-line-clamp:2}.line-clamp-2,.line-clamp-3{overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical}.line-clamp-3{-webkit-line-clamp:3}.\\!block{display:block!important}.block{display:block}.inline-block{display:inline-block}.inline{display:inline}.flex{display:flex}.inline-flex{display:inline-flex}.table{display:table}.grid{display:grid}.contents{display:contents}.hidden{display:none}.h-1{height:.25em}.h-10{height:2.5em}.h-3{height:.75em}.h-3\\.5{height:.875em}.h-4{height:1em}.h-5{height:1.25em}.h-6{height:1.5em}.h-64{height:16em}.h-7{height:1.75em}.h-8{height:2em}.h-9{height:2.25em}.h-auto{height:auto}.max-h-40{max-height:10em}.max-h-64{max-height:16em}.max-h-80{max-height:20em}.max-h-\\[160px\\]{max-height:160px}.max-h-\\[85dvh\\]{max-height:85dvh}.min-h-\\[40px\\]{min-height:40px}.w-10{width:2.5em}.w-24{width:6em}.w-3{width:.75em}.w-3\\.5{width:.875em}.w-4{width:1em}.w-5{width:1.25em}.w-6{width:1.5em}.w-7{width:1.75em}.w-72{width:18em}.w-8{width:2em}.w-9{width:2.25em}.w-full{width:100%}.min-w-0{min-width:0}.min-w-\\[220px\\]{min-width:220px}.min-w-\\[80px\\]{min-width:80px}.max-w-2xl{max-width:42em}.max-w-\\[160px\\]{max-width:160px}.max-w-\\[200px\\]{max-width:200px}.max-w-\\[85\\%\\]{max-width:85%}.max-w-\\[90\\%\\]{max-width:90%}.max-w-full{max-width:100%}.max-w-sm{max-width:24em}.max-w-xl{max-width:36em}.flex-1{flex:1 1 0%}.flex-shrink,.shrink{flex-shrink:1}.shrink-0{flex-shrink:0}.border-collapse{border-collapse:collapse}.-translate-x-1{--tw-translate-x:-0.25em}.-translate-x-1,.-translate-x-1\\/2{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.-translate-x-1\\/2{--tw-translate-x:-50%}.transform{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.cursor-pointer{cursor:pointer}.select-none{-webkit-user-select:none;-moz-user-select:none;user-select:none}.select-all{-webkit-user-select:all;-moz-user-select:all;user-select:all}.resize{resize:both}.list-decimal{list-style-type:decimal}.list-disc{list-style-type:disc}.grid-cols-6{grid-template-columns:repeat(6,minmax(0,1fr))}.grid-cols-\\[auto_1fr\\]{grid-template-columns:auto 1fr}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.items-start{align-items:flex-start}.items-end{align-items:flex-end}.items-center{align-items:center}.justify-start{justify-content:flex-start}.justify-end{justify-content:flex-end}.justify-center{justify-content:center}.gap-1{gap:.25em}.gap-2{gap:.5em}.gap-3{gap:.75em}.gap-x-3{-moz-column-gap:.75em;column-gap:.75em}.gap-y-1{row-gap:.25em}.space-y-1>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.25em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.25em*var(--tw-space-y-reverse))}.space-y-2>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.5em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.5em*var(--tw-space-y-reverse))}.space-y-3>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.75em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.75em*var(--tw-space-y-reverse))}.space-y-6>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(1.5em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(1.5em*var(--tw-space-y-reverse))}.divide-y>:not([hidden])~:not([hidden]){--tw-divide-y-reverse:0;border-top-width:calc(1px*(1 - var(--tw-divide-y-reverse)));border-bottom-width:calc(1px*var(--tw-divide-y-reverse))}.divide-zinc-100>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(244 244 245/var(--tw-divide-opacity,1))}.overflow-auto{overflow:auto}.overflow-hidden{overflow:hidden}.overflow-x-auto{overflow-x:auto}.overflow-y-auto{overflow-y:auto}.truncate{overflow:hidden;text-overflow:ellipsis}.truncate,.whitespace-nowrap{white-space:nowrap}.whitespace-pre-wrap{white-space:pre-wrap}.break-words{overflow-wrap:break-word}.break-all{word-break:break-all}.rounded{border-radius:.25em}.rounded-2xl{border-radius:1em}.rounded-full{border-radius:9999px}.rounded-lg{border-radius:.5em}.rounded-md{border-radius:.375em}.rounded-xl{border-radius:.75em}.rounded-r-lg{border-top-right-radius:.5em;border-bottom-right-radius:.5em}.rounded-t-2xl{border-top-left-radius:1em;border-top-right-radius:1em}.border{border-width:1px}.border-b{border-bottom-width:1px}.border-b-2{border-bottom-width:2px}.border-l-4{border-left-width:4px}.border-t{border-top-width:1px}.border-dashed{border-style:dashed}.border-indigo-200{--tw-border-opacity:1;border-color:rgb(199 210 254/var(--tw-border-opacity,1))}.border-indigo-500{--tw-border-opacity:1;border-color:rgb(99 102 241/var(--tw-border-opacity,1))}.border-indigo-600{--tw-border-opacity:1;border-color:rgb(79 70 229/var(--tw-border-opacity,1))}.border-transparent{border-color:transparent}.border-zinc-100{--tw-border-opacity:1;border-color:rgb(244 244 245/var(--tw-border-opacity,1))}.border-zinc-200{--tw-border-opacity:1;border-color:rgb(228 228 231/var(--tw-border-opacity,1))}.border-zinc-300{--tw-border-opacity:1;border-color:rgb(212 212 216/var(--tw-border-opacity,1))}.bg-amber-50{--tw-bg-opacity:1;background-color:rgb(255 251 235/var(--tw-bg-opacity,1))}.bg-amber-900{--tw-bg-opacity:1;background-color:rgb(120 53 15/var(--tw-bg-opacity,1))}.bg-black{--tw-bg-opacity:1;background-color:rgb(0 0 0/var(--tw-bg-opacity,1))}.bg-black\\/30{background-color:rgba(0,0,0,.3)}.bg-black\\/40{background-color:rgba(0,0,0,.4)}.bg-emerald-600{--tw-bg-opacity:1;background-color:rgb(5 150 105/var(--tw-bg-opacity,1))}.bg-indigo-100{--tw-bg-opacity:1;background-color:rgb(224 231 255/var(--tw-bg-opacity,1))}.bg-indigo-50{--tw-bg-opacity:1;background-color:rgb(238 242 255/var(--tw-bg-opacity,1))}.bg-indigo-600{--tw-bg-opacity:1;background-color:rgb(79 70 229/var(--tw-bg-opacity,1))}.bg-indigo-900{--tw-bg-opacity:1;background-color:rgb(49 46 129/var(--tw-bg-opacity,1))}.bg-red-50{--tw-bg-opacity:1;background-color:rgb(254 242 242/var(--tw-bg-opacity,1))}.bg-red-600{--tw-bg-opacity:1;background-color:rgb(220 38 38/var(--tw-bg-opacity,1))}.bg-red-900{--tw-bg-opacity:1;background-color:rgb(127 29 29/var(--tw-bg-opacity,1))}.bg-transparent{background-color:transparent}.bg-white{--tw-bg-opacity:1;background-color:rgb(255 255 255/var(--tw-bg-opacity,1))}.bg-white\\/70{background-color:hsla(0,0%,100%,.7)}.bg-zinc-100{--tw-bg-opacity:1;background-color:rgb(244 244 245/var(--tw-bg-opacity,1))}.bg-zinc-200{--tw-bg-opacity:1;background-color:rgb(228 228 231/var(--tw-bg-opacity,1))}.bg-zinc-300{--tw-bg-opacity:1;background-color:rgb(212 212 216/var(--tw-bg-opacity,1))}.bg-zinc-50{--tw-bg-opacity:1;background-color:rgb(250 250 250/var(--tw-bg-opacity,1))}.bg-zinc-700{--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.bg-zinc-800{--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.bg-zinc-900{--tw-bg-opacity:1;background-color:rgb(24 24 27/var(--tw-bg-opacity,1))}.object-cover{-o-object-fit:cover;object-fit:cover}.p-0{padding:0}.p-1{padding:.25em}.p-2{padding:.5em}.p-3{padding:.75em}.p-4{padding:1em}.p-8{padding:2em}.px-1{padding-left:.25em;padding-right:.25em}.px-1\\.5{padding-left:.375em;padding-right:.375em}.px-2{padding-left:.5em;padding-right:.5em}.px-3{padding-left:.75em;padding-right:.75em}.px-4{padding-left:1em;padding-right:1em}.py-0{padding-top:0;padding-bottom:0}.py-0\\.5{padding-top:.125em;padding-bottom:.125em}.py-1{padding-top:.25em;padding-bottom:.25em}.py-1\\.5{padding-top:.375em;padding-bottom:.375em}.py-2{padding-top:.5em;padding-bottom:.5em}.py-2\\.5{padding-top:.625em;padding-bottom:.625em}.py-3{padding-top:.75em;padding-bottom:.75em}.py-8{padding-top:2em;padding-bottom:2em}.pb-1{padding-bottom:.25em}.pb-2{padding-bottom:.5em}.pb-3{padding-bottom:.75em}.pl-3{padding-left:.75em}.pt-0{padding-top:0}.pt-0\\.5{padding-top:.125em}.pt-1{padding-top:.25em}.pt-2{padding-top:.5em}.pt-3{padding-top:.75em}.pt-4{padding-top:1em}.text-left{text-align:left}.text-center{text-align:center}.align-top{vertical-align:top}.font-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.text-\\[0\\.85em\\]{font-size:.85em}.text-\\[10px\\]{font-size:10px}.text-\\[11px\\]{font-size:11px}.text-base{font-size:16px;line-height:24px}.text-lg{font-size:18px;line-height:28px}.text-sm{font-size:14px;line-height:20px}.text-xl{font-size:20px;line-height:28px}.text-xs{font-size:12px;line-height:16px}.font-bold{font-weight:700}.font-medium{font-weight:500}.font-semibold{font-weight:600}.uppercase{text-transform:uppercase}.italic{font-style:italic}.leading-none{line-height:1}.leading-relaxed{line-height:1.625}.tracking-wide{letter-spacing:.025em}.tracking-wider{letter-spacing:.05em}.text-amber-800{--tw-text-opacity:1;color:rgb(146 64 14/var(--tw-text-opacity,1))}.text-blue-600{--tw-text-opacity:1;color:rgb(37 99 235/var(--tw-text-opacity,1))}.text-emerald-600{--tw-text-opacity:1;color:rgb(5 150 105/var(--tw-text-opacity,1))}.text-indigo-600{--tw-text-opacity:1;color:rgb(79 70 229/var(--tw-text-opacity,1))}.text-indigo-700{--tw-text-opacity:1;color:rgb(67 56 202/var(--tw-text-opacity,1))}.text-inherit{color:inherit}.text-red-600{--tw-text-opacity:1;color:rgb(220 38 38/var(--tw-text-opacity,1))}.text-red-700{--tw-text-opacity:1;color:rgb(185 28 28/var(--tw-text-opacity,1))}.text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.text-zinc-100{--tw-text-opacity:1;color:rgb(244 244 245/var(--tw-text-opacity,1))}.text-zinc-400{--tw-text-opacity:1;color:rgb(161 161 170/var(--tw-text-opacity,1))}.text-zinc-500{--tw-text-opacity:1;color:rgb(113 113 122/var(--tw-text-opacity,1))}.text-zinc-600{--tw-text-opacity:1;color:rgb(82 82 91/var(--tw-text-opacity,1))}.text-zinc-700{--tw-text-opacity:1;color:rgb(63 63 70/var(--tw-text-opacity,1))}.text-zinc-800{--tw-text-opacity:1;color:rgb(39 39 42/var(--tw-text-opacity,1))}.text-zinc-900{--tw-text-opacity:1;color:rgb(24 24 27/var(--tw-text-opacity,1))}.underline{text-decoration-line:underline}.antialiased{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}.opacity-80{opacity:.8}.shadow{--tw-shadow:0 1px 3px 0 rgba(0,0,0,.1),0 1px 2px -1px rgba(0,0,0,.1);--tw-shadow-colored:0 1px 3px 0 var(--tw-shadow-color),0 1px 2px -1px var(--tw-shadow-color)}.shadow,.shadow-2xl{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-2xl{--tw-shadow:0 25px 50px -12px rgba(0,0,0,.25);--tw-shadow-colored:0 25px 50px -12px var(--tw-shadow-color)}.shadow-lg{--tw-shadow:0 10px 15px -3px rgba(0,0,0,.1),0 4px 6px -4px rgba(0,0,0,.1);--tw-shadow-colored:0 10px 15px -3px var(--tw-shadow-color),0 4px 6px -4px var(--tw-shadow-color)}.shadow-lg,.shadow-xl{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-xl{--tw-shadow:0 20px 25px -5px rgba(0,0,0,.1),0 8px 10px -6px rgba(0,0,0,.1);--tw-shadow-colored:0 20px 25px -5px var(--tw-shadow-color),0 8px 10px -6px var(--tw-shadow-color)}.outline{outline-style:solid}.ring{--tw-ring-offset-shadow:var(--tw-ring-inset) 0 0 0 var(--tw-ring-offset-width) var(--tw-ring-offset-color);--tw-ring-shadow:var(--tw-ring-inset) 0 0 0 calc(3px + var(--tw-ring-offset-width)) var(--tw-ring-color);box-shadow:var(--tw-ring-offset-shadow),var(--tw-ring-shadow),var(--tw-shadow,0 0 #0000)}.blur{--tw-blur:blur(8px)}.blur,.filter{filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.transition{transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,-webkit-backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter,-webkit-backdrop-filter;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.ease-out{transition-timing-function:cubic-bezier(0,0,.2,1)}.empty\\:hidden:empty{display:none}.hover\\:bg-indigo-50:hover{--tw-bg-opacity:1;background-color:rgb(238 242 255/var(--tw-bg-opacity,1))}.hover\\:bg-red-50:hover{--tw-bg-opacity:1;background-color:rgb(254 242 242/var(--tw-bg-opacity,1))}.hover\\:bg-zinc-100:hover{--tw-bg-opacity:1;background-color:rgb(244 244 245/var(--tw-bg-opacity,1))}.hover\\:bg-zinc-50:hover{--tw-bg-opacity:1;background-color:rgb(250 250 250/var(--tw-bg-opacity,1))}.hover\\:text-red-500:hover{--tw-text-opacity:1;color:rgb(239 68 68/var(--tw-text-opacity,1))}.hover\\:text-red-600:hover{--tw-text-opacity:1;color:rgb(220 38 38/var(--tw-text-opacity,1))}.hover\\:text-zinc-600:hover{--tw-text-opacity:1;color:rgb(82 82 91/var(--tw-text-opacity,1))}.hover\\:text-zinc-700:hover{--tw-text-opacity:1;color:rgb(63 63 70/var(--tw-text-opacity,1))}.hover\\:underline:hover{text-decoration-line:underline}.disabled\\:opacity-50:disabled{opacity:.5}.dark\\:divide-zinc-800:is(.dark *)>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(39 39 42/var(--tw-divide-opacity,1))}.dark\\:border-indigo-800:is(.dark *){--tw-border-opacity:1;border-color:rgb(55 48 163/var(--tw-border-opacity,1))}.dark\\:border-zinc-600:is(.dark *){--tw-border-opacity:1;border-color:rgb(82 82 91/var(--tw-border-opacity,1))}.dark\\:border-zinc-700:is(.dark *){--tw-border-opacity:1;border-color:rgb(63 63 70/var(--tw-border-opacity,1))}.dark\\:border-zinc-800:is(.dark *){--tw-border-opacity:1;border-color:rgb(39 39 42/var(--tw-border-opacity,1))}.dark\\:bg-amber-900\\/30:is(.dark *){background-color:rgba(120,53,15,.3)}.dark\\:bg-indigo-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(49 46 129/var(--tw-bg-opacity,1))}.dark\\:bg-indigo-900\\/30:is(.dark *){background-color:rgba(49,46,129,.3)}.dark\\:bg-indigo-900\\/40:is(.dark *){background-color:rgba(49,46,129,.4)}.dark\\:bg-red-900\\/30:is(.dark *){background-color:rgba(127,29,29,.3)}.dark\\:bg-zinc-600:is(.dark *){--tw-bg-opacity:1;background-color:rgb(82 82 91/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-700:is(.dark *){--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-800:is(.dark *){--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-800\\/50:is(.dark *){background-color:rgba(39,39,42,.5)}.dark\\:bg-zinc-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(24 24 27/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-900\\/40:is(.dark *){background-color:rgba(24,24,27,.4)}.dark\\:text-amber-200:is(.dark *){--tw-text-opacity:1;color:rgb(253 230 138/var(--tw-text-opacity,1))}.dark\\:text-blue-400:is(.dark *){--tw-text-opacity:1;color:rgb(96 165 250/var(--tw-text-opacity,1))}.dark\\:text-indigo-200:is(.dark *){--tw-text-opacity:1;color:rgb(199 210 254/var(--tw-text-opacity,1))}.dark\\:text-indigo-300:is(.dark *){--tw-text-opacity:1;color:rgb(165 180 252/var(--tw-text-opacity,1))}.dark\\:text-indigo-400:is(.dark *){--tw-text-opacity:1;color:rgb(129 140 248/var(--tw-text-opacity,1))}.dark\\:text-red-300:is(.dark *){--tw-text-opacity:1;color:rgb(252 165 165/var(--tw-text-opacity,1))}.dark\\:text-red-400:is(.dark *){--tw-text-opacity:1;color:rgb(248 113 113/var(--tw-text-opacity,1))}.dark\\:text-zinc-100:is(.dark *){--tw-text-opacity:1;color:rgb(244 244 245/var(--tw-text-opacity,1))}.dark\\:text-zinc-200:is(.dark *){--tw-text-opacity:1;color:rgb(228 228 231/var(--tw-text-opacity,1))}.dark\\:text-zinc-300:is(.dark *){--tw-text-opacity:1;color:rgb(212 212 216/var(--tw-text-opacity,1))}.dark\\:text-zinc-400:is(.dark *){--tw-text-opacity:1;color:rgb(161 161 170/var(--tw-text-opacity,1))}.dark\\:text-zinc-500:is(.dark *){--tw-text-opacity:1;color:rgb(113 113 122/var(--tw-text-opacity,1))}.dark\\:hover\\:bg-indigo-900\\/40:hover:is(.dark *){background-color:rgba(49,46,129,.4)}.dark\\:hover\\:bg-red-900\\/30:hover:is(.dark *){background-color:rgba(127,29,29,.3)}.dark\\:hover\\:bg-zinc-700:hover:is(.dark *){--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.dark\\:hover\\:bg-zinc-800:hover:is(.dark *){--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.dark\\:hover\\:bg-zinc-800\\/50:hover:is(.dark *){background-color:rgba(39,39,42,.5)}.dark\\:hover\\:bg-zinc-800\\/60:hover:is(.dark *){background-color:rgba(39,39,42,.6)}.dark\\:hover\\:text-zinc-200:hover:is(.dark *){--tw-text-opacity:1;color:rgb(228 228 231/var(--tw-text-opacity,1))}@media (min-width:640px){.sm\\:mx-auto{margin-left:auto;margin-right:auto}.sm\\:my-4{margin-top:1em}.sm\\:mb-4,.sm\\:my-4{margin-bottom:1em}.sm\\:h-\\[calc\\(100dvh-2em\\)\\]{height:calc(100dvh - 2em)}.sm\\:max-w-4xl{max-width:56em}.sm\\:max-w-5xl{max-width:64em}.sm\\:max-w-6xl{max-width:72em}.sm\\:items-stretch{align-items:stretch}.sm\\:rounded-2xl{border-radius:1em}}`;
   /* @TAILWIND_CSS_END */
 
   const BASE_CSS = `
@@ -3078,6 +3201,8 @@ textarea { resize: none; }
 - 完全な ==UserScript== メタデータブロックを含める（@name, @namespace, @version, @description, @author, @match, @run-at, @grant）。
 - メタデータブロックは 1 行目の \`// ==UserScript==\` で始め、\`// ==/UserScript==\` で閉じる。閉じ行の \`==\` の後のスラッシュを絶対に落とさないこと（\`// ==UserScript==\` で閉じると Tampermonkey がインストールに失敗する）。
 - @match は必要最小限のスコープにする。サイト全体が対象でないならパス単位で絞る。
+- 修正版を出すときは @version を必ず上げる（例: 1.0.0 → 1.0.1）。@name と @namespace は変えない（変えると別のスクリプトとして扱われる）。
+- @updateURL / @downloadURL は新たに書かない（Gist に公開するときにアプリが設定する）。既存スクリプトに書かれていればそのまま残す。
 - 使用する GM_* API はすべて @grant に列挙する。何も使わないなら @grant none と明記する。
 - 全体を (function(){ 'use strict'; ... })(); で囲み、グローバルを汚さない。
 - 対象要素が遅れて描画される場合や SPA の画面遷移に備え、MutationObserver や待機処理を入れる。
@@ -4079,7 +4204,10 @@ textarea { resize: none; }
       // still recoverable by hand.
       if (verdict.ok) btnRow.append(install);
       btnRow.append(copy, toggle);
-      card.append(btnRow, pre);
+      // Secret-Gist publish state and button (empty for an invalid block).
+      const gist = el('div');
+      GistPublish.paintCardSection(gist, code);
+      card.append(btnRow, gist, pre);
       return card;
     },
 
@@ -4241,6 +4369,457 @@ textarea { resize: none; }
         }));
       }
       return frag;
+    }
+  };
+
+  // =========================================================================
+  // 12.6 Secret-Gist publishing
+  // =========================================================================
+  //
+  // Publishes a generated userscript to a secret Gist so it can be installed
+  // from a URL and kept up to date by the userscript manager.
+  //
+  //   - Only the user starts a publish (the install card's button); the model
+  //     has no tool for it.
+  //   - One Gist per script, identified by `@namespace` + `@name`.
+  //     Republishing updates the same Gist and the same file, so the
+  //     revision-less raw URL — written into @updateURL / @downloadURL — stays
+  //     valid and installed copies pick the new version up.
+  //   - Tampermonkey only updates when @version increases, so a republish
+  //     whose @version is not above the last published one gets its last
+  //     numeric part bumped.
+  //   - A secret Gist is unlisted, not private: anyone holding the URL can read
+  //     it. Code that looks like it carries a credential is refused outright.
+  const GistPublish = {
+    // Credential shapes worth refusing to publish. Each pattern is anchored on
+    // a word boundary so ordinary identifiers that merely contain the prefix
+    // (`task-…`, `desk-…`) do not match.
+    SECRET_PATTERNS: [
+      { label: 'Anthropic API キー', re: /\bsk-ant-[A-Za-z0-9_-]{10,}/ },
+      // Long and digit-bearing, so `sk-`-prefixed CSS class names don't trip it.
+      { label: 'OpenAI 形式の API キー', re: /\bsk-(?!ant-)(?:proj-)?(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{32,}/ },
+      { label: 'GitHub トークン', re: /\bgh[pousr]_[A-Za-z0-9]{30,}/ },
+      { label: 'GitHub fine-grained トークン', re: /\bgithub_pat_[A-Za-z0-9_]{20,}/ },
+      { label: 'Google API キー', re: /\bAIza[0-9A-Za-z_-]{35}/ },
+      { label: 'Slack トークン', re: /\bxox[abprs]-[A-Za-z0-9-]{10,}/ },
+      { label: 'AWS アクセスキー', re: /\bAKIA[0-9A-Z]{16}\b/ },
+      { label: '秘密鍵', re: /-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----/ }
+    ],
+
+    // The registry lives in settings. Settings are built with a shallow
+    // Object.assign over DEFAULT_SETTINGS, so a user who never published
+    // shares the default `{}` object; copy it before the first write.
+    registry() {
+      const cur = Store.settings.gistPublished;
+      if (!cur || typeof cur !== 'object' || cur === DEFAULT_SETTINGS.gistPublished) {
+        Store.settings.gistPublished = Object.assign({}, cur && typeof cur === 'object' ? cur : {});
+      }
+      return Store.settings.gistPublished;
+    },
+
+    keyOf(meta) {
+      return `${(meta && meta.namespace) || ''}\n${(meta && meta.name) || ''}`;
+    },
+
+    entryFor(code) {
+      const meta = UserScriptMode.parseMeta(code);
+      if (!meta.name) return null;
+      return this.registry()[this.keyOf(meta)] || null;
+    },
+
+    // FNV-1a over the source the model produced (before we touch @version or
+    // the update URLs), so a card can tell whether its exact code is what was
+    // last published.
+    hash(str) {
+      let h = 0x811c9dc5;
+      const s = String(str || '');
+      for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 0x01000193);
+      }
+      return (h >>> 0).toString(16).padStart(8, '0');
+    },
+
+    // Dotted-version comparison: numeric segments compare as numbers, a
+    // missing segment counts as 0, and anything non-numeric falls back to a
+    // string comparison of that segment.
+    compareVersions(a, b) {
+      const pa = String(a || '0').split('.');
+      const pb = String(b || '0').split('.');
+      for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+        const sa = pa[i] == null ? '0' : pa[i];
+        const sb = pb[i] == null ? '0' : pb[i];
+        const na = /^\d+$/.test(sa) ? parseInt(sa, 10) : NaN;
+        const nb = /^\d+$/.test(sb) ? parseInt(sb, 10) : NaN;
+        if (!Number.isNaN(na) && !Number.isNaN(nb)) {
+          if (na !== nb) return na < nb ? -1 : 1;
+        } else if (sa !== sb) {
+          return sa < sb ? -1 : 1;
+        }
+      }
+      return 0;
+    },
+
+    // 1.0.3 → 1.0.4; 2.1-beta → 2.2; a version with no numeric tail gets ".1".
+    bumpVersion(v) {
+      const parts = String(v || '').trim().split('.');
+      if (!parts[0]) return '1.0.1';
+      const last = parts[parts.length - 1];
+      const m = /^(\d+)/.exec(last);
+      if (m) parts[parts.length - 1] = String(parseInt(m[1], 10) + 1);
+      else parts.push('1');
+      return parts.join('.');
+    },
+
+    // Rewrites `// @<key> <value>` inside the metadata block: the first line
+    // for `key` (case-insensitive) is replaced, further duplicates are dropped,
+    // and a missing key is inserted just above `// ==/UserScript==`. The value
+    // column follows the block's first entry so the result lines up.
+    setMeta(code, key, value) {
+      const text = String(code || '');
+      const eol = /\r\n/.test(text) ? '\r\n' : '\n';
+      const lines = text.split(/\r?\n/);
+      const open = lines.findIndex((l) => UserScriptMode.META_OPEN_RE.test(l));
+      if (open === -1) return text;
+      const close = lines.findIndex((l, i) => i > open && UserScriptMode.META_CLOSE_RE.test(l));
+      if (close === -1) return text;
+      const lineRe = /^(\s*\/\/\s*)@([\w:-]+)(\s+)/;
+      let prefix = '// ';
+      let valueCol = 0;
+      for (let i = open + 1; i < close; i++) {
+        const m = lineRe.exec(lines[i]);
+        if (m) { prefix = m[1]; valueCol = m[1].length + 1 + m[2].length + m[3].length; break; }
+      }
+      const head = `${prefix}@${key}`;
+      const line = head + ' '.repeat(Math.max(1, valueCol - head.length)) + value;
+      const want = key.toLowerCase();
+      const out = [];
+      let placed = false;
+      for (let i = 0; i < lines.length; i++) {
+        if (i > open && i < close) {
+          const m = /^\s*\/\/\s*@([\w:-]+)(?:\s|$)/.exec(lines[i]);
+          if (m && m[1].toLowerCase() === want) {
+            if (!placed) { out.push(line); placed = true; }
+            continue;
+          }
+        }
+        if (i === close && !placed) { out.push(line); placed = true; }
+        out.push(lines[i]);
+      }
+      return out.join(eol);
+    },
+
+    // Every credential-looking string in `code`, plus any of the user's own
+    // configured keys appearing verbatim. Matches are reported masked.
+    async scanSecrets(code) {
+      const text = String(code || '');
+      const lines = text.split(/\r?\n/);
+      const findings = [];
+      const mask = (s) => (s.length <= 8 ? s.slice(0, 2) : s.slice(0, 6)) + '…';
+      const add = (label, value) => {
+        const idx = text.indexOf(value);
+        const line = idx < 0 ? 0 : text.slice(0, idx).split(/\r?\n/).length;
+        if (!findings.some((f) => f.line === line && f.label === label)) findings.push({ label, line, excerpt: mask(value) });
+      };
+      for (const line of lines) {
+        for (const p of this.SECRET_PATTERNS) {
+          const m = p.re.exec(line);
+          if (m) add(p.label, m[0]);
+        }
+      }
+      const own = [
+        ['設定済みの Gemini API キー', Store.settings.apiKey],
+        ['設定済みの Claude API キー', Store.settings.anthropicApiKey],
+        ['設定済みの GitHub トークン', await GitHub.token()]
+      ];
+      for (const [label, val] of own) {
+        if (val && val.length >= 8 && text.includes(val)) add(label, val);
+      }
+      return findings.sort((a, b) => a.line - b.line);
+    },
+
+    // Everything the confirmation dialog shows, computed without side effects.
+    async plan(code) {
+      const src = String(code || '');
+      const verdict = UserScriptMode.validateScript(src);
+      if (!verdict.ok) return { error: verdict.error };
+      const meta = UserScriptMode.parseMeta(src);
+      if (!meta.name) return { error: 'メタデータに @name がありません。@name を付けてから公開してください。' };
+      const entry = this.registry()[this.keyOf(meta)] || null;
+      const current = meta.version || '';
+      let version = current || '1.0.0';
+      let bumped = false;
+      // A `pending` entry never got its final content written (see publish),
+      // so its version was never actually served and needs no bump.
+      if (entry && !entry.pending && entry.version && this.compareVersions(version, entry.version) <= 0) {
+        version = this.bumpVersion(entry.version);
+        bumped = true;
+      }
+      return {
+        meta,
+        entry,
+        name: meta.name,
+        filename: entry ? entry.filename : UserScriptMode.fileNameFor(meta.name),
+        currentVersion: current,
+        previousVersion: entry ? entry.version : '',
+        version,
+        bumped,
+        findings: await this.scanSecrets(src)
+      };
+    },
+
+    description(meta) {
+      const d = (meta.description || '').trim();
+      return (d ? `${meta.name} — ${d}` : meta.name).slice(0, 250);
+    },
+
+    withUrls(code, version, rawUrl) {
+      let out = this.setMeta(code, 'version', version);
+      out = this.setMeta(out, 'updateURL', rawUrl);
+      out = this.setMeta(out, 'downloadURL', rawUrl);
+      return out;
+    },
+
+    // Creates or updates the Gist and records it. `forceCreate` starts a new
+    // Gist even when one is registered (used after the registered one turned
+    // out to be deleted). Resolves with the registry entry.
+    async publish(code, { forceCreate = false } = {}) {
+      const src = String(code || '');
+      const p = await this.plan(src);
+      if (p.error) throw new Error(p.error);
+      if (p.findings.length) throw new Error('認証情報らしき文字列が含まれているため公開できません。');
+      const reg = this.registry();
+      const key = this.keyOf(p.meta);
+      const description = this.description(p.meta);
+      // A forced re-create keeps the version decided against the old entry, so
+      // copies installed from the old URL still see a newer version if the
+      // user points them at the new one.
+      let entry = forceCreate ? null : p.entry;
+      const version = p.version;
+
+      if (entry) {
+        const content = this.withUrls(src, version, entry.rawUrl);
+        await GitHub.updateGist(entry.gistId, { description, filename: entry.filename, content });
+        Object.assign(entry, {
+          name: p.meta.name, namespace: p.meta.namespace || '',
+          version, sourceHash: this.hash(src), updatedAt: now()
+        });
+        delete entry.pending;
+      } else {
+        const filename = p.filename;
+        // The raw URL embeds the Gist id, which only exists once the Gist
+        // does: create it first, then write the URLs in with an update.
+        const created = await GitHub.createGist({ description, filename, content: this.setMeta(src, 'version', version) });
+        let owner = created && created.owner && created.owner.login;
+        if (!owner) {
+          const user = await GitHub.getUser();
+          owner = user && user.login;
+        }
+        if (!created || !created.id || !owner) throw new Error('GitHub の応答から Gist の情報を取得できませんでした。');
+        const rawUrl = GitHub.rawUrl(owner, created.id, filename);
+        entry = {
+          key, name: p.meta.name, namespace: p.meta.namespace || '',
+          gistId: created.id, owner, filename, rawUrl,
+          htmlUrl: created.html_url || `https://gist.github.com/${owner}/${created.id}`,
+          version, sourceHash: '', createdAt: now(), updatedAt: now(),
+          pending: true
+        };
+        // Record the Gist before the second request: if that one fails, a
+        // retry updates this Gist rather than creating a duplicate.
+        reg[key] = entry;
+        await Store.saveSettings();
+        await GitHub.updateGist(created.id, { filename, content: this.withUrls(src, version, rawUrl) });
+        entry.sourceHash = this.hash(src);
+        entry.updatedAt = now();
+        delete entry.pending;
+      }
+      reg[key] = entry;
+      await Store.saveSettings();
+      ScheduleBackup.mark();
+      return entry;
+    },
+
+    async unregister(key) {
+      delete this.registry()[key];
+      await Store.saveSettings();
+      ScheduleBackup.mark();
+    },
+
+    async remove(key) {
+      const entry = this.registry()[key];
+      if (!entry) return;
+      try {
+        await GitHub.deleteGist(entry.gistId);
+      } catch (e) {
+        // Already gone on GitHub's side: dropping our record is all that's left.
+        if (!e || e.status !== 404) throw e;
+      }
+      await this.unregister(key);
+    },
+
+    // Opening the raw `.user.js` URL is how the manager is asked to install:
+    // Tampermonkey (and the iOS Userscripts extension) intercept navigations
+    // to such URLs and show their install / update screen.
+    openInstall(url) {
+      const gmOpen = (typeof GM_openInTab === 'function') ? GM_openInTab
+        : (typeof GM !== 'undefined' && GM && typeof GM.openInTab === 'function') ? GM.openInTab.bind(GM)
+        : null;
+      try {
+        if (gmOpen) gmOpen(url, { active: true, insert: true });
+        else window.open(url, '_blank', 'noopener');
+      } catch {
+        window.open(url, '_blank', 'noopener');
+      }
+    },
+
+    // ---------------------------------------------------------------------
+    // UI
+    // ---------------------------------------------------------------------
+    // Raw URL plus install / copy / open-Gist buttons for one registry entry.
+    renderLinks(entry, { compact = false } = {}) {
+      const wrap = el('div', { class: 'space-y-2' });
+      wrap.append(el('div', {
+        class: 'text-[11px] font-mono break-all text-zinc-700 dark:text-zinc-200 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg px-2 py-1.5 select-all'
+      }, entry.rawUrl));
+      const row = el('div', { class: 'flex flex-wrap gap-2' });
+      const btnCls = 'px-3 py-1.5 rounded-lg text-xs aicx-tap inline-flex items-center gap-1';
+      const install = el('button', { class: `${btnCls} bg-emerald-600 text-white`, type: 'button' });
+      install.append(icon('download', 'w-3.5 h-3.5'), el('span', {}, compact ? 'インストール' : 'URL からインストール'));
+      install.addEventListener('click', () => this.openInstall(entry.rawUrl));
+      const copy = el('button', { class: `${btnCls} bg-white dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200 border border-zinc-200 dark:border-zinc-700`, type: 'button' });
+      copy.append(icon('copy', 'w-3.5 h-3.5'), el('span', {}, 'URL をコピー'));
+      copy.addEventListener('click', async () => {
+        const ok = await copyToClipboard(entry.rawUrl);
+        UI.toast(ok ? 'URL をコピーしました' : 'コピーに失敗しました', ok ? 'success' : 'error');
+      });
+      const open = el('a', {
+        class: `${btnCls} bg-white dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200 border border-zinc-200 dark:border-zinc-700`,
+        href: entry.htmlUrl, target: '_blank', rel: 'noopener noreferrer'
+      });
+      open.append(icon('link', 'w-3.5 h-3.5'), el('span', {}, 'Gist を開く'));
+      row.append(install, copy, open);
+      wrap.append(row);
+      return wrap;
+    },
+
+    // Install-card section: publish state for this exact code plus the
+    // publish / update button. `container` is cleared and refilled, so the
+    // card can repaint it after a publish.
+    paintCardSection(container, code) {
+      clear(container);
+      const verdict = UserScriptMode.validateScript(code);
+      if (!verdict.ok) return;
+      const entry = this.entryFor(code);
+      const same = !!(entry && entry.sourceHash && entry.sourceHash === this.hash(code));
+
+      const box = el('div', { class: 'mx-3 mb-3 p-3 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white/70 dark:bg-zinc-900/40 space-y-2' });
+      const head = el('div', { class: 'flex items-center gap-2 text-xs font-semibold text-zinc-800 dark:text-zinc-100' });
+      head.append(icon('cloud', 'w-4 h-4'), el('span', { class: 'flex-1' }, 'シークレット Gist'));
+      box.append(head);
+
+      if (entry && entry.pending) {
+        box.append(el('p', { class: 'text-[11px] text-red-700 dark:text-red-300' },
+          '前回の公開が途中で失敗しました (Gist は作成済み)。もう一度「Gist を更新」を押すと公開を完了できます。'));
+      } else if (entry) {
+        box.append(el('p', { class: 'text-[11px] text-zinc-600 dark:text-zinc-300' }, same
+          ? `この版を公開済みです (v${entry.version} · ${fmtDate(entry.updatedAt)})。URL からインストールすると、以後は @updateURL で自動更新されます。`
+          : `このスクリプトは v${entry.version} を公開済みです (${fmtDate(entry.updatedAt)})。この版を配布するには「Gist を更新」を押してください。`));
+        box.append(this.renderLinks(entry));
+      } else {
+        box.append(el('p', { class: 'text-[11px] text-zinc-600 dark:text-zinc-300' },
+          'シークレット Gist に公開すると、URL からのインストールと @updateURL による自動更新が使えます。'));
+      }
+      if (!same) {
+        const btn = el('button', { class: 'px-3 py-1.5 rounded-lg text-xs font-medium bg-indigo-600 text-white aicx-tap inline-flex items-center gap-1', type: 'button' });
+        btn.append(icon('upload', 'w-3.5 h-3.5'), el('span', {}, entry ? 'Gist を更新' : 'Gist に公開'));
+        btn.addEventListener('click', () => this.openPublishDialog({ code, onDone: () => this.paintCardSection(container, code) }));
+        box.append(el('div', { class: 'flex flex-wrap gap-2' }, [btn]));
+      }
+      container.append(box);
+    },
+
+    async openPublishDialog({ code, onDone }) {
+      const { body, footer, close } = UI.modal({ title: 'シークレット Gist に公開', iconName: 'upload', maxWidth: 'max-w-xl' });
+      const cancel = el('button', { class: 'px-4 py-2 rounded-lg text-sm bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200 aicx-tap', type: 'button' }, 'キャンセル');
+      cancel.addEventListener('click', () => close());
+
+      const openSettings = () => { close(); SettingsPanel.activeTab = 'github'; SettingsPanel.open(); };
+      if (!SecretKV.available()) {
+        body.append(el('p', { class: 'text-xs text-red-600 dark:text-red-400' }, 'この環境では GM ストレージが使えないため、GitHub トークンを安全に保存できません。Gist への公開は利用できません。'));
+        footer.append(cancel);
+        return;
+      }
+      if (!await GitHub.token()) {
+        body.append(el('p', { class: 'text-xs text-zinc-600 dark:text-zinc-300' }, 'Gist に公開するには GitHub のトークンが必要です。設定 → GitHub でトークンを登録してください。'));
+        footer.append(cancel, Form.btn('設定を開く', openSettings));
+        return;
+      }
+
+      const p = await this.plan(code);
+      if (p.error) {
+        body.append(el('p', { class: 'text-xs text-red-600 dark:text-red-400 whitespace-pre-wrap' }, p.error));
+        footer.append(cancel);
+        return;
+      }
+
+      const notice = el('div', { class: 'flex items-start gap-2 p-2 rounded-lg bg-amber-50 dark:bg-amber-900/30 text-[11px] text-amber-800 dark:text-amber-200' });
+      notice.append(el('span', { class: 'shrink-0 pt-0.5' }, [icon('warn', 'w-3.5 h-3.5')]),
+        el('div', { class: 'flex-1 min-w-0' }, 'シークレット Gist は検索や一覧には表示されませんが、URL を知っている人は誰でも閲覧できます。個人情報や認証情報を含めないでください。'));
+      body.append(notice);
+
+      const facts = el('div', { class: 'grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs' });
+      const fact = (k, v, cls = '') => facts.append(
+        el('div', { class: 'text-zinc-500 dark:text-zinc-400' }, k),
+        el('div', { class: `text-zinc-800 dark:text-zinc-100 break-all ${cls}` }, v));
+      fact('スクリプト', p.name);
+      fact('ファイル名', p.filename, 'font-mono');
+      fact('公開先', p.entry ? `既存の Gist を更新 (${p.entry.gistId.slice(0, 8)}…)` : '新しいシークレット Gist を作成');
+      let ver = `v${p.version}`;
+      if (p.bumped) ver = `v${p.currentVersion || '(なし)'} → v${p.version} (前回公開 v${p.previousVersion} から自動で更新)`;
+      else if (!p.currentVersion) ver = `v${p.version} (@version が無いため設定)`;
+      fact('バージョン', ver);
+      body.append(facts);
+      body.append(el('p', { class: 'text-[11px] text-zinc-500' },
+        '@updateURL と @downloadURL を公開先の URL に設定してから公開します (既存の値は置き換えます)。チャット上のコードは変更しません。'));
+
+      const ok = el('button', { class: 'px-4 py-2 rounded-lg text-sm bg-indigo-600 text-white aicx-tap disabled:opacity-50', type: 'button' }, p.entry ? 'Gist を更新' : '公開');
+      if (p.findings.length) {
+        const box = el('div', { class: 'p-2 rounded-lg bg-red-50 dark:bg-red-900/30 text-[11px] text-red-700 dark:text-red-300 space-y-1' });
+        box.append(el('div', { class: 'font-semibold' }, '認証情報らしき文字列が含まれているため公開できません。該当箇所を取り除いてから公開してください。'));
+        for (const f of p.findings) box.append(el('div', { class: 'font-mono break-all' }, `${f.line} 行目: ${f.label} (${f.excerpt})`));
+        body.append(box);
+        ok.disabled = true;
+      }
+
+      const status = el('p', { class: 'text-xs text-red-600 dark:text-red-400 whitespace-pre-wrap hidden' });
+      body.append(status);
+      const showError = (msg) => { status.textContent = msg; status.classList.remove('hidden'); };
+
+      const run = async (forceCreate) => {
+        ok.disabled = true;
+        cancel.disabled = true;
+        ok.textContent = '公開中…';
+        status.classList.add('hidden');
+        try {
+          const entry = await this.publish(code, { forceCreate });
+          close();
+          UI.toast(p.entry && !forceCreate ? `Gist を更新しました (v${entry.version})` : `シークレット Gist に公開しました (v${entry.version})`, 'success');
+          if (onDone) onDone(entry);
+        } catch (e) {
+          ok.disabled = false;
+          cancel.disabled = false;
+          ok.textContent = p.entry ? 'Gist を更新' : '公開';
+          if (e && e.status === 404 && p.entry && !forceCreate) {
+            if (await UI.confirm('登録済みの Gist が見つかりません (削除された可能性があります)。新しい Gist を作成して公開しますか?\n\nURL が変わるため、この URL からインストール済みの環境では入れ直しが必要です。')) {
+              run(true);
+              return;
+            }
+          }
+          showError((e && e.message) || String(e));
+        }
+      };
+      ok.addEventListener('click', () => run(false));
+      footer.append(cancel, ok);
     }
   };
 
@@ -5859,6 +6438,7 @@ textarea { resize: none; }
       { id: 'general', label: '一般' },
       { id: 'prompts', label: 'プロンプト' },
       { id: 'domains', label: 'ドメイン' },
+      { id: 'github',  label: 'GitHub' },
       { id: 'backup',  label: 'バックアップ' }
     ],
 
@@ -5910,6 +6490,9 @@ textarea { resize: none; }
           break;
         case 'domains':
           body.append(this.sectionDomains());
+          break;
+        case 'github':
+          body.append(this.sectionGitHub(), this.sectionGists());
           break;
         case 'backup':
           body.append(this.sectionBackup());
@@ -6370,6 +6953,111 @@ textarea { resize: none; }
       autoWrap.append(chk, el('span', {}, '会話更新時に自動バックアップ (接続中のみ)'));
       box.append(autoWrap);
 
+      return box;
+    },
+
+    sectionGitHub() {
+      const box = el('section', { class: 'space-y-3' });
+      box.append(Form.sectionTitle('GitHub (シークレット Gist への公開)'));
+
+      const link = (href, text) => el('a', { href, target: '_blank', rel: 'noopener noreferrer', class: 'underline text-indigo-600 dark:text-indigo-400' }, text);
+      const info = el('div', { class: 'text-xs text-zinc-500 space-y-1' });
+      info.append(el('p', {}, 'UserScript 作成モードで作ったスクリプトをシークレット Gist に公開するためのトークンを登録します。'));
+      info.append(el('p', {}, ['1. ', link('https://github.com/settings/personal-access-tokens/new', 'Fine-grained トークンの作成ページ'), ' を開く。']));
+      info.append(el('p', {}, '2. Account permissions の「Gists」を Read and write にする (リポジトリの権限は不要)。有効期限も設定する。'));
+      info.append(el('p', {}, '3. 作成したトークンを下に貼り付け、「保存して接続テスト」を押す。classic トークンを使う場合は gist スコープだけを付けてください。'));
+      info.append(el('p', {}, 'トークンはこのユーザースクリプトの GM ストレージにだけ保存され、Google Drive のバックアップには含まれません。Gist の権限はアカウントのすべての Gist に及ぶため、有効期限付きのトークンを使ってください。'));
+      box.append(info);
+
+      if (!SecretKV.available()) {
+        box.append(el('p', { class: 'text-xs text-red-600 dark:text-red-400' }, 'この環境では GM ストレージが使えないため、GitHub 連携は利用できません。'));
+        return box;
+      }
+
+      box.append(Form.label('GitHub トークン'));
+      let draft = '';
+      const input = Form.input('', (v) => { draft = v; }, { type: 'password', placeholder: 'github_pat_... または ghp_...', autocomplete: 'off' });
+      box.append(input);
+      GitHub.token().then((t) => { if (!draft) { input.value = t; draft = t; } });
+
+      const status = el('div', { class: 'text-xs text-zinc-500' });
+      const setStatus = (text, tone) => {
+        status.className = 'text-xs whitespace-pre-wrap ' + (tone === 'ok' ? 'text-emerald-600' : tone === 'error' ? 'text-red-600 dark:text-red-400' : 'text-zinc-500');
+        status.textContent = text;
+      };
+      GitHub.token().then((t) => setStatus(t ? '登録済み (「保存して接続テスト」で確認できます)' : '未登録'));
+      box.append(status);
+
+      const row = el('div', { class: 'flex flex-wrap gap-2' });
+      row.append(Form.btn('保存して接続テスト', async () => {
+        try {
+          await GitHub.setToken(input.value);
+          if (!input.value.trim()) { setStatus('未登録'); return; }
+          setStatus('接続を確認中…');
+          const user = await GitHub.getUser();
+          const login = (user && user.login) || '?';
+          try {
+            await GitHub.listGists();
+            setStatus(`接続 OK: @${login}`, 'ok');
+          } catch (e) {
+            setStatus(`@${login} として認証できましたが、Gist にアクセスできませんでした。トークンの Gists 権限を確認してください。${e && e.message ? `\n${e.message}` : ''}`, 'error');
+          }
+        } catch (e) {
+          setStatus((e && e.message) || String(e), 'error');
+        }
+      }));
+      row.append(Form.btn('トークンを削除', async () => {
+        if (!await UI.confirm('登録済みの GitHub トークンを削除しますか? (公開済みの Gist は削除されません)')) return;
+        await GitHub.setToken('');
+        input.value = '';
+        draft = '';
+        setStatus('未登録');
+      }, 'bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200'));
+      box.append(row);
+      return box;
+    },
+
+    sectionGists() {
+      const box = el('section', { class: 'space-y-3' });
+      box.append(Form.sectionTitle('公開済みスクリプト'));
+      const list = el('div', { class: 'space-y-3' });
+      box.append(list);
+
+      const render = () => {
+        clear(list);
+        const entries = Object.entries(GistPublish.registry())
+          .sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0));
+        if (!entries.length) {
+          list.append(el('p', { class: 'text-xs text-zinc-500' }, 'まだ公開したスクリプトはありません。UserScript 作成モードのインストールカードから公開できます。'));
+          return;
+        }
+        for (const [key, entry] of entries) {
+          const card = el('div', { class: 'p-3 rounded-lg border border-zinc-200 dark:border-zinc-700 space-y-2' });
+          card.append(el('div', { class: 'text-sm font-semibold break-words' }, entry.name || '(名前なし)'));
+          card.append(el('div', { class: 'text-[11px] text-zinc-500 break-all' },
+            `v${entry.version || '?'} · 更新: ${fmtDate(entry.updatedAt || entry.createdAt)}${entry.namespace ? ` · @namespace ${entry.namespace}` : ''}`));
+          card.append(GistPublish.renderLinks(entry, { compact: true }));
+          const row = el('div', { class: 'flex flex-wrap gap-2' });
+          row.append(Form.btn('一覧から外す', async () => {
+            if (!await UI.confirm(`「${entry.name}」を公開済み一覧から外しますか?\n\nGist 自体は残ります。次に同じスクリプトを公開すると、新しい Gist (別の URL) が作られます。`)) return;
+            await GistPublish.unregister(key);
+            render();
+          }, 'bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200'));
+          row.append(Form.btn('Gist を削除', async () => {
+            if (!await UI.confirm(`「${entry.name}」の Gist を GitHub から削除しますか?\n\nこの URL からインストールした環境では、以後は自動更新されなくなります。`)) return;
+            try {
+              await GistPublish.remove(key);
+              UI.toast('Gist を削除しました', 'success');
+              render();
+            } catch (e) {
+              UI.toast((e && e.message) || String(e), 'error');
+            }
+          }, 'bg-red-600 text-white'));
+          card.append(row);
+          list.append(card);
+        }
+      };
+      render();
       return box;
     },
 
