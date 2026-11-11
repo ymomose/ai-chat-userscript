@@ -2,7 +2,7 @@
 // @name         AI Chat Overlay
 // @name:ja      AI チャット オーバーレイ
 // @namespace    https://github.com/ym/userscripts/ai-chat
-// @version      2.2.0
+// @version      2.3.0
 // @description  Floating AI chat (Gemini / Claude) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode with secret-Gist publishing. Claude chats run on the Agents API, keeping transcripts server-side and shared across devices. Optimized for iOS Safari.
 // @description:ja Webページの内容を文脈として Gemini / Claude と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。作ったスクリプトはシークレット Gist に公開して URL からインストール・自動更新できる。Claude のチャットは Agents API で実行し、会話はサーバー側に保存して他のデバイスからも開ける。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
 // @author       ym
@@ -26,8 +26,15 @@
 // @connect      www.googleapis.com
 // @connect      oauth2.googleapis.com
 // @connect      cdn.jsdelivr.net
+// @connect      *
 // @noframes
 // ==/UserScript==
+// `@connect *` is for the fetch_resource tool, which reads scripts / styles
+// from whatever host the current page loads them from. The named hosts above
+// stay allowed without a prompt; for any other host Tampermonkey still asks
+// the user, and the `*` adds an "always allow all domains" choice to that
+// dialog.
+//
 // Libraries (marked / DOMPurify / Readability) are NOT @require'd any more.
 // Rationale: iOS Safari + Tampermonkey does not reliably honour @noframes for
 // iframe navigations — sites that repeatedly retarget a single iframe at new
@@ -535,6 +542,28 @@
   const _gmXhr = (typeof GM_xmlhttpRequest !== 'undefined') ? GM_xmlhttpRequest
     : (typeof GM !== 'undefined' && GM && typeof GM.xmlHttpRequest === 'function') ? GM.xmlHttpRequest.bind(GM)
     : null;
+
+  // Error for a GM request's `onerror`. When the userscript manager refuses
+  // the request itself (host not allowed by @connect, permission prompt
+  // denied, domain not on the user whitelist), status / statusText are empty
+  // and Tampermonkey puts the reason in an undocumented `error` property —
+  // without it all we could say is "Network error". `finalUrl` shows where a
+  // redirect ended up, since @connect also applies to the redirect target.
+  function gmNetworkError(r, url) {
+    const status = (r && r.status) || 0;
+    const raw = r && r.error;
+    const detail = typeof raw === 'string' ? raw.trim()
+      : (raw && typeof raw.message === 'string') ? raw.message.trim()
+      : '';
+    const finalUrl = (r && typeof r.finalUrl === 'string' && r.finalUrl && r.finalUrl !== url) ? r.finalUrl : '';
+    let msg = 'Network error';
+    if (status) msg += ' ' + status;
+    if (r && r.statusText) msg += ' ' + r.statusText;
+    if (detail) msg += ': ' + detail;
+    if (finalUrl) msg += ` (final URL: ${finalUrl})`;
+    return Object.assign(new Error(msg), { status, detail, finalUrl, noResponse: !status });
+  }
+
   function gmRequest({ method = 'GET', url, headers, body, signal }) {
     return new Promise((resolve, reject) => {
       if (!_gmXhr) { reject(new Error('GM_xmlhttpRequest is unavailable')); return; }
@@ -545,7 +574,7 @@
       const handle = _gmXhr({
         method, url, headers, data: body, responseType: 'text',
         onload: (r) => resolve({ status: r.status, statusText: r.statusText, responseText: r.responseText }),
-        onerror: (r) => reject(new Error(`Network error${r && r.status ? ' ' + r.status : ''}${r && r.statusText ? ' ' + r.statusText : ''}`)),
+        onerror: (r) => reject(gmNetworkError(r, url)),
         ontimeout: () => reject(new Error('Request timed out')),
         onabort: () => reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }))
       });
@@ -685,7 +714,7 @@
               scheduleStreamEnd();
             },
             onloadend: () => { if (usingReadableStream) scheduleStreamEnd(); },
-            onerror: (r) => finish(new Error(`Network error${r && r.status ? ' ' + r.status : ''}${r && r.statusText ? ' ' + r.statusText : ''}`)),
+            onerror: (r) => finish(gmNetworkError(r, url)),
             ontimeout: () => finish(new Error('Request timed out')),
             onabort: () => finish(Object.assign(new Error('Aborted'), { name: 'AbortError' }))
           });
@@ -3822,7 +3851,7 @@ textarea { resize: none; }
       let status = 0, contentType = '', text = null;
       // Plain fetch first (cheap, no permission prompt); GM XHR is the CORS /
       // CSP fallback and is where the userscript manager asks the user for
-      // per-domain permission on hosts outside our @connect list.
+      // permission on hosts not named in our @connect list.
       try {
         const res = await fetch(url, { credentials: 'omit' });
         status = res.status;
@@ -3834,7 +3863,22 @@ textarea { resize: none; }
           status = r.status;
           text = r.responseText;
         } catch (e2) {
-          return { error: `取得に失敗しました: ${(e2 && e2.message) || e2}`, url };
+          // Report both attempts: the fetch error says whether CORS / CSP sent
+          // us to the fallback, the GM error why the fallback failed too.
+          const out = {
+            error: `取得に失敗しました: ${(e2 && e2.message) || e2}`,
+            url,
+            fetch_error: (e && e.message) ? `${e.name || 'Error'}: ${e.message}` : String(e)
+          };
+          if (e2 && e2.finalUrl) out.final_url = e2.finalUrl;
+          // No HTTP status means the request never got an answer: either the
+          // userscript manager refused the host, or the connection failed.
+          if (e2 && e2.noResponse) {
+            let host = '';
+            try { host = new URL(e2.finalUrl || url).host; } catch {}
+            out.hint = `UserScript マネージャー (Tampermonkey など) が ${host || 'このホスト'} への接続を拒否したか、通信そのものが失敗した可能性があります。接続の許可を求めるダイアログで許可するか、スクリプト設定のドメインホワイトリストにこのホストを追加すると取得できる場合があります。`;
+          }
+          return out;
         }
       }
       if (text == null) return { error: '本文を取得できませんでした。', url, status };
