@@ -2,7 +2,7 @@
 // @name         AI Chat Overlay
 // @name:ja      AI チャット オーバーレイ
 // @namespace    https://github.com/ym/userscripts/ai-chat
-// @version      1.5.0
+// @version      1.6.0
 // @description  Floating AI chat (Gemini / Claude) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode with secret-Gist publishing. Optimized for iOS Safari.
 // @description:ja Webページの内容を文脈として Gemini / Claude と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。作ったスクリプトはシークレット Gist に公開して URL からインストール・自動更新できる。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
 // @author       ym
@@ -214,6 +214,19 @@
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
   };
   const getDomain = () => location.hostname || 'unknown';
+  // The installed version (this file's @version) as the userscript manager
+  // reports it — Tampermonkey / Violentmonkey expose GM_info, Greasemonkey 4
+  // and the iOS Userscripts app GM.info. Null when neither is available, so
+  // callers omit the version rather than show a made-up one.
+  const scriptVersion = () => {
+    try {
+      const info = (typeof GM_info !== 'undefined' && GM_info)
+        || (typeof GM !== 'undefined' && GM && GM.info)
+        || null;
+      const v = info && info.script && info.script.version;
+      return v ? String(v) : null;
+    } catch { return null; }
+  };
   const el = (tag, props = {}, children = []) => {
     const n = document.createElement(tag);
     for (const [k, v] of Object.entries(props)) {
@@ -7135,7 +7148,8 @@ textarea { resize: none; }
     sectionAbout() {
       const box = el('section', { class: 'space-y-1' });
       box.append(Form.sectionTitle('情報'));
-      box.append(el('p', { class: 'text-xs text-zinc-500' }, 'AI Chat Overlay v0.1.0 · Tailwind CSS · Gemini API · Claude API · Google Drive'));
+      const v = scriptVersion();
+      box.append(el('p', { class: 'text-xs text-zinc-500' }, `AI Chat Overlay${v ? ` v${v}` : ''} · Tailwind CSS · Gemini API · Claude API · GitHub Gist · Google Drive`));
       return box;
     }
   };
