@@ -2,9 +2,9 @@
 // @name         AI Chat Overlay
 // @name:ja      AI チャット オーバーレイ
 // @namespace    https://github.com/ym/userscripts/ai-chat
-// @version      2.1.0
-// @description  Floating AI chat (Gemini / Claude) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode with secret-Gist publishing. Optimized for iOS Safari.
-// @description:ja Webページの内容を文脈として Gemini / Claude と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。作ったスクリプトはシークレット Gist に公開して URL からインストール・自動更新できる。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
+// @version      2.2.0
+// @description  Floating AI chat (Gemini / Claude) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode with secret-Gist publishing. Claude chats run on the Agents API, keeping transcripts server-side and shared across devices. Optimized for iOS Safari.
+// @description:ja Webページの内容を文脈として Gemini / Claude と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。作ったスクリプトはシークレット Gist に公開して URL からインストール・自動更新できる。Claude のチャットは Agents API で実行し、会話はサーバー側に保存して他のデバイスからも開ける。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
 // @author       ym
 // @match        *://*/*
 // @run-at       document-idle
@@ -360,7 +360,12 @@
     agentsAgentId: '',
     agentsAgentVersion: 0,
     agentsAgentHash: '',
-    agentsEnvironmentId: ''
+    agentsEnvironmentId: '',
+    // The same for the agent plain Claude chats run on (see AgentsMode
+    // profiles). The environment is shared by both kinds.
+    agentsChatAgentId: '',
+    agentsChatAgentVersion: 0,
+    agentsChatAgentHash: ''
   };
 
   const Store = {
@@ -377,7 +382,34 @@
       }
     },
     async saveSettings() { await KV.set('settings', this.settings); },
-    async saveDomains() { await KV.set('domains', this.domains); },
+    async saveDomains() { await KV.set('domains', this.serializeDomains()); },
+    // What is written to storage (and to the Drive backup). Remote Agents
+    // conversations (AgentsMode.isRemote) are reduced to a catalog entry:
+    // their transcript lives in the session on Anthropic's side and is
+    // fetched when opened, so local storage does not grow with usage.
+    serializeDomains() {
+      const out = {};
+      for (const [host, d] of Object.entries(this.domains)) {
+        if (!d) continue;
+        out[host] = Object.assign({}, d, {
+          conversations: (d.conversations || []).map((c) => (AgentsMode.isRemote(c) ? this.catalogOf(c) : c))
+        });
+      }
+      return out;
+    },
+    catalogOf(c) {
+      const a = c.agent || {};
+      return {
+        id: c.id, title: c.title, createdAt: c.createdAt, updatedAt: c.updatedAt,
+        mode: c.mode, engine: c.engine, remote: true,
+        pageUrl: c.pageUrl, pageTitle: c.pageTitle,
+        messages: [],
+        agent: {
+          kind: a.kind, sessionId: a.sessionId || null, model: a.model, effort: a.effort,
+          budgetCents: a.budgetCents, costCents: a.costCents || 0, web: a.web
+        }
+      };
+    },
     async saveAll() { await this.saveSettings(); await this.saveDomains(); },
     getDomain(host) {
       host = host || getDomain();
@@ -1883,7 +1915,7 @@
         version: 1,
         exportedAt: now(),
         settings: { ...Store.settings, driveToken: '', driveTokenExp: 0, driveFileId: '' },
-        domains: Store.domains
+        domains: Store.serializeDomains()
       };
       await this._fetch(`https://www.googleapis.com/upload/drive/v3/files/${id}?uploadType=media`, {
         method: 'PATCH',
@@ -2539,7 +2571,7 @@
   //    precompiled path above.
   // ------------------------------------------------------------------------
   /* @TAILWIND_CSS_START */
-  const TAILWIND_CSS = `.\\!container{width:100%!important}.container{width:100%}@media (min-width:640px){.\\!container{max-width:640px!important}.container{max-width:640px}}@media (min-width:768px){.\\!container{max-width:768px!important}.container{max-width:768px}}@media (min-width:1024px){.\\!container{max-width:1024px!important}.container{max-width:1024px}}@media (min-width:1280px){.\\!container{max-width:1280px!important}.container{max-width:1280px}}@media (min-width:1536px){.\\!container{max-width:1536px!important}.container{max-width:1536px}}.pointer-events-none{pointer-events:none}.pointer-events-auto{pointer-events:auto}.\\!visible{visibility:visible!important}.visible{visibility:visible}.invisible{visibility:hidden}.fixed{position:fixed}.absolute{position:absolute}.relative{position:relative}.inset-0{inset:0}.bottom-4{bottom:1em}.bottom-full{bottom:100%}.left-0{left:0}.left-1{left:.25em}.left-1\\/2{left:50%}.z-20{z-index:20}.mx-3{margin-left:.75em;margin-right:.75em}.my-1{margin-top:.25em;margin-bottom:.25em}.my-2{margin-top:.5em;margin-bottom:.5em}.my-3{margin-top:.75em;margin-bottom:.75em}.mb-1{margin-bottom:.25em}.mb-2{margin-bottom:.5em}.mb-3{margin-bottom:.75em}.ml-5{margin-left:1.25em}.mr-1{margin-right:.25em}.mr-2{margin-right:.5em}.mt-0{margin-top:0}.mt-0\\.5{margin-top:.125em}.mt-1{margin-top:.25em}.mt-1\\.5{margin-top:.375em}.mt-2{margin-top:.5em}.mt-3{margin-top:.75em}.mt-4{margin-top:1em}.line-clamp-2{-webkit-line-clamp:2}.line-clamp-2,.line-clamp-3{overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical}.line-clamp-3{-webkit-line-clamp:3}.\\!block{display:block!important}.block{display:block}.inline-block{display:inline-block}.inline{display:inline}.flex{display:flex}.inline-flex{display:inline-flex}.table{display:table}.grid{display:grid}.contents{display:contents}.hidden{display:none}.h-1{height:.25em}.h-10{height:2.5em}.h-3{height:.75em}.h-3\\.5{height:.875em}.h-4{height:1em}.h-5{height:1.25em}.h-6{height:1.5em}.h-64{height:16em}.h-7{height:1.75em}.h-8{height:2em}.h-9{height:2.25em}.h-auto{height:auto}.max-h-40{max-height:10em}.max-h-64{max-height:16em}.max-h-80{max-height:20em}.max-h-\\[160px\\]{max-height:160px}.max-h-\\[85dvh\\]{max-height:85dvh}.min-h-\\[40px\\]{min-height:40px}.w-10{width:2.5em}.w-24{width:6em}.w-3{width:.75em}.w-3\\.5{width:.875em}.w-4{width:1em}.w-5{width:1.25em}.w-6{width:1.5em}.w-7{width:1.75em}.w-72{width:18em}.w-8{width:2em}.w-9{width:2.25em}.w-full{width:100%}.min-w-0{min-width:0}.min-w-\\[220px\\]{min-width:220px}.min-w-\\[80px\\]{min-width:80px}.max-w-2xl{max-width:42em}.max-w-\\[160px\\]{max-width:160px}.max-w-\\[200px\\]{max-width:200px}.max-w-\\[85\\%\\]{max-width:85%}.max-w-\\[90\\%\\]{max-width:90%}.max-w-full{max-width:100%}.max-w-sm{max-width:24em}.max-w-xl{max-width:36em}.flex-1{flex:1 1 0%}.flex-shrink,.shrink{flex-shrink:1}.shrink-0{flex-shrink:0}.border-collapse{border-collapse:collapse}.-translate-x-1{--tw-translate-x:-0.25em}.-translate-x-1,.-translate-x-1\\/2{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.-translate-x-1\\/2{--tw-translate-x:-50%}.transform{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.cursor-pointer{cursor:pointer}.select-none{-webkit-user-select:none;-moz-user-select:none;user-select:none}.select-all{-webkit-user-select:all;-moz-user-select:all;user-select:all}.resize{resize:both}.list-decimal{list-style-type:decimal}.list-disc{list-style-type:disc}.grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}.grid-cols-6{grid-template-columns:repeat(6,minmax(0,1fr))}.grid-cols-\\[auto_1fr\\]{grid-template-columns:auto 1fr}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.items-start{align-items:flex-start}.items-end{align-items:flex-end}.items-center{align-items:center}.justify-start{justify-content:flex-start}.justify-end{justify-content:flex-end}.justify-center{justify-content:center}.gap-1{gap:.25em}.gap-2{gap:.5em}.gap-3{gap:.75em}.gap-x-3{-moz-column-gap:.75em;column-gap:.75em}.gap-y-1{row-gap:.25em}.space-y-0>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(0px*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(0px*var(--tw-space-y-reverse))}.space-y-0\\.5>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.125em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.125em*var(--tw-space-y-reverse))}.space-y-1>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.25em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.25em*var(--tw-space-y-reverse))}.space-y-2>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.5em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.5em*var(--tw-space-y-reverse))}.space-y-3>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.75em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.75em*var(--tw-space-y-reverse))}.space-y-6>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(1.5em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(1.5em*var(--tw-space-y-reverse))}.divide-y>:not([hidden])~:not([hidden]){--tw-divide-y-reverse:0;border-top-width:calc(1px*(1 - var(--tw-divide-y-reverse)));border-bottom-width:calc(1px*var(--tw-divide-y-reverse))}.divide-zinc-100>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(244 244 245/var(--tw-divide-opacity,1))}.overflow-auto{overflow:auto}.overflow-hidden{overflow:hidden}.overflow-x-auto{overflow-x:auto}.overflow-y-auto{overflow-y:auto}.truncate{overflow:hidden;text-overflow:ellipsis}.truncate,.whitespace-nowrap{white-space:nowrap}.whitespace-pre-wrap{white-space:pre-wrap}.break-words{overflow-wrap:break-word}.break-all{word-break:break-all}.rounded{border-radius:.25em}.rounded-2xl{border-radius:1em}.rounded-full{border-radius:9999px}.rounded-lg{border-radius:.5em}.rounded-md{border-radius:.375em}.rounded-xl{border-radius:.75em}.rounded-r-lg{border-top-right-radius:.5em;border-bottom-right-radius:.5em}.rounded-t-2xl{border-top-left-radius:1em;border-top-right-radius:1em}.border{border-width:1px}.border-b{border-bottom-width:1px}.border-b-2{border-bottom-width:2px}.border-l-4{border-left-width:4px}.border-t{border-top-width:1px}.border-dashed{border-style:dashed}.border-indigo-200{--tw-border-opacity:1;border-color:rgb(199 210 254/var(--tw-border-opacity,1))}.border-indigo-500{--tw-border-opacity:1;border-color:rgb(99 102 241/var(--tw-border-opacity,1))}.border-indigo-600{--tw-border-opacity:1;border-color:rgb(79 70 229/var(--tw-border-opacity,1))}.border-transparent{border-color:transparent}.border-zinc-100{--tw-border-opacity:1;border-color:rgb(244 244 245/var(--tw-border-opacity,1))}.border-zinc-200{--tw-border-opacity:1;border-color:rgb(228 228 231/var(--tw-border-opacity,1))}.border-zinc-300{--tw-border-opacity:1;border-color:rgb(212 212 216/var(--tw-border-opacity,1))}.bg-amber-50{--tw-bg-opacity:1;background-color:rgb(255 251 235/var(--tw-bg-opacity,1))}.bg-amber-900{--tw-bg-opacity:1;background-color:rgb(120 53 15/var(--tw-bg-opacity,1))}.bg-black{--tw-bg-opacity:1;background-color:rgb(0 0 0/var(--tw-bg-opacity,1))}.bg-black\\/30{background-color:rgba(0,0,0,.3)}.bg-black\\/40{background-color:rgba(0,0,0,.4)}.bg-emerald-100{--tw-bg-opacity:1;background-color:rgb(209 250 229/var(--tw-bg-opacity,1))}.bg-emerald-600{--tw-bg-opacity:1;background-color:rgb(5 150 105/var(--tw-bg-opacity,1))}.bg-indigo-100{--tw-bg-opacity:1;background-color:rgb(224 231 255/var(--tw-bg-opacity,1))}.bg-indigo-50{--tw-bg-opacity:1;background-color:rgb(238 242 255/var(--tw-bg-opacity,1))}.bg-indigo-600{--tw-bg-opacity:1;background-color:rgb(79 70 229/var(--tw-bg-opacity,1))}.bg-indigo-900{--tw-bg-opacity:1;background-color:rgb(49 46 129/var(--tw-bg-opacity,1))}.bg-red-50{--tw-bg-opacity:1;background-color:rgb(254 242 242/var(--tw-bg-opacity,1))}.bg-red-600{--tw-bg-opacity:1;background-color:rgb(220 38 38/var(--tw-bg-opacity,1))}.bg-red-900{--tw-bg-opacity:1;background-color:rgb(127 29 29/var(--tw-bg-opacity,1))}.bg-transparent{background-color:transparent}.bg-white{--tw-bg-opacity:1;background-color:rgb(255 255 255/var(--tw-bg-opacity,1))}.bg-white\\/70{background-color:hsla(0,0%,100%,.7)}.bg-zinc-100{--tw-bg-opacity:1;background-color:rgb(244 244 245/var(--tw-bg-opacity,1))}.bg-zinc-200{--tw-bg-opacity:1;background-color:rgb(228 228 231/var(--tw-bg-opacity,1))}.bg-zinc-300{--tw-bg-opacity:1;background-color:rgb(212 212 216/var(--tw-bg-opacity,1))}.bg-zinc-50{--tw-bg-opacity:1;background-color:rgb(250 250 250/var(--tw-bg-opacity,1))}.bg-zinc-700{--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.bg-zinc-800{--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.bg-zinc-900{--tw-bg-opacity:1;background-color:rgb(24 24 27/var(--tw-bg-opacity,1))}.object-cover{-o-object-fit:cover;object-fit:cover}.p-0{padding:0}.p-1{padding:.25em}.p-2{padding:.5em}.p-3{padding:.75em}.p-4{padding:1em}.p-8{padding:2em}.px-1{padding-left:.25em;padding-right:.25em}.px-1\\.5{padding-left:.375em;padding-right:.375em}.px-2{padding-left:.5em;padding-right:.5em}.px-3{padding-left:.75em;padding-right:.75em}.px-4{padding-left:1em;padding-right:1em}.py-0{padding-top:0;padding-bottom:0}.py-0\\.5{padding-top:.125em;padding-bottom:.125em}.py-1{padding-top:.25em;padding-bottom:.25em}.py-1\\.5{padding-top:.375em;padding-bottom:.375em}.py-2{padding-top:.5em;padding-bottom:.5em}.py-2\\.5{padding-top:.625em;padding-bottom:.625em}.py-3{padding-top:.75em;padding-bottom:.75em}.py-8{padding-top:2em;padding-bottom:2em}.pb-1{padding-bottom:.25em}.pb-2{padding-bottom:.5em}.pb-3{padding-bottom:.75em}.pl-3{padding-left:.75em}.pt-0{padding-top:0}.pt-0\\.5{padding-top:.125em}.pt-1{padding-top:.25em}.pt-2{padding-top:.5em}.pt-3{padding-top:.75em}.pt-4{padding-top:1em}.text-left{text-align:left}.text-center{text-align:center}.align-top{vertical-align:top}.font-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.text-\\[0\\.85em\\]{font-size:.85em}.text-\\[10px\\]{font-size:10px}.text-\\[11px\\]{font-size:11px}.text-base{font-size:16px;line-height:24px}.text-lg{font-size:18px;line-height:28px}.text-sm{font-size:14px;line-height:20px}.text-xl{font-size:20px;line-height:28px}.text-xs{font-size:12px;line-height:16px}.font-bold{font-weight:700}.font-medium{font-weight:500}.font-semibold{font-weight:600}.uppercase{text-transform:uppercase}.italic{font-style:italic}.leading-none{line-height:1}.leading-relaxed{line-height:1.625}.tracking-wide{letter-spacing:.025em}.tracking-wider{letter-spacing:.05em}.text-amber-800{--tw-text-opacity:1;color:rgb(146 64 14/var(--tw-text-opacity,1))}.text-blue-600{--tw-text-opacity:1;color:rgb(37 99 235/var(--tw-text-opacity,1))}.text-emerald-600{--tw-text-opacity:1;color:rgb(5 150 105/var(--tw-text-opacity,1))}.text-emerald-700{--tw-text-opacity:1;color:rgb(4 120 87/var(--tw-text-opacity,1))}.text-indigo-600{--tw-text-opacity:1;color:rgb(79 70 229/var(--tw-text-opacity,1))}.text-indigo-700{--tw-text-opacity:1;color:rgb(67 56 202/var(--tw-text-opacity,1))}.text-inherit{color:inherit}.text-red-600{--tw-text-opacity:1;color:rgb(220 38 38/var(--tw-text-opacity,1))}.text-red-700{--tw-text-opacity:1;color:rgb(185 28 28/var(--tw-text-opacity,1))}.text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.text-zinc-100{--tw-text-opacity:1;color:rgb(244 244 245/var(--tw-text-opacity,1))}.text-zinc-400{--tw-text-opacity:1;color:rgb(161 161 170/var(--tw-text-opacity,1))}.text-zinc-500{--tw-text-opacity:1;color:rgb(113 113 122/var(--tw-text-opacity,1))}.text-zinc-600{--tw-text-opacity:1;color:rgb(82 82 91/var(--tw-text-opacity,1))}.text-zinc-700{--tw-text-opacity:1;color:rgb(63 63 70/var(--tw-text-opacity,1))}.text-zinc-800{--tw-text-opacity:1;color:rgb(39 39 42/var(--tw-text-opacity,1))}.text-zinc-900{--tw-text-opacity:1;color:rgb(24 24 27/var(--tw-text-opacity,1))}.underline{text-decoration-line:underline}.antialiased{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}.opacity-80{opacity:.8}.shadow{--tw-shadow:0 1px 3px 0 rgba(0,0,0,.1),0 1px 2px -1px rgba(0,0,0,.1);--tw-shadow-colored:0 1px 3px 0 var(--tw-shadow-color),0 1px 2px -1px var(--tw-shadow-color)}.shadow,.shadow-2xl{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-2xl{--tw-shadow:0 25px 50px -12px rgba(0,0,0,.25);--tw-shadow-colored:0 25px 50px -12px var(--tw-shadow-color)}.shadow-lg{--tw-shadow:0 10px 15px -3px rgba(0,0,0,.1),0 4px 6px -4px rgba(0,0,0,.1);--tw-shadow-colored:0 10px 15px -3px var(--tw-shadow-color),0 4px 6px -4px var(--tw-shadow-color)}.shadow-lg,.shadow-xl{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-xl{--tw-shadow:0 20px 25px -5px rgba(0,0,0,.1),0 8px 10px -6px rgba(0,0,0,.1);--tw-shadow-colored:0 20px 25px -5px var(--tw-shadow-color),0 8px 10px -6px var(--tw-shadow-color)}.outline{outline-style:solid}.ring{--tw-ring-offset-shadow:var(--tw-ring-inset) 0 0 0 var(--tw-ring-offset-width) var(--tw-ring-offset-color);--tw-ring-shadow:var(--tw-ring-inset) 0 0 0 calc(3px + var(--tw-ring-offset-width)) var(--tw-ring-color);box-shadow:var(--tw-ring-offset-shadow),var(--tw-ring-shadow),var(--tw-shadow,0 0 #0000)}.blur{--tw-blur:blur(8px)}.blur,.filter{filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.transition{transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,-webkit-backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter,-webkit-backdrop-filter;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.ease-out{transition-timing-function:cubic-bezier(0,0,.2,1)}.empty\\:hidden:empty{display:none}.hover\\:bg-indigo-50:hover{--tw-bg-opacity:1;background-color:rgb(238 242 255/var(--tw-bg-opacity,1))}.hover\\:bg-red-50:hover{--tw-bg-opacity:1;background-color:rgb(254 242 242/var(--tw-bg-opacity,1))}.hover\\:bg-zinc-100:hover{--tw-bg-opacity:1;background-color:rgb(244 244 245/var(--tw-bg-opacity,1))}.hover\\:bg-zinc-50:hover{--tw-bg-opacity:1;background-color:rgb(250 250 250/var(--tw-bg-opacity,1))}.hover\\:text-red-500:hover{--tw-text-opacity:1;color:rgb(239 68 68/var(--tw-text-opacity,1))}.hover\\:text-red-600:hover{--tw-text-opacity:1;color:rgb(220 38 38/var(--tw-text-opacity,1))}.hover\\:text-zinc-600:hover{--tw-text-opacity:1;color:rgb(82 82 91/var(--tw-text-opacity,1))}.hover\\:text-zinc-700:hover{--tw-text-opacity:1;color:rgb(63 63 70/var(--tw-text-opacity,1))}.hover\\:underline:hover{text-decoration-line:underline}.disabled\\:opacity-50:disabled{opacity:.5}.dark\\:divide-zinc-800:is(.dark *)>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(39 39 42/var(--tw-divide-opacity,1))}.dark\\:border-indigo-800:is(.dark *){--tw-border-opacity:1;border-color:rgb(55 48 163/var(--tw-border-opacity,1))}.dark\\:border-zinc-600:is(.dark *){--tw-border-opacity:1;border-color:rgb(82 82 91/var(--tw-border-opacity,1))}.dark\\:border-zinc-700:is(.dark *){--tw-border-opacity:1;border-color:rgb(63 63 70/var(--tw-border-opacity,1))}.dark\\:border-zinc-800:is(.dark *){--tw-border-opacity:1;border-color:rgb(39 39 42/var(--tw-border-opacity,1))}.dark\\:bg-amber-900\\/30:is(.dark *){background-color:rgba(120,53,15,.3)}.dark\\:bg-emerald-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(6 78 59/var(--tw-bg-opacity,1))}.dark\\:bg-indigo-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(49 46 129/var(--tw-bg-opacity,1))}.dark\\:bg-indigo-900\\/30:is(.dark *){background-color:rgba(49,46,129,.3)}.dark\\:bg-indigo-900\\/40:is(.dark *){background-color:rgba(49,46,129,.4)}.dark\\:bg-red-900\\/30:is(.dark *){background-color:rgba(127,29,29,.3)}.dark\\:bg-zinc-600:is(.dark *){--tw-bg-opacity:1;background-color:rgb(82 82 91/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-700:is(.dark *){--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-800:is(.dark *){--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-800\\/50:is(.dark *){background-color:rgba(39,39,42,.5)}.dark\\:bg-zinc-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(24 24 27/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-900\\/40:is(.dark *){background-color:rgba(24,24,27,.4)}.dark\\:text-amber-200:is(.dark *){--tw-text-opacity:1;color:rgb(253 230 138/var(--tw-text-opacity,1))}.dark\\:text-blue-400:is(.dark *){--tw-text-opacity:1;color:rgb(96 165 250/var(--tw-text-opacity,1))}.dark\\:text-emerald-200:is(.dark *){--tw-text-opacity:1;color:rgb(167 243 208/var(--tw-text-opacity,1))}.dark\\:text-indigo-200:is(.dark *){--tw-text-opacity:1;color:rgb(199 210 254/var(--tw-text-opacity,1))}.dark\\:text-indigo-300:is(.dark *){--tw-text-opacity:1;color:rgb(165 180 252/var(--tw-text-opacity,1))}.dark\\:text-indigo-400:is(.dark *){--tw-text-opacity:1;color:rgb(129 140 248/var(--tw-text-opacity,1))}.dark\\:text-red-300:is(.dark *){--tw-text-opacity:1;color:rgb(252 165 165/var(--tw-text-opacity,1))}.dark\\:text-red-400:is(.dark *){--tw-text-opacity:1;color:rgb(248 113 113/var(--tw-text-opacity,1))}.dark\\:text-zinc-100:is(.dark *){--tw-text-opacity:1;color:rgb(244 244 245/var(--tw-text-opacity,1))}.dark\\:text-zinc-200:is(.dark *){--tw-text-opacity:1;color:rgb(228 228 231/var(--tw-text-opacity,1))}.dark\\:text-zinc-300:is(.dark *){--tw-text-opacity:1;color:rgb(212 212 216/var(--tw-text-opacity,1))}.dark\\:text-zinc-400:is(.dark *){--tw-text-opacity:1;color:rgb(161 161 170/var(--tw-text-opacity,1))}.dark\\:text-zinc-500:is(.dark *){--tw-text-opacity:1;color:rgb(113 113 122/var(--tw-text-opacity,1))}.dark\\:hover\\:bg-indigo-900\\/40:hover:is(.dark *){background-color:rgba(49,46,129,.4)}.dark\\:hover\\:bg-red-900\\/30:hover:is(.dark *){background-color:rgba(127,29,29,.3)}.dark\\:hover\\:bg-zinc-700:hover:is(.dark *){--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.dark\\:hover\\:bg-zinc-800:hover:is(.dark *){--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.dark\\:hover\\:bg-zinc-800\\/50:hover:is(.dark *){background-color:rgba(39,39,42,.5)}.dark\\:hover\\:bg-zinc-800\\/60:hover:is(.dark *){background-color:rgba(39,39,42,.6)}.dark\\:hover\\:text-zinc-200:hover:is(.dark *){--tw-text-opacity:1;color:rgb(228 228 231/var(--tw-text-opacity,1))}@media (min-width:640px){.sm\\:mx-auto{margin-left:auto;margin-right:auto}.sm\\:my-4{margin-top:1em}.sm\\:mb-4,.sm\\:my-4{margin-bottom:1em}.sm\\:h-\\[calc\\(100dvh-2em\\)\\]{height:calc(100dvh - 2em)}.sm\\:max-w-4xl{max-width:56em}.sm\\:max-w-5xl{max-width:64em}.sm\\:max-w-6xl{max-width:72em}.sm\\:items-stretch{align-items:stretch}.sm\\:rounded-2xl{border-radius:1em}}`;
+  const TAILWIND_CSS = `.\\!container{width:100%!important}.container{width:100%}@media (min-width:640px){.\\!container{max-width:640px!important}.container{max-width:640px}}@media (min-width:768px){.\\!container{max-width:768px!important}.container{max-width:768px}}@media (min-width:1024px){.\\!container{max-width:1024px!important}.container{max-width:1024px}}@media (min-width:1280px){.\\!container{max-width:1280px!important}.container{max-width:1280px}}@media (min-width:1536px){.\\!container{max-width:1536px!important}.container{max-width:1536px}}.pointer-events-none{pointer-events:none}.pointer-events-auto{pointer-events:auto}.\\!visible{visibility:visible!important}.visible{visibility:visible}.invisible{visibility:hidden}.fixed{position:fixed}.absolute{position:absolute}.relative{position:relative}.inset-0{inset:0}.bottom-4{bottom:1em}.bottom-full{bottom:100%}.left-0{left:0}.left-1{left:.25em}.left-1\\/2{left:50%}.z-20{z-index:20}.mx-3{margin-left:.75em;margin-right:.75em}.my-1{margin-top:.25em;margin-bottom:.25em}.my-2{margin-top:.5em;margin-bottom:.5em}.my-3{margin-top:.75em;margin-bottom:.75em}.mb-1{margin-bottom:.25em}.mb-2{margin-bottom:.5em}.mb-3{margin-bottom:.75em}.ml-5{margin-left:1.25em}.mr-1{margin-right:.25em}.mr-2{margin-right:.5em}.mt-0{margin-top:0}.mt-0\\.5{margin-top:.125em}.mt-1{margin-top:.25em}.mt-1\\.5{margin-top:.375em}.mt-2{margin-top:.5em}.mt-3{margin-top:.75em}.mt-4{margin-top:1em}.line-clamp-2{-webkit-line-clamp:2}.line-clamp-2,.line-clamp-3{overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical}.line-clamp-3{-webkit-line-clamp:3}.\\!block{display:block!important}.block{display:block}.inline-block{display:inline-block}.inline{display:inline}.flex{display:flex}.inline-flex{display:inline-flex}.table{display:table}.grid{display:grid}.contents{display:contents}.hidden{display:none}.h-1{height:.25em}.h-10{height:2.5em}.h-3{height:.75em}.h-3\\.5{height:.875em}.h-4{height:1em}.h-5{height:1.25em}.h-6{height:1.5em}.h-64{height:16em}.h-7{height:1.75em}.h-8{height:2em}.h-9{height:2.25em}.h-auto{height:auto}.max-h-40{max-height:10em}.max-h-64{max-height:16em}.max-h-80{max-height:20em}.max-h-\\[160px\\]{max-height:160px}.max-h-\\[85dvh\\]{max-height:85dvh}.min-h-\\[40px\\]{min-height:40px}.w-10{width:2.5em}.w-24{width:6em}.w-3{width:.75em}.w-3\\.5{width:.875em}.w-4{width:1em}.w-5{width:1.25em}.w-6{width:1.5em}.w-7{width:1.75em}.w-72{width:18em}.w-8{width:2em}.w-9{width:2.25em}.w-full{width:100%}.min-w-0{min-width:0}.min-w-\\[220px\\]{min-width:220px}.min-w-\\[80px\\]{min-width:80px}.max-w-2xl{max-width:42em}.max-w-\\[160px\\]{max-width:160px}.max-w-\\[200px\\]{max-width:200px}.max-w-\\[85\\%\\]{max-width:85%}.max-w-\\[90\\%\\]{max-width:90%}.max-w-full{max-width:100%}.max-w-sm{max-width:24em}.max-w-xl{max-width:36em}.flex-1{flex:1 1 0%}.flex-shrink,.shrink{flex-shrink:1}.shrink-0{flex-shrink:0}.grow{flex-grow:1}.border-collapse{border-collapse:collapse}.-translate-x-1{--tw-translate-x:-0.25em}.-translate-x-1,.-translate-x-1\\/2{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.-translate-x-1\\/2{--tw-translate-x:-50%}.transform{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.cursor-pointer{cursor:pointer}.select-none{-webkit-user-select:none;-moz-user-select:none;user-select:none}.select-all{-webkit-user-select:all;-moz-user-select:all;user-select:all}.resize{resize:both}.list-decimal{list-style-type:decimal}.list-disc{list-style-type:disc}.grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}.grid-cols-6{grid-template-columns:repeat(6,minmax(0,1fr))}.grid-cols-\\[auto_1fr\\]{grid-template-columns:auto 1fr}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.items-start{align-items:flex-start}.items-end{align-items:flex-end}.items-center{align-items:center}.justify-start{justify-content:flex-start}.justify-end{justify-content:flex-end}.justify-center{justify-content:center}.gap-1{gap:.25em}.gap-2{gap:.5em}.gap-3{gap:.75em}.gap-x-3{-moz-column-gap:.75em;column-gap:.75em}.gap-y-1{row-gap:.25em}.space-y-0>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(0px*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(0px*var(--tw-space-y-reverse))}.space-y-0\\.5>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.125em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.125em*var(--tw-space-y-reverse))}.space-y-1>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.25em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.25em*var(--tw-space-y-reverse))}.space-y-2>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.5em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.5em*var(--tw-space-y-reverse))}.space-y-3>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.75em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.75em*var(--tw-space-y-reverse))}.space-y-6>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(1.5em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(1.5em*var(--tw-space-y-reverse))}.divide-y>:not([hidden])~:not([hidden]){--tw-divide-y-reverse:0;border-top-width:calc(1px*(1 - var(--tw-divide-y-reverse)));border-bottom-width:calc(1px*var(--tw-divide-y-reverse))}.divide-zinc-100>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(244 244 245/var(--tw-divide-opacity,1))}.overflow-auto{overflow:auto}.overflow-hidden{overflow:hidden}.overflow-x-auto{overflow-x:auto}.overflow-y-auto{overflow-y:auto}.truncate{overflow:hidden;text-overflow:ellipsis}.truncate,.whitespace-nowrap{white-space:nowrap}.whitespace-pre-wrap{white-space:pre-wrap}.break-words{overflow-wrap:break-word}.break-all{word-break:break-all}.rounded{border-radius:.25em}.rounded-2xl{border-radius:1em}.rounded-full{border-radius:9999px}.rounded-lg{border-radius:.5em}.rounded-md{border-radius:.375em}.rounded-xl{border-radius:.75em}.rounded-r-lg{border-top-right-radius:.5em;border-bottom-right-radius:.5em}.rounded-t-2xl{border-top-left-radius:1em;border-top-right-radius:1em}.border{border-width:1px}.border-b{border-bottom-width:1px}.border-b-2{border-bottom-width:2px}.border-l-4{border-left-width:4px}.border-t{border-top-width:1px}.border-dashed{border-style:dashed}.border-indigo-200{--tw-border-opacity:1;border-color:rgb(199 210 254/var(--tw-border-opacity,1))}.border-indigo-500{--tw-border-opacity:1;border-color:rgb(99 102 241/var(--tw-border-opacity,1))}.border-indigo-600{--tw-border-opacity:1;border-color:rgb(79 70 229/var(--tw-border-opacity,1))}.border-transparent{border-color:transparent}.border-zinc-100{--tw-border-opacity:1;border-color:rgb(244 244 245/var(--tw-border-opacity,1))}.border-zinc-200{--tw-border-opacity:1;border-color:rgb(228 228 231/var(--tw-border-opacity,1))}.border-zinc-300{--tw-border-opacity:1;border-color:rgb(212 212 216/var(--tw-border-opacity,1))}.bg-amber-50{--tw-bg-opacity:1;background-color:rgb(255 251 235/var(--tw-bg-opacity,1))}.bg-amber-900{--tw-bg-opacity:1;background-color:rgb(120 53 15/var(--tw-bg-opacity,1))}.bg-black{--tw-bg-opacity:1;background-color:rgb(0 0 0/var(--tw-bg-opacity,1))}.bg-black\\/30{background-color:rgba(0,0,0,.3)}.bg-black\\/40{background-color:rgba(0,0,0,.4)}.bg-emerald-100{--tw-bg-opacity:1;background-color:rgb(209 250 229/var(--tw-bg-opacity,1))}.bg-emerald-600{--tw-bg-opacity:1;background-color:rgb(5 150 105/var(--tw-bg-opacity,1))}.bg-indigo-100{--tw-bg-opacity:1;background-color:rgb(224 231 255/var(--tw-bg-opacity,1))}.bg-indigo-50{--tw-bg-opacity:1;background-color:rgb(238 242 255/var(--tw-bg-opacity,1))}.bg-indigo-600{--tw-bg-opacity:1;background-color:rgb(79 70 229/var(--tw-bg-opacity,1))}.bg-indigo-900{--tw-bg-opacity:1;background-color:rgb(49 46 129/var(--tw-bg-opacity,1))}.bg-red-50{--tw-bg-opacity:1;background-color:rgb(254 242 242/var(--tw-bg-opacity,1))}.bg-red-600{--tw-bg-opacity:1;background-color:rgb(220 38 38/var(--tw-bg-opacity,1))}.bg-red-900{--tw-bg-opacity:1;background-color:rgb(127 29 29/var(--tw-bg-opacity,1))}.bg-transparent{background-color:transparent}.bg-white{--tw-bg-opacity:1;background-color:rgb(255 255 255/var(--tw-bg-opacity,1))}.bg-white\\/70{background-color:hsla(0,0%,100%,.7)}.bg-zinc-100{--tw-bg-opacity:1;background-color:rgb(244 244 245/var(--tw-bg-opacity,1))}.bg-zinc-200{--tw-bg-opacity:1;background-color:rgb(228 228 231/var(--tw-bg-opacity,1))}.bg-zinc-300{--tw-bg-opacity:1;background-color:rgb(212 212 216/var(--tw-bg-opacity,1))}.bg-zinc-50{--tw-bg-opacity:1;background-color:rgb(250 250 250/var(--tw-bg-opacity,1))}.bg-zinc-700{--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.bg-zinc-800{--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.bg-zinc-900{--tw-bg-opacity:1;background-color:rgb(24 24 27/var(--tw-bg-opacity,1))}.object-cover{-o-object-fit:cover;object-fit:cover}.p-0{padding:0}.p-1{padding:.25em}.p-2{padding:.5em}.p-3{padding:.75em}.p-4{padding:1em}.p-8{padding:2em}.px-1{padding-left:.25em;padding-right:.25em}.px-1\\.5{padding-left:.375em;padding-right:.375em}.px-2{padding-left:.5em;padding-right:.5em}.px-3{padding-left:.75em;padding-right:.75em}.px-4{padding-left:1em;padding-right:1em}.py-0{padding-top:0;padding-bottom:0}.py-0\\.5{padding-top:.125em;padding-bottom:.125em}.py-1{padding-top:.25em;padding-bottom:.25em}.py-1\\.5{padding-top:.375em;padding-bottom:.375em}.py-2{padding-top:.5em;padding-bottom:.5em}.py-2\\.5{padding-top:.625em;padding-bottom:.625em}.py-3{padding-top:.75em;padding-bottom:.75em}.py-8{padding-top:2em;padding-bottom:2em}.pb-1{padding-bottom:.25em}.pb-2{padding-bottom:.5em}.pb-3{padding-bottom:.75em}.pl-3{padding-left:.75em}.pt-0{padding-top:0}.pt-0\\.5{padding-top:.125em}.pt-1{padding-top:.25em}.pt-2{padding-top:.5em}.pt-3{padding-top:.75em}.pt-4{padding-top:1em}.text-left{text-align:left}.text-center{text-align:center}.align-top{vertical-align:top}.font-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.text-\\[0\\.85em\\]{font-size:.85em}.text-\\[10px\\]{font-size:10px}.text-\\[11px\\]{font-size:11px}.text-base{font-size:16px;line-height:24px}.text-lg{font-size:18px;line-height:28px}.text-sm{font-size:14px;line-height:20px}.text-xl{font-size:20px;line-height:28px}.text-xs{font-size:12px;line-height:16px}.font-bold{font-weight:700}.font-medium{font-weight:500}.font-semibold{font-weight:600}.uppercase{text-transform:uppercase}.italic{font-style:italic}.leading-none{line-height:1}.leading-relaxed{line-height:1.625}.tracking-wide{letter-spacing:.025em}.tracking-wider{letter-spacing:.05em}.text-amber-800{--tw-text-opacity:1;color:rgb(146 64 14/var(--tw-text-opacity,1))}.text-blue-600{--tw-text-opacity:1;color:rgb(37 99 235/var(--tw-text-opacity,1))}.text-emerald-600{--tw-text-opacity:1;color:rgb(5 150 105/var(--tw-text-opacity,1))}.text-emerald-700{--tw-text-opacity:1;color:rgb(4 120 87/var(--tw-text-opacity,1))}.text-indigo-600{--tw-text-opacity:1;color:rgb(79 70 229/var(--tw-text-opacity,1))}.text-indigo-700{--tw-text-opacity:1;color:rgb(67 56 202/var(--tw-text-opacity,1))}.text-inherit{color:inherit}.text-red-600{--tw-text-opacity:1;color:rgb(220 38 38/var(--tw-text-opacity,1))}.text-red-700{--tw-text-opacity:1;color:rgb(185 28 28/var(--tw-text-opacity,1))}.text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.text-zinc-100{--tw-text-opacity:1;color:rgb(244 244 245/var(--tw-text-opacity,1))}.text-zinc-400{--tw-text-opacity:1;color:rgb(161 161 170/var(--tw-text-opacity,1))}.text-zinc-500{--tw-text-opacity:1;color:rgb(113 113 122/var(--tw-text-opacity,1))}.text-zinc-600{--tw-text-opacity:1;color:rgb(82 82 91/var(--tw-text-opacity,1))}.text-zinc-700{--tw-text-opacity:1;color:rgb(63 63 70/var(--tw-text-opacity,1))}.text-zinc-800{--tw-text-opacity:1;color:rgb(39 39 42/var(--tw-text-opacity,1))}.text-zinc-900{--tw-text-opacity:1;color:rgb(24 24 27/var(--tw-text-opacity,1))}.underline{text-decoration-line:underline}.antialiased{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}.opacity-80{opacity:.8}.shadow{--tw-shadow:0 1px 3px 0 rgba(0,0,0,.1),0 1px 2px -1px rgba(0,0,0,.1);--tw-shadow-colored:0 1px 3px 0 var(--tw-shadow-color),0 1px 2px -1px var(--tw-shadow-color)}.shadow,.shadow-2xl{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-2xl{--tw-shadow:0 25px 50px -12px rgba(0,0,0,.25);--tw-shadow-colored:0 25px 50px -12px var(--tw-shadow-color)}.shadow-lg{--tw-shadow:0 10px 15px -3px rgba(0,0,0,.1),0 4px 6px -4px rgba(0,0,0,.1);--tw-shadow-colored:0 10px 15px -3px var(--tw-shadow-color),0 4px 6px -4px var(--tw-shadow-color)}.shadow-lg,.shadow-xl{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-xl{--tw-shadow:0 20px 25px -5px rgba(0,0,0,.1),0 8px 10px -6px rgba(0,0,0,.1);--tw-shadow-colored:0 20px 25px -5px var(--tw-shadow-color),0 8px 10px -6px var(--tw-shadow-color)}.outline{outline-style:solid}.ring{--tw-ring-offset-shadow:var(--tw-ring-inset) 0 0 0 var(--tw-ring-offset-width) var(--tw-ring-offset-color);--tw-ring-shadow:var(--tw-ring-inset) 0 0 0 calc(3px + var(--tw-ring-offset-width)) var(--tw-ring-color);box-shadow:var(--tw-ring-offset-shadow),var(--tw-ring-shadow),var(--tw-shadow,0 0 #0000)}.blur{--tw-blur:blur(8px)}.blur,.filter{filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.transition{transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,-webkit-backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter,-webkit-backdrop-filter;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.ease-out{transition-timing-function:cubic-bezier(0,0,.2,1)}.empty\\:hidden:empty{display:none}.hover\\:bg-indigo-50:hover{--tw-bg-opacity:1;background-color:rgb(238 242 255/var(--tw-bg-opacity,1))}.hover\\:bg-red-50:hover{--tw-bg-opacity:1;background-color:rgb(254 242 242/var(--tw-bg-opacity,1))}.hover\\:bg-zinc-100:hover{--tw-bg-opacity:1;background-color:rgb(244 244 245/var(--tw-bg-opacity,1))}.hover\\:bg-zinc-50:hover{--tw-bg-opacity:1;background-color:rgb(250 250 250/var(--tw-bg-opacity,1))}.hover\\:text-red-500:hover{--tw-text-opacity:1;color:rgb(239 68 68/var(--tw-text-opacity,1))}.hover\\:text-red-600:hover{--tw-text-opacity:1;color:rgb(220 38 38/var(--tw-text-opacity,1))}.hover\\:text-zinc-600:hover{--tw-text-opacity:1;color:rgb(82 82 91/var(--tw-text-opacity,1))}.hover\\:text-zinc-700:hover{--tw-text-opacity:1;color:rgb(63 63 70/var(--tw-text-opacity,1))}.hover\\:underline:hover{text-decoration-line:underline}.disabled\\:opacity-50:disabled{opacity:.5}.dark\\:divide-zinc-800:is(.dark *)>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(39 39 42/var(--tw-divide-opacity,1))}.dark\\:border-indigo-800:is(.dark *){--tw-border-opacity:1;border-color:rgb(55 48 163/var(--tw-border-opacity,1))}.dark\\:border-zinc-600:is(.dark *){--tw-border-opacity:1;border-color:rgb(82 82 91/var(--tw-border-opacity,1))}.dark\\:border-zinc-700:is(.dark *){--tw-border-opacity:1;border-color:rgb(63 63 70/var(--tw-border-opacity,1))}.dark\\:border-zinc-800:is(.dark *){--tw-border-opacity:1;border-color:rgb(39 39 42/var(--tw-border-opacity,1))}.dark\\:bg-amber-900\\/30:is(.dark *){background-color:rgba(120,53,15,.3)}.dark\\:bg-emerald-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(6 78 59/var(--tw-bg-opacity,1))}.dark\\:bg-indigo-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(49 46 129/var(--tw-bg-opacity,1))}.dark\\:bg-indigo-900\\/30:is(.dark *){background-color:rgba(49,46,129,.3)}.dark\\:bg-indigo-900\\/40:is(.dark *){background-color:rgba(49,46,129,.4)}.dark\\:bg-red-900\\/30:is(.dark *){background-color:rgba(127,29,29,.3)}.dark\\:bg-zinc-600:is(.dark *){--tw-bg-opacity:1;background-color:rgb(82 82 91/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-700:is(.dark *){--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-800:is(.dark *){--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-800\\/50:is(.dark *){background-color:rgba(39,39,42,.5)}.dark\\:bg-zinc-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(24 24 27/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-900\\/40:is(.dark *){background-color:rgba(24,24,27,.4)}.dark\\:text-amber-200:is(.dark *){--tw-text-opacity:1;color:rgb(253 230 138/var(--tw-text-opacity,1))}.dark\\:text-blue-400:is(.dark *){--tw-text-opacity:1;color:rgb(96 165 250/var(--tw-text-opacity,1))}.dark\\:text-emerald-200:is(.dark *){--tw-text-opacity:1;color:rgb(167 243 208/var(--tw-text-opacity,1))}.dark\\:text-indigo-200:is(.dark *){--tw-text-opacity:1;color:rgb(199 210 254/var(--tw-text-opacity,1))}.dark\\:text-indigo-300:is(.dark *){--tw-text-opacity:1;color:rgb(165 180 252/var(--tw-text-opacity,1))}.dark\\:text-indigo-400:is(.dark *){--tw-text-opacity:1;color:rgb(129 140 248/var(--tw-text-opacity,1))}.dark\\:text-red-300:is(.dark *){--tw-text-opacity:1;color:rgb(252 165 165/var(--tw-text-opacity,1))}.dark\\:text-red-400:is(.dark *){--tw-text-opacity:1;color:rgb(248 113 113/var(--tw-text-opacity,1))}.dark\\:text-zinc-100:is(.dark *){--tw-text-opacity:1;color:rgb(244 244 245/var(--tw-text-opacity,1))}.dark\\:text-zinc-200:is(.dark *){--tw-text-opacity:1;color:rgb(228 228 231/var(--tw-text-opacity,1))}.dark\\:text-zinc-300:is(.dark *){--tw-text-opacity:1;color:rgb(212 212 216/var(--tw-text-opacity,1))}.dark\\:text-zinc-400:is(.dark *){--tw-text-opacity:1;color:rgb(161 161 170/var(--tw-text-opacity,1))}.dark\\:text-zinc-500:is(.dark *){--tw-text-opacity:1;color:rgb(113 113 122/var(--tw-text-opacity,1))}.dark\\:hover\\:bg-indigo-900\\/40:hover:is(.dark *){background-color:rgba(49,46,129,.4)}.dark\\:hover\\:bg-red-900\\/30:hover:is(.dark *){background-color:rgba(127,29,29,.3)}.dark\\:hover\\:bg-zinc-700:hover:is(.dark *){--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.dark\\:hover\\:bg-zinc-800:hover:is(.dark *){--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.dark\\:hover\\:bg-zinc-800\\/50:hover:is(.dark *){background-color:rgba(39,39,42,.5)}.dark\\:hover\\:bg-zinc-800\\/60:hover:is(.dark *){background-color:rgba(39,39,42,.6)}.dark\\:hover\\:text-zinc-200:hover:is(.dark *){--tw-text-opacity:1;color:rgb(228 228 231/var(--tw-text-opacity,1))}@media (min-width:640px){.sm\\:mx-auto{margin-left:auto;margin-right:auto}.sm\\:my-4{margin-top:1em}.sm\\:mb-4,.sm\\:my-4{margin-bottom:1em}.sm\\:h-\\[calc\\(100dvh-2em\\)\\]{height:calc(100dvh - 2em)}.sm\\:max-w-4xl{max-width:56em}.sm\\:max-w-5xl{max-width:64em}.sm\\:max-w-6xl{max-width:72em}.sm\\:items-stretch{align-items:stretch}.sm\\:rounded-2xl{border-radius:1em}}`;
   /* @TAILWIND_CSS_END */
 
   const BASE_CSS = `
@@ -3233,7 +3265,6 @@ textarea { resize: none; }
     openMenu() {
       const host = getDomain();
       const domain = Store.getDomain(host);
-      const recent = (domain.conversations || []).slice(0, 3);
 
       // Position menu near button but within viewport
       const r = this.host.getBoundingClientRect();
@@ -3261,15 +3292,25 @@ textarea { resize: none; }
       menu.appendChild(row('code', '新規 UserScript', () => ChatPanel.open({ newChat: true, mode: UserScriptMode.ID })));
       menu.appendChild(row('history', '会話履歴', () => HistoryPanel.open()));
 
-      // Recent section
-      if (recent.length) {
-        menu.appendChild(el('div', { class: 'px-4 pt-2 pb-1 text-xs uppercase tracking-wide text-zinc-500 dark:text-zinc-400' }, '最近の会話'));
+      // Recent section: local conversations plus Agents sessions from other
+      // devices. The session list is fetched now (menu open is the only
+      // trigger besides a stale history panel) and the section repaints
+      // when it arrives.
+      const recentWrap = el('div');
+      const paintRecent = () => {
+        clear(recentWrap);
+        const recent = RemoteHistory.merged(host).slice(0, 3);
+        if (!recent.length) return;
+        recentWrap.appendChild(el('div', { class: 'px-4 pt-2 pb-1 text-xs uppercase tracking-wide text-zinc-500 dark:text-zinc-400' }, '最近の会話'));
         recent.forEach((c) => {
-          const firstUser = c.messages.find((m) => m.role === 'user' && !m._synthetic);
+          const firstUser = (c.messages || []).find((m) => m.role === 'user' && !m._synthetic);
           const label = c.title || (firstUser && (firstUser.content || '').slice(0, 40)) || '(新規会話)';
-          menu.appendChild(row(c.mode === UserScriptMode.ID ? 'code' : 'chat', label, () => ChatPanel.open({ conversationId: c.id })));
+          recentWrap.appendChild(row(c.mode === UserScriptMode.ID ? 'code' : 'chat', label, () => ChatPanel.open({ conversationId: c.id })));
         });
-      }
+      };
+      paintRecent();
+      menu.appendChild(recentWrap);
+      RemoteHistory.refresh().then((ok) => { if (ok && this.menuEl === menu) paintRecent(); });
 
       // Footer
       menu.appendChild(el('div', { class: 'border-t border-zinc-100 dark:border-zinc-800 mt-1' }));
@@ -3581,6 +3622,8 @@ textarea { resize: none; }
         const tool = call.name.slice(8);
         const path = a.file_path || a.path || '';
         switch (tool) {
+          case 'web_search': return `Web 検索: ${a.query || ''}`;
+          case 'web_fetch':  return `URL を取得: ${a.url || ''}`;
           case 'bash':  return `サンドボックス: ${String(a.command || '').replace(/\s+/g, ' ').slice(0, 120)}`;
           case 'write': return `サンドボックス: ファイルを書き込み ${path}`;
           case 'edit':  return `サンドボックス: ファイルを編集 ${path}`;
@@ -5050,14 +5093,48 @@ textarea { resize: none; }
     // How long to wait for the session to settle after the user pressed stop.
     INTERRUPT_GRACE_MS: 20000,
 
+    CHAT_PROMPT: `## 実行環境 (Agents API)
+- ユーザーはブラウザで Web ページを見ながら、このチャットであなたと会話している。
+- ユーザーメッセージの前に、ページの内容・ページで選択しているテキスト・添付ファイルが [見出し] 付きのブロックとして付くことがある。最後のブロックがユーザーの入力したメッセージ。
+- Web 検索や URL の取得は、ユーザーが有効にしたときだけ使える。`,
+
     enabled() { return !!Store.settings.agentsEnabled; },
+    // Plain chats run on the Agents API whenever a Claude model is selected
+    // (the API needs GM_xmlhttpRequest; without it Claude chats stay on the
+    // Messages API, stored locally as before). Gemini chats never do.
+    chatEnabled() {
+      const model = Store.settings.model || '';
+      return Providers.of(model) === 'anthropic' && this.supportsModel(model) && AgentsAPI.available();
+    },
+    // Managed Agents runs Claude 4.5 and later. Older ids (Claude 2 / 3,
+    // Opus / Sonnet 4 and Opus 4.1) keep using the Messages API.
+    supportsModel(id) {
+      return !/^claude-(instant|2|3)/i.test(id) && !/^claude-(opus|sonnet)-4(-1)?(-\d{8})?$/i.test(id);
+    },
 
     // A chat's engine is fixed when the conversation is created; until then
-    // (a fresh panel) it follows the setting.
+    // (a fresh panel) it follows the settings.
     usesAgents(conv, mode) {
-      if (mode !== UserScriptMode.ID) return false;
-      return conv ? conv.engine === 'agents' : this.enabled();
+      if (conv) return conv.engine === 'agents';
+      return mode === UserScriptMode.ID ? this.enabled() : this.chatEnabled();
     },
+
+    // 'userscript' or 'chat': which agent profile a conversation runs on.
+    // Agents conversations from before v2.2 carry no kind and were all
+    // UserScript chats; without a conversation the panel mode decides
+    // ('chat' only when given explicitly).
+    kindOf(conv, mode) {
+      const k = conv && conv.agent && conv.agent.kind;
+      if (k) return k;
+      if (conv) return conv.mode === UserScriptMode.ID || conv.engine === 'agents' ? 'userscript' : 'chat';
+      return mode === 'chat' ? 'chat' : 'userscript';
+    },
+
+    // Agents conversations created from v2.2 on keep only a catalog entry
+    // in local storage; the transcript is the session's event history and is
+    // fetched when the conversation is opened. Older ones keep their stored
+    // transcript.
+    isRemote(conv) { return !!(conv && conv.remote && conv.engine === 'agents'); },
 
     models() {
       const list = AGENTS_MODELS.slice();
@@ -5070,8 +5147,24 @@ textarea { resize: none; }
       const m = this.models().find((x) => x.id === id);
       return (m && m.display) || id || '';
     },
-    modelOf(conv) { return (conv && conv.agent && conv.agent.model) || Store.settings.agentsModel || DEFAULT_SETTINGS.agentsModel; },
-    effortOf(conv) { return (conv && conv.agent && conv.agent.effort) || Store.settings.agentsEffort || DEFAULT_SETTINGS.agentsEffort; },
+    // Model / effort a conversation runs (or, before its session exists,
+    // would run) with. UserScript chats follow the Agents settings; plain
+    // chats follow the chat model picker and the Claude effort setting (empty
+    // effort = the model's default).
+    modelOf(conv, mode) {
+      if (conv && conv.agent && conv.agent.model) return conv.agent.model;
+      if (this.kindOf(conv, mode) === 'chat') return Store.settings.model || '';
+      return Store.settings.agentsModel || DEFAULT_SETTINGS.agentsModel;
+    },
+    effortOf(conv, mode) {
+      if (conv && conv.agent && conv.agent.model) return conv.agent.effort || '';
+      if (this.kindOf(conv, mode) === 'chat') {
+        const model = Store.settings.model || '';
+        return Claude.resolveEffort(Store.settings.claudeEffort, Claude.profile(model).effortLevels) || '';
+      }
+      return Store.settings.agentsEffort || DEFAULT_SETTINGS.agentsEffort;
+    },
+    effortLabel(effort) { return effort ? `effort ${effort}` : 'effort 既定'; },
 
     rate() {
       const r = Number(Store.settings.agentsJpyPerUsd);
@@ -5118,12 +5211,36 @@ textarea { resize: none; }
         || (e.status === 400 && /(environment|agent|session)[^.]*(not found|archived|does not exist)/i.test(e.message || '')));
     },
 
-    // `metadata.kind` of the agents this mode runs on. Agents created before
-    // the key existed carry no kind and count as this one.
-    AGENT_KIND: 'userscript',
-    isOwnAgent(a) {
+    // The two agents this app runs on. `kind` is stored in the agent's
+    // metadata; agents created before the key existed carry none and count
+    // as UserScript agents. `keys` are the Store.settings fields holding the
+    // chosen agent.
+    profile(kind) {
+      if (kind === 'chat') {
+        return {
+          kind,
+          name: 'AI Chat Overlay — Chat',
+          description: 'ユーザーが見ている Web ページについて会話する (AI Chat Overlay)',
+          keys: { id: 'agentsChatAgentId', version: 'agentsChatAgentVersion', hash: 'agentsChatAgentHash' },
+          // Sessions always override the prompt with the domain's / global
+          // one, so this only matters when an agent is used elsewhere.
+          system: () => `${DEFAULT_SETTINGS.globalSystemPrompt}\n\n${this.CHAT_PROMPT}`,
+          // Web search / fetch are switched on per session (see webTools).
+          tools: () => []
+        };
+      }
+      return {
+        kind: 'userscript',
+        name: this.AGENT_NAME,
+        description: 'ユーザーのページを調べながら Tampermonkey 向け UserScript を作り、サンドボックスで検証する (AI Chat Overlay)',
+        keys: { id: 'agentsAgentId', version: 'agentsAgentVersion', hash: 'agentsAgentHash' },
+        system: () => this.systemPrompt(),
+        tools: () => this.tools()
+      };
+    },
+    isOwnAgent(a, kind = 'userscript') {
       return !!(a && !a.archived_at && a.metadata && a.metadata.app === AGENTS_APP
-        && (a.metadata.kind || this.AGENT_KIND) === this.AGENT_KIND);
+        && (a.metadata.kind || 'userscript') === kind);
     },
     isUsableEnvironment(env) {
       return !!(env && !env.archived_at && (!env.config || !env.config.type || env.config.type === 'cloud'));
@@ -5133,21 +5250,39 @@ textarea { resize: none; }
     // hash covers what decides behaviour (name, prompt, tools) and is also
     // stored in the agent's metadata, so every device sharing the agent can
     // tell whether it already matches without comparing whole prompts.
-    agentSpec() {
-      const system = this.systemPrompt();
-      const tools = this.tools();
-      const hash = GistPublish.hash(JSON.stringify([this.AGENT_NAME, system, tools]));
+    agentSpec(kind = 'userscript') {
+      const p = this.profile(kind);
+      const system = p.system();
+      const tools = p.tools();
+      const hash = GistPublish.hash(JSON.stringify([p.name, system, tools]));
       return {
         hash,
         body: {
-          name: this.AGENT_NAME,
-          description: 'ユーザーのページを調べながら Tampermonkey 向け UserScript を作り、サンドボックスで検証する (AI Chat Overlay)',
+          name: p.name,
+          description: p.description,
           model: { id: DEFAULT_SETTINGS.agentsModel, effort: DEFAULT_SETTINGS.agentsEffort },
           system,
           tools,
-          metadata: { app: AGENTS_APP, kind: this.AGENT_KIND, config_hash: hash, script_version: scriptVersion() || '0' }
+          metadata: { app: AGENTS_APP, kind: p.kind, config_hash: hash, script_version: scriptVersion() || '0' }
         }
       };
+    },
+
+    // Tools of a plain-chat session: the agent toolset with only the web
+    // tools the user switched on (none → no tools at all).
+    webTools(web) {
+      if (!web || (!web.search && !web.fetch)) return [];
+      return [{
+        type: 'agent_toolset_20260401',
+        default_config: { enabled: false },
+        configs: [{ name: 'web_search', enabled: !!web.search }, { name: 'web_fetch', enabled: !!web.fetch }]
+      }];
+    },
+
+    // The plain-chat system prompt for a page's domain.
+    chatSystemPrompt(host) {
+      const base = Store.resolveSystemPrompt(host) || DEFAULT_SETTINGS.globalSystemPrompt;
+      return `${base}\n\n${this.CHAT_PROMPT}`;
     },
 
     // Resolves the agent new sessions run on: the one picked in Settings,
@@ -5160,10 +5295,11 @@ textarea { resize: none; }
     // that last wrote it; an older copy leaves it alone and passes its own
     // prompt and tools as session overrides, so it neither rolls the shared
     // agent back nor runs with tools it does not implement.
-    async ensureAgent() {
+    async ensureAgent(kind = 'userscript') {
       const s = Store.settings;
-      const { body, hash } = this.agentSpec();
-      if (s.agentsAgentId && s.agentsAgentHash === hash) return { id: s.agentsAgentId, version: s.agentsAgentVersion };
+      const k = this.profile(kind).keys;
+      const { body, hash } = this.agentSpec(kind);
+      if (s[k.id] && s[k.hash] === hash) return { id: s[k.id], version: s[k.version] };
 
       let overrides = null;
       const adopt = async (id) => {
@@ -5190,13 +5326,13 @@ textarea { resize: none; }
         }
       };
 
-      let agent = s.agentsAgentId ? await adopt(s.agentsAgentId) : null;
+      let agent = s[k.id] ? await adopt(s[k.id]) : null;
       if (!agent) {
-        const found = await this.findAgent().catch((e) => {
+        const found = await this.findAgent(kind).catch((e) => {
           console.warn('[aicx] could not list agents:', e);
           return null;
         });
-        if (found && found.id !== s.agentsAgentId) agent = await adopt(found.id);
+        if (found && found.id !== s[k.id]) agent = await adopt(found.id);
       }
       if (!agent) {
         overrides = null;
@@ -5204,15 +5340,16 @@ textarea { resize: none; }
       }
       // With overrides the agent does not match this copy, so the next
       // session checks it again (a newer device may have moved it on).
-      Object.assign(s, { agentsAgentId: agent.id, agentsAgentVersion: agent.version, agentsAgentHash: overrides ? '' : hash });
+      Object.assign(s, { [k.id]: agent.id, [k.version]: agent.version, [k.hash]: overrides ? '' : hash });
       await Store.saveSettings();
       return { id: agent.id, version: agent.version, overrides };
     },
 
-    // The agent this app created most recently in the workspace, if any.
-    async findAgent() {
+    // The agent of this kind this app created most recently in the
+    // workspace, if any.
+    async findAgent(kind = 'userscript') {
       const list = await AgentsAPI.listAgents();
-      return list.filter((a) => this.isOwnAgent(a))
+      return list.filter((a) => this.isOwnAgent(a, kind))
         .sort((a, b) => this.tsOf(b.updated_at || b.created_at) - this.tsOf(a.updated_at || a.created_at))[0] || null;
     },
 
@@ -5242,27 +5379,37 @@ textarea { resize: none; }
       // is writing a script for, and that is not known in advance.
       return AgentsAPI.createEnvironment({
         name: `ai-chat-overlay-${Date.now().toString(36)}`,
-        description: 'AI Chat Overlay: UserScript の動作確認用サンドボックス',
+        description: 'AI Chat Overlay: Agents API のチャット / UserScript 作成用サンドボックス',
         config: { type: 'cloud', networking: { type: 'unrestricted' } },
         metadata: { app: AGENTS_APP }
       });
     },
 
-    async createSession(conv) {
+    // `host` and `kind` go into the session's metadata so the conversation
+    // can be listed (and reopened) on other devices. Plain chats also get
+    // the domain's system prompt and the web tools the user switched on.
+    async createSession(conv, { host, web } = {}) {
+      const kind = this.kindOf(conv);
       const create = async () => {
-        const agent = await this.ensureAgent();
+        const agent = await this.ensureAgent(kind);
         const envId = await this.ensureEnvironment();
+        const effort = this.effortOf(conv);
+        const overrides = Object.assign({}, agent.overrides || {});
+        if (kind === 'chat') {
+          overrides.system = this.chatSystemPrompt(host);
+          overrides.tools = this.webTools(web);
+        }
         return AgentsAPI.createSession({
           agent: Object.assign({
             type: 'agent_with_overrides', id: agent.id, version: agent.version,
-            model: { id: this.modelOf(conv), effort: this.effortOf(conv) }
-          }, agent.overrides || {}),
+            model: effort ? { id: this.modelOf(conv), effort } : { id: this.modelOf(conv) }
+          }, overrides),
           environment_id: envId,
           // The API rejects control / format characters (newlines included)
           // in titles, and conv.title is the first line(s) the user typed.
-          title: (conv.title || '').replace(/[\p{Cc}\p{Cf}]+/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 200) || 'UserScript',
+          title: (conv.title || '').replace(/[\p{Cc}\p{Cf}]+/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 200) || (kind === 'chat' ? 'チャット' : 'UserScript'),
           budget: { type: 'limit', max_list_cost: { amount: String(conv.agent.budgetCents), currency: 'USD' } },
-          metadata: { app: AGENTS_APP, conversation: conv.id }
+          metadata: { app: AGENTS_APP, kind, host: host || '', conversation: conv.id }
         });
       };
       try {
@@ -5271,7 +5418,8 @@ textarea { resize: none; }
         // A stored agent / environment id that no longer resolves: drop both
         // and resolve them again once (reusing or creating as needed).
         if (!this.isGone(e)) throw e;
-        Object.assign(Store.settings, { agentsAgentId: '', agentsAgentHash: '', agentsEnvironmentId: '' });
+        const k = this.profile(kind).keys;
+        Object.assign(Store.settings, { [k.id]: '', [k.hash]: '', agentsEnvironmentId: '' });
         await Store.saveSettings();
         return create();
       }
@@ -5321,32 +5469,272 @@ textarea { resize: none; }
       return Number.isFinite(t) ? t : 0;
     },
 
-    // Text of a user turn as the agent receives it: where the user is, what
-    // they shared, then what they typed.
-    composeMessage({ text, selection, snapText, attachments }) {
-      const parts = [[
-        '[ユーザーが開いているページ (送信時点)]',
-        `URL: ${location.href}`,
-        `Title: ${document.title || '(なし)'}`,
-        `推奨 @match: ${UserScriptMode.suggestedMatches().join(' / ')}`
-      ].join('\n')];
-      if (snapText) parts.push(`[ユーザーが共有したページ内容]\n${snapText}`);
+    // Headers of the context blocks that precede what the user typed in a
+    // user.message. The user's own text is always the last text block, so a
+    // transcript rebuilt from the session's events (see transcriptOf) can
+    // tell the parts apart.
+    HDR: {
+      at: '[ユーザーが開いているページ (送信時点)]',
+      page: '[ユーザーが共有したページ内容]',
+      attach: '[添付ファイル: ',
+      selection: '[ユーザーがページで選択しているテキスト。このターンの主な対象]',
+      noText: '[メッセージ本文なし]'
+    },
+
+    // Content blocks of a user turn as the agent receives it: (UserScript
+    // only) where the user is, what they shared, then what they typed.
+    // Images and PDFs go as image / document blocks, each preceded by a
+    // header naming the file.
+    composeContent(kind, { text, selection, snapText, attachments }) {
+      const H = this.HDR;
+      const blocks = [];
+      const textBlock = (t) => blocks.push({ type: 'text', text: t });
+      if (kind === 'userscript') {
+        textBlock([
+          H.at,
+          `URL: ${location.href}`,
+          `Title: ${document.title || '(なし)'}`,
+          `推奨 @match: ${UserScriptMode.suggestedMatches().join(' / ')}`
+        ].join('\n'));
+      }
+      if (snapText) textBlock(`${H.page}\n${snapText}`);
       for (const a of attachments || []) {
-        const textual = /^text\/|json|javascript|xml/.test(a.mimeType || '') || /\.(js|ts|json|css|html?|txt|md)$/i.test(a.name || '');
+        const mime = a.mimeType || '';
+        const b64 = a.dataUrl ? a.dataUrl.slice(a.dataUrl.indexOf(',') + 1) : '';
+        if (b64 && /^image\/(png|jpe?g|gif|webp)$/.test(mime)) {
+          textBlock(`${H.attach}${a.name}]`);
+          blocks.push({ type: 'image', source: { type: 'base64', media_type: mime === 'image/jpg' ? 'image/jpeg' : mime, data: b64 } });
+          continue;
+        }
+        if (b64 && mime === 'application/pdf') {
+          textBlock(`${H.attach}${a.name}]`);
+          blocks.push({ type: 'document', source: { type: 'base64', media_type: mime, data: b64 } });
+          continue;
+        }
+        const textual = /^text\/|json|javascript|xml/.test(mime) || /\.(js|ts|json|css|html?|txt|md|csv)$/i.test(a.name || '');
         let body = null;
-        if (textual && a.dataUrl) {
+        if (textual && b64) {
           try {
-            const b64 = a.dataUrl.slice(a.dataUrl.indexOf(',') + 1);
             body = new TextDecoder().decode(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)));
           } catch { body = null; }
         }
-        parts.push(body != null
-          ? `[添付ファイル: ${a.name}]\n${body}`
-          : `[添付ファイル: ${a.name}] (画像などのファイルは Agents API モードでは送信されません)`);
+        textBlock(body != null
+          ? `${H.attach}${a.name}]\n${body}`
+          : `${H.attach}${a.name}] (この形式のファイルは送信できません)`);
       }
-      if (selection) parts.push(`[ユーザーがページで選択しているテキスト。このターンの主な対象]\n"""\n${selection}\n"""`);
-      parts.push(text || (selection ? 'この選択箇所について対応してください。' : '続けてください。'));
-      return parts.join('\n\n');
+      if (selection) textBlock(`${H.selection}\n"""\n${selection}\n"""`);
+      textBlock(text || `${H.noText}\n${selection ? 'この選択箇所について対応してください。' : '続けてください。'}`);
+      return blocks;
+    },
+
+    // The parts of a user.message composed above, for display: what the
+    // user typed, the selection, the files, and the shared page (url /
+    // title). A message from an older version (one text block) shows its
+    // text minus the leading page header.
+    parseUserContent(content) {
+      const H = this.HDR;
+      const out = { text: '', selection: '', attachments: [], page: null };
+      const blocks = Array.isArray(content) ? content : [];
+      const texts = blocks.filter((b) => b && b.type === 'text');
+      const last = texts[texts.length - 1];
+      for (let i = 0; i < blocks.length; i++) {
+        const b = blocks[i];
+        if (!b) continue;
+        if (b.type === 'image' || b.type === 'document') {
+          const prev = blocks[i - 1];
+          const name = prev && prev.type === 'text' && prev.text.startsWith(H.attach) ? prev.text.slice(H.attach.length).replace(/\].*$/s, '') : (b.type === 'image' ? '画像' : 'PDF');
+          const src = b.source || {};
+          out.attachments.push({ id: uid(), name, mimeType: src.media_type || '', dataUrl: src.type === 'base64' ? `data:${src.media_type};base64,${src.data}` : '' });
+          continue;
+        }
+        if (b.type !== 'text' || b === last) continue;
+        const t = b.text || '';
+        if (t.startsWith(H.page)) {
+          const url = (t.match(/^URL: (.*)$/m) || [])[1] || '';
+          const title = (t.match(/^Title: (.*)$/m) || [])[1] || '';
+          out.page = { url, title, text: t.slice(H.page.length + 1) };
+        } else if (t.startsWith(H.selection)) {
+          out.selection = t.slice(H.selection.length + 1).replace(/^"""\n/, '').replace(/\n"""$/, '');
+        } else if (t.startsWith(H.attach) && !/^\[添付ファイル: [^\]]*\]$/.test(t)) {
+          out.attachments.push({ id: uid(), name: t.slice(H.attach.length).replace(/\][\s\S]*$/, ''), mimeType: 'text/plain' });
+        }
+      }
+      let text = last ? last.text || '' : '';
+      if (text.startsWith(H.noText)) text = '';
+      else if (texts.length === 1 && text.startsWith(H.at)) {
+        // Pre-2.2 single-block message: drop the page header paragraph.
+        text = text.split('\n\n').slice(1).join('\n\n');
+      }
+      out.text = text;
+      return out;
+    },
+
+    // Rebuilds a conversation's messages from its session's events, in the
+    // shape run() produces live: user turns (the shared page as a context
+    // banner), assistant text, tool calls and their results, and the cost
+    // line at the end of each turn. Nothing is executed or sent. Also
+    // returns the requests still waiting for this side (custom tool calls
+    // and permission asks nobody answered), which run() settles before
+    // sending the next message.
+    transcriptOf(events, conv) {
+      const msgs = [];
+      const st = (conv && conv.agent) || {};
+      let cur = null;
+      let cost = 0;
+      const asked = new Map();
+      const ts = (ev) => this.tsOf(ev.processed_at || ev.created_at) || now();
+      const textOf = (ev) => (ev.content || []).filter((b) => b && b.type === 'text').map((b) => b.text).join('');
+      const newAssistant = (ev) => {
+        cur = { id: uid(), role: 'assistant', content: '', createdAt: ts(ev) };
+        msgs.push(cur);
+        return cur;
+      };
+      const ensureCur = (ev, forText) => {
+        if (!cur || cur.role !== 'assistant') return newAssistant(ev);
+        if (forText && cur.functionCalls && cur.functionCalls.length) return newAssistant(ev);
+        return cur;
+      };
+      const note = (ev, s) => {
+        const m = ensureCur(ev, true);
+        m.content = (m.content ? `${m.content}\n\n` : '') + s;
+      };
+      const pushResult = (ev, resp) => {
+        const last = msgs[msgs.length - 1];
+        if (last && last._tool) last.functionResponses.push(resp);
+        else msgs.push({ id: uid(), role: 'user', _tool: true, functionResponses: [resp], createdAt: ts(ev) });
+        cur = null;
+      };
+      const callName = (id) => {
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const c = (msgs[i].functionCalls || []).find((x) => x.id === id);
+          if (c) return c.name;
+        }
+        return null;
+      };
+      for (const ev of events || []) {
+        if (!ev || !ev.type) continue;
+        switch (ev.type) {
+          case 'user.message': {
+            const p = this.parseUserContent(ev.content);
+            if (p.page) {
+              msgs.push({ id: uid(), role: 'user', _synthetic: true, _contextUrl: p.page.url, _contextTitle: p.page.title, content: p.page.text, createdAt: ts(ev) });
+              msgs.push({ id: uid(), role: 'assistant', _synthetic: true, content: '(context received)', createdAt: ts(ev) });
+            }
+            msgs.push({
+              id: uid(), role: 'user', content: p.text, createdAt: ts(ev),
+              attachments: p.attachments.length ? p.attachments : undefined,
+              selection: p.selection || undefined
+            });
+            cur = null;
+            break;
+          }
+          case 'agent.message': {
+            const t = textOf(ev);
+            if (t) {
+              const m = ensureCur(ev, true);
+              m.content = (m.content ? `${m.content}\n\n` : '') + t;
+            }
+            break;
+          }
+          case 'agent.custom_tool_use':
+          case 'agent.tool_use': {
+            const m = ensureCur(ev, false);
+            const custom = ev.type === 'agent.custom_tool_use';
+            (m.functionCalls || (m.functionCalls = [])).push({ id: ev.id, name: custom ? ev.name : `sandbox.${ev.name}`, args: ev.input || {} });
+            if (custom) asked.set(ev.id, 'custom');
+            else if (ev.evaluated_permission === 'ask') asked.set(ev.id, 'confirm');
+            break;
+          }
+          case 'user.custom_tool_result': {
+            asked.delete(ev.custom_tool_use_id);
+            const raw = textOf(ev);
+            let response;
+            try { response = JSON.parse(raw); } catch { response = { output: raw }; }
+            pushResult(ev, { id: ev.custom_tool_use_id, name: callName(ev.custom_tool_use_id) || 'tool', response });
+            break;
+          }
+          case 'user.tool_confirmation':
+            asked.delete(ev.tool_use_id);
+            break;
+          case 'agent.tool_result': {
+            const out = textOf(ev);
+            const response = { output: out.length > this.RESULT_KEEP_CHARS ? `${out.slice(0, this.RESULT_KEEP_CHARS)}\n…(省略)` : out };
+            if (ev.is_error) response.error = out.split('\n')[0].slice(0, 200) || 'エラー';
+            pushResult(ev, { id: ev.tool_use_id, name: callName(ev.tool_use_id) || 'sandbox.tool', response });
+            break;
+          }
+          case 'span.model_request_start':
+            if (!cur || cur.role !== 'assistant') newAssistant(ev);
+            break;
+          case 'session.usage': {
+            const u = ev.usage || ev;
+            const amt = u && u.list_cost && u.list_cost.amount;
+            if (amt != null) cost = parseInt(amt, 10) || 0;
+            break;
+          }
+          case 'session.error': {
+            const err = ev.error || {};
+            note(ev, `_(エージェントでエラーが発生しました: ${esc(err.message || err.type || '不明なエラー')})_`);
+            break;
+          }
+          case 'agent.thread_context_compacted':
+            note(ev, '_(会話が長くなったため、エージェントがこれまでの内容を要約しました)_');
+            break;
+          case 'user.interrupt':
+            note(ev, '_(停止しました)_');
+            break;
+          case 'session.status_idle': {
+            const reason = (ev.stop_reason && ev.stop_reason.type) || 'end_turn';
+            if (reason === 'requires_action') break;
+            if (reason === 'retries_exhausted') note(ev, '_(エージェントの処理がエラーまたは上限により停止しました。「続けて」と送ると再開できます。)_');
+            if (reason === 'budget_reached') note(ev, '_(費用の上限に達したため停止しました)_');
+            let last = msgs[msgs.length - 1];
+            if (!last || last.role !== 'assistant' || last._synthetic) last = newAssistant(ev);
+            last.agentsInfo = { model: st.model, effort: st.effort, costCents: cost };
+            cur = null;
+            break;
+          }
+          default:
+            break;
+        }
+      }
+      const messages = msgs.filter((m) => m.role !== 'assistant' || m._synthetic || m.content
+        || (m.functionCalls && m.functionCalls.length) || m.agentsInfo);
+      return { messages, costCents: cost, unanswered: [...asked].map(([id, type]) => ({ id, type })) };
+    },
+
+    // Conversations whose transcript was fetched (or produced) during this
+    // page session. A remote conversation outside this set has only its
+    // catalog entry in memory.
+    _loaded: new Set(),
+    needsLoad(conv) {
+      return this.isRemote(conv) && !!(conv.agent && conv.agent.sessionId)
+        && !this._loaded.has(conv.id) && !Runs.has(conv.id);
+    },
+
+    // Fetches a remote conversation's transcript from its session. A session
+    // that no longer exists leaves a note; the next send starts a new one.
+    async loadTranscript(conv) {
+      const st = conv.agent;
+      let evs;
+      try {
+        evs = await AgentsAPI.listEvents(st.sessionId, null);
+      } catch (e) {
+        if (e.status !== 404) throw e;
+        conv.messages = [{ id: uid(), role: 'assistant', createdAt: now(), content: '_(この会話のセッションはサーバー上に見つかりませんでした。削除された可能性があります。送信すると新しいセッションで続けます。)_' }];
+        st.sessionId = null;
+        this._loaded.add(conv.id);
+        return;
+      }
+      const t = this.transcriptOf(evs, conv);
+      conv.messages = t.messages;
+      st.costCents = t.costCents || st.costCents || 0;
+      st.unanswered = t.unanswered;
+      let cursor = null;
+      for (const e of evs) if (e.processed_at && this.tsOf(e.processed_at) >= this.tsOf(cursor)) cursor = e.processed_at;
+      st.cursor = cursor;
+      st.seen = evs.map((e) => e.id).filter(Boolean).slice(-300);
+      this._loaded.add(conv.id);
     },
 
     // Minimal single-consumer queue fed by the stream and the poller.
@@ -5451,8 +5839,9 @@ textarea { resize: none; }
     // `onPending(msg)` tells the caller which message to annotate if this
     // throws. Resolves when the session settles (end of turn, stop, budget
     // pause the user declined, or termination).
-    async run({ conv, host, panel, userMsg, text, selection, snapText, attachments, onPending, aborter }) {
-      const st = conv.agent || (conv.agent = { model: this.modelOf(null), effort: this.effortOf(null) });
+    async run({ conv, host, panel, userMsg, text, selection, snapText, attachments, web, onPending, aborter }) {
+      const st = conv.agent || (conv.agent = { model: this.modelOf(conv), effort: this.effortOf(conv) });
+      const kind = this.kindOf(conv);
       const view = () => { if (panel.conv === conv) panel.render(); };
       const viewLast = () => { if (panel.conv === conv) panel.renderLastAssistant(); };
       const save = () => { Store.upsertConversation(host, conv); Store.saveDomains(); };
@@ -5506,8 +5895,18 @@ textarea { resize: none; }
         st.costCents = 0;
         st.cursor = null;
         st.seen = [];
-        session = await this.createSession(conv);
+        st.unanswered = [];
+        session = await this.createSession(conv, { host, web });
         st.sessionId = session.id;
+        st.web = { search: !!(web && web.search), fetch: !!(web && web.fetch) };
+        // The transcript of a session created here is the one in memory.
+        this._loaded.add(conv.id);
+        save();
+      } else if (kind === 'chat' && web && (!!web.search !== !!(st.web && st.web.search) || !!web.fetch !== !!(st.web && st.web.fetch))) {
+        // The web toggles changed since the last turn: swap the session's
+        // tools (allowed while it is idle, which it is between turns).
+        await AgentsAPI.updateSession(st.sessionId, { agent: { tools: this.webTools(web) } });
+        st.web = { search: !!web.search, fetch: !!web.fetch };
         save();
       }
       const sid = st.sessionId;
@@ -5686,6 +6085,20 @@ textarea { resize: none; }
         }
       }
 
+      // Requests left waiting when the transcript was rebuilt from the server
+      // (another device, or a reload, left a tool call or permission ask
+      // unanswered). A session waiting on one accepts nothing else, so they
+      // are declined first.
+      const pendingAsks = (st.unanswered || []).filter((x) => !answered.has(x.id));
+      st.unanswered = [];
+      for (const ask of pendingAsks) {
+        answered.add(ask.id);
+        const ev = ask.type === 'custom'
+          ? { type: 'user.custom_tool_result', custom_tool_use_id: ask.id, content: [{ type: 'text', text: JSON.stringify({ error: 'このツール呼び出しには応答できませんでした (別のデバイスやページの再読み込みで中断)。必要ならもう一度呼び出してください。' }) }], is_error: true }
+          : { type: 'user.tool_confirmation', tool_use_id: ask.id, result: 'deny', deny_message: '別のデバイスやページの再読み込みで確認できませんでした。' };
+        await AgentsAPI.sendEvents(sid, [ev]).catch((e) => console.warn('[aicx] could not settle a pending request:', e));
+      }
+
       // A session paused at its cap only accepts settle events.
       const latest = await AgentsAPI.getSession(sid);
       if (latest && latest.usage) usageOf(latest.usage);
@@ -5711,7 +6124,7 @@ textarea { resize: none; }
       try {
         const sent = await AgentsAPI.sendEvents(sid, [{
           type: 'user.message',
-          content: [{ type: 'text', text: this.composeMessage({ text, selection, snapText, attachments }) }]
+          content: this.composeContent(kind, { text, selection, snapText, attachments })
         }]);
         const ourId = sent && sent.data && sent.data[0] && sent.data[0].id;
         let ourProcessed = !ourId;
@@ -5834,6 +6247,113 @@ textarea { resize: none; }
   };
 
   // =========================================================================
+  // 12.8 Remote history (Agents sessions made elsewhere)
+  // =========================================================================
+  //
+  // An Agents conversation started on another device (or before a
+  // reinstall) exists only as a session in the workspace. The session list
+  // is fetched when the FAB menu opens, or when the history panel opens with
+  // a stale list — never at script load — and merged with the local catalog
+  // for display. Opening such a conversation adds a catalog entry for it.
+  // Sessions are matched to a domain by the `host` written into their
+  // metadata (sessions created before v2.2 carry none and are not listed).
+  const RemoteHistory = {
+    STALE_MS: 30_000,
+    MAX_PAGES: 2,
+    _items: new Map(), // host -> conv-like entries
+    _at: 0,
+    _inflight: null,
+    available() { return AgentsAPI.available() && !!Store.settings.anthropicApiKey; },
+    items(host) { return this._items.get(host) || []; },
+    isStale() { return Date.now() - this._at > this.STALE_MS; },
+
+    // Fetches the newest sessions of the workspace. Resolves to true when
+    // the list was (re)loaded; failures only log, the local catalog still
+    // shows.
+    refresh() {
+      if (!this.available()) return Promise.resolve(false);
+      if (this._inflight) return this._inflight;
+      this._inflight = (async () => {
+        try {
+          const list = await AgentsAPI.listAll('/sessions?limit=100', undefined, this.MAX_PAGES);
+          const byHost = new Map();
+          for (const s of list) {
+            const m = s && s.metadata;
+            if (!m || m.app !== AGENTS_APP || !m.host || s.archived_at) continue;
+            if (!byHost.has(m.host)) byHost.set(m.host, []);
+            byHost.get(m.host).push(this.toConv(s));
+          }
+          this._items = byHost;
+          this._at = Date.now();
+          return true;
+        } catch (e) {
+          console.warn('[aicx] could not list Agents sessions:', e);
+          return false;
+        } finally {
+          this._inflight = null;
+        }
+      })();
+      return this._inflight;
+    },
+
+    toConv(s) {
+      const m = s.metadata || {};
+      const kind = m.kind === 'chat' ? 'chat' : 'userscript';
+      const model = (s.agent && s.agent.model) || {};
+      const eff = model.effort;
+      const usage = s.usage && s.usage.list_cost;
+      return {
+        id: m.conversation || s.id,
+        title: s.title || '',
+        createdAt: AgentsMode.tsOf(s.created_at) || now(),
+        updatedAt: AgentsMode.tsOf(s.updated_at || s.created_at) || now(),
+        mode: kind === 'userscript' ? UserScriptMode.ID : undefined,
+        engine: 'agents',
+        remote: true,
+        messages: [],
+        agent: {
+          kind, sessionId: s.id, model: model.id || '',
+          effort: (eff && typeof eff === 'object') ? (eff.type || '') : (eff || ''),
+          costCents: (usage && parseInt(usage.amount, 10)) || 0
+        },
+        _remoteOnly: true
+      };
+    },
+
+    // The domain's local conversations plus sessions from elsewhere that are
+    // not among them, most recently updated first.
+    merged(host) {
+      const local = Store.getDomain(host).conversations || [];
+      const ids = new Set(local.map((c) => c.id));
+      const sids = new Set(local.map((c) => c.agent && c.agent.sessionId).filter(Boolean));
+      const extra = this.items(host).filter((c) => !ids.has(c.id) && !sids.has(c.agent.sessionId));
+      return local.concat(extra).sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+    },
+
+    find(host, id) { return this.items(host).find((c) => c.id === id) || null; },
+
+    // Adds a conversation known only from the server to the local catalog.
+    adopt(host, id) {
+      const r = this.find(host, id);
+      if (!r) return null;
+      const d = Store.getDomain(host);
+      let conv = d.conversations.find((c) => c.id === r.id);
+      if (!conv) {
+        const { _remoteOnly, ...rest } = r;
+        conv = Object.assign({}, rest, { agent: Object.assign({}, r.agent), messages: [] });
+        d.conversations.unshift(conv);
+        Store.saveDomains();
+      }
+      return conv;
+    },
+
+    drop(host, id) {
+      const list = this._items.get(host);
+      if (list) this._items.set(host, list.filter((c) => c.id !== id));
+    }
+  };
+
+  // =========================================================================
   // 13. UI: Chat Panel
   // =========================================================================
   const ChatPanel = {
@@ -5851,7 +6371,8 @@ textarea { resize: none; }
       const domain = Store.getDomain(host);
       let conv = null;
       if (opts.conversationId) {
-        conv = domain.conversations.find((c) => c.id === opts.conversationId) || null;
+        conv = domain.conversations.find((c) => c.id === opts.conversationId)
+          || RemoteHistory.adopt(host, opts.conversationId) || null;
       }
       // Defer creating a new conversation until the user actually sends something,
       // to avoid leaving empty conversations in history if they close the panel.
@@ -5977,7 +6498,9 @@ textarea { resize: none; }
       if (AgentsMode.usesAgents(conv, this.mode)) {
         titleRow.append(el('span', {
           class: 'shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-900 text-emerald-700 dark:text-emerald-200',
-          title: 'Agents API (クラウドのサンドボックスで検証しながら作成)'
+          title: isUserscript
+            ? 'Agents API (クラウドのサンドボックスで検証しながら作成)'
+            : 'Agents API (会話はサーバーのセッションに保存され、他のデバイスからも開けます)'
         }, 'Agents'));
       }
       titleRow.append(titleTop);
@@ -5997,7 +6520,7 @@ textarea { resize: none; }
         link.addEventListener('click', (e) => e.stopPropagation());
         const tail = el('span', { class: 'shrink-0 text-zinc-500 dark:text-zinc-400' },
           AgentsMode.usesAgents(this.conv, this.mode)
-            ? ` · ${AgentsMode.modelOf(this.conv)} (effort ${AgentsMode.effortOf(this.conv)})`
+            ? ` · ${AgentsMode.modelOf(this.conv, this.mode) || '(モデル未選択)'} (${AgentsMode.effortLabel(AgentsMode.effortOf(this.conv, this.mode))})`
             : ` · ${Store.settings.model || '(モデル未選択)'}`);
         titleSub.append(link, tail);
       };
@@ -6232,10 +6755,13 @@ textarea { resize: none; }
       const btnModelLabel = el('span', { class: 'text-xs font-medium' }, '');
       btnModel.append(btnModelLabel);
       const paintModelBtn = () => {
-        if (AgentsMode.usesAgents(this.conv, this.mode)) {
-          const id = AgentsMode.modelOf(this.conv);
-          btnModelLabel.textContent = `${Providers.abbreviate(id)} ${AgentsMode.effortOf(this.conv)}`;
-          btnModel.title = `Agents API モデル: ${id} / effort ${AgentsMode.effortOf(this.conv)}`;
+        // UserScript Agents chats pick model / effort here; a plain chat that
+        // already runs on a session shows the model it runs with.
+        if (isUserscript ? AgentsMode.usesAgents(this.conv, this.mode) : !!(this.conv && this.conv.engine === 'agents')) {
+          const id = AgentsMode.modelOf(this.conv, this.mode);
+          const eff = AgentsMode.effortOf(this.conv, this.mode);
+          btnModelLabel.textContent = `${Providers.abbreviate(id)}${eff ? ` ${eff}` : ''}`;
+          btnModel.title = `Agents API モデル: ${id} / ${AgentsMode.effortLabel(eff)}`;
           return;
         }
         btnModelLabel.textContent = Providers.abbreviate(Store.settings.model || '');
@@ -6262,10 +6788,10 @@ textarea { resize: none; }
         btnModel.setAttribute('aria-expanded', 'true');
         setTimeout(() => document.addEventListener('pointerdown', onModelDocDown, true), 0);
 
-        // Agents API chats: model + effort for the session. A session keeps
-        // the model it was created with, so once one exists the choice only
-        // becomes the default for new chats.
-        if (AgentsMode.usesAgents(this.conv, this.mode)) {
+        // Agents API UserScript chats: model + effort for the session. A
+        // session keeps the model it was created with, so once one exists the
+        // choice only becomes the default for new chats.
+        if (isUserscript && AgentsMode.usesAgents(this.conv, this.mode)) {
           const locked = !!(this.conv && this.conv.agent && this.conv.agent.sessionId);
           const pick = async (field, value) => {
             Store.settings[field === 'model' ? 'agentsModel' : 'agentsEffort'] = value;
@@ -6294,7 +6820,7 @@ textarea { resize: none; }
           const head = (t) => el('div', { class: 'px-3 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-500' }, t);
           if (locked) {
             modelPopover.append(el('div', { class: 'text-[11px] text-zinc-500 px-3 py-2' },
-              `このチャットは ${AgentsMode.modelOf(this.conv)} / effort ${AgentsMode.effortOf(this.conv)} で実行中です。変更は新しい UserScript チャットから反映されます。`));
+              `このチャットは ${AgentsMode.modelOf(this.conv)} / ${AgentsMode.effortLabel(AgentsMode.effortOf(this.conv))} で実行中です。変更は新しい UserScript チャットから反映されます。`));
           }
           const curModel = locked ? Store.settings.agentsModel : AgentsMode.modelOf(this.conv);
           const curEffort = locked ? Store.settings.agentsEffort : AgentsMode.effortOf(this.conv);
@@ -6306,6 +6832,13 @@ textarea { resize: none; }
         }
 
         const models = Store.settings.addedModels || [];
+        // A plain chat running on an Agents session keeps its model; the
+        // picker then only sets the model for new chats.
+        const runningOn = this.conv && this.conv.engine === 'agents' ? AgentsMode.modelOf(this.conv) : '';
+        if (runningOn) {
+          modelPopover.append(el('div', { class: 'text-[11px] text-zinc-500 px-3 py-2' },
+            `このチャットは Agents API の ${runningOn} で実行中です。ここでの変更は新しいチャットから反映されます。`));
+        }
         if (!models.length) {
           modelPopover.append(el('div', { class: 'text-xs text-zinc-500 p-3' }, '使用するモデルが追加されていません。設定画面の「一般」タブから追加してください。'));
           return;
@@ -6380,8 +6913,28 @@ textarea { resize: none; }
       // state needs restoring here.
       this.paintBusy();
 
+      // A remote Agents conversation has only its catalog entry locally:
+      // fetch the transcript from its session.
+      if (conv && AgentsMode.needsLoad(conv)) this.loadRemote(conv);
+
       // Focus composer on next frame (mobile keyboards)
       setTimeout(() => ta.focus(), 50);
+    },
+
+    // Fetches a remote conversation's transcript and shows it. While it
+    // loads (or after it failed) render() shows a placeholder and send()
+    // refuses, since the session may be waiting on a request.
+    async loadRemote(conv) {
+      this._loading = conv.id;
+      this._loadError = null;
+      if (this.conv === conv) { this.render(); this.paintBusy(); }
+      try {
+        await AgentsMode.loadTranscript(conv);
+      } catch (e) {
+        if (this._loading === conv.id) this._loadError = { id: conv.id, message: (e && e.message) || String(e) };
+      }
+      if (this._loading === conv.id) this._loading = null;
+      if (this.conv === conv && this.panel) { this.render(); this.paintBusy(); }
     },
 
     bindResize(handle, sheet) {
@@ -6449,6 +7002,7 @@ textarea { resize: none; }
       const busy = Runs.has(this.conv && this.conv.id);
       this.els.btnSend.classList.toggle('hidden', busy);
       this.els.btnStop.classList.toggle('hidden', !busy);
+      this.els.btnSend.disabled = !!(this.conv && (this._loading === this.conv.id || AgentsMode.needsLoad(this.conv)));
     },
 
     renderSelectionChip() {
@@ -6647,6 +7201,19 @@ textarea { resize: none; }
     render() {
       const list = this.els.list;
       clear(list);
+      const cid = this.conv && this.conv.id;
+      if (cid && this._loading === cid) {
+        list.appendChild(el('div', { class: 'text-center text-xs text-zinc-500 py-8' }, '会話をサーバーから読み込んでいます…'));
+        return;
+      }
+      if (cid && this._loadError && this._loadError.id === cid) {
+        const conv = this.conv;
+        const box = el('div', { class: 'text-center text-xs text-red-600 dark:text-red-400 py-8 space-y-3' });
+        box.append(el('div', { class: 'whitespace-pre-wrap break-words' }, `会話を読み込めませんでした: ${this._loadError.message}`));
+        box.append(el('div', {}, [Form.btn('再読み込み', () => this.loadRemote(conv), 'bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200')]));
+        list.appendChild(box);
+        return;
+      }
       // Hide the synthetic "(context received)" ack from the chat; the paired
       // user-side context message is rendered as a compact banner below.
       const visible = this.conv
@@ -6761,7 +7328,7 @@ textarea { resize: none; }
         const i = m.agentsInfo;
         wrap.appendChild(el('div', { class: 'mt-1 text-[10px] text-zinc-500 dark:text-zinc-400 flex items-center gap-1' }, [
           icon('cloud', 'w-3 h-3'),
-          el('span', {}, `Agents API · ${AgentsMode.modelLabel(i.model)} · effort ${i.effort} · このセッションの累計 ${AgentsMode.formatCost(i.costCents)}`)
+          el('span', {}, `Agents API · ${AgentsMode.modelLabel(i.model)} · ${AgentsMode.effortLabel(i.effort)} · このセッションの累計 ${AgentsMode.formatCost(i.costCents)}`)
         ]));
       }
       return wrap;
@@ -6841,6 +7408,12 @@ textarea { resize: none; }
       // One generation per conversation. Another conversation may generate
       // concurrently — each run owns its own AbortController and conv object.
       if (this.conv && Runs.has(this.conv.id)) return;
+      // A remote conversation can only be continued once its transcript is
+      // here: the session may be waiting on a request the rebuild found.
+      if (this.conv && (this._loading === this.conv.id || AgentsMode.needsLoad(this.conv))) {
+        UI.toast(this._loading === this.conv.id ? '会話を読み込み中です' : '会話を読み込めていません。「再読み込み」を押してください', 'info');
+        return;
+      }
       const text = this.els.ta.value.trim();
       const atts = this.attachments;
       // Allow a selection-only send (empty composer, no files) so the user can
@@ -6883,9 +7456,15 @@ textarea { resize: none; }
         this.conv.pageTitle = document.title || '';
         if (useAgents) {
           // The engine and the model / effort the session will be created
-          // with are fixed from here on.
+          // with are fixed from here on. `remote`: only a catalog entry is
+          // stored locally (see Store.serializeDomains).
           this.conv.engine = 'agents';
-          this.conv.agent = { model: AgentsMode.modelOf(null), effort: AgentsMode.effortOf(null) };
+          this.conv.remote = true;
+          this.conv.agent = {
+            kind: AgentsMode.kindOf(null, this.mode),
+            model: AgentsMode.modelOf(null, this.mode),
+            effort: AgentsMode.effortOf(null, this.mode)
+          };
         }
         if (this.els && this.els.updateTitleSub) this.els.updateTitleSub();
       }
@@ -7000,6 +7579,7 @@ textarea { resize: none; }
             selection: selectedText || '',
             snapText: pendingSnap ? Page.formatForPrompt(pendingSnap) : '',
             attachments: userMsg.attachments || [],
+            web: { search: webSearch, fetch: webFetch },
             onPending: (m) => { pending = m; },
             aborter
           });
@@ -7304,7 +7884,6 @@ textarea { resize: none; }
     open() {
       this.close();
       const host = getDomain();
-      const domain = Store.getDomain(host);
 
       const panel = el('div', { class: 'fixed inset-0 aicx-panel aicx-enter-fade flex items-end sm:items-stretch justify-center', style: { zIndex: 30 } });
       const overlay = el('div', { class: 'absolute inset-0 bg-black/30' });
@@ -7323,10 +7902,21 @@ textarea { resize: none; }
 
       const list = el('div', { class: 'flex-1 aicx-scroll overflow-y-auto divide-y divide-zinc-100 dark:divide-zinc-800' });
 
-      if (!domain.conversations.length) {
-        list.appendChild(el('div', { class: 'p-8 text-center text-sm text-zinc-500' }, 'このドメインでの会話はまだありません。'));
-      } else {
-        for (const c of domain.conversations) list.appendChild(this.renderItem(c, host));
+      // Local conversations plus Agents sessions from other devices. The
+      // session list comes from the last FAB-menu fetch; it is refetched
+      // here only when that is stale (opened from the chat header later).
+      const paint = () => {
+        clear(list);
+        const convs = RemoteHistory.merged(host);
+        if (!convs.length) {
+          list.appendChild(el('div', { class: 'p-8 text-center text-sm text-zinc-500' }, 'このドメインでの会話はまだありません。'));
+        } else {
+          for (const c of convs) list.appendChild(this.renderItem(c, host));
+        }
+      };
+      paint();
+      if (RemoteHistory.isStale()) {
+        RemoteHistory.refresh().then((ok) => { if (ok && this.panel === panel) paint(); });
       }
 
       sheet.append(header, list);
@@ -7344,10 +7934,16 @@ textarea { resize: none; }
       });
       badge.appendChild(icon(isUserscript ? 'code' : 'chat', 'w-4 h-4'));
       const main = el('button', { class: 'flex-1 min-w-0 text-left aicx-tap' });
-      const snippet = (c.messages.find((m) => m.role === 'user' && !m._synthetic && !m._tool) || {}).content || '';
+      const msgs = c.messages || [];
+      const snippet = (msgs.find((m) => m.role === 'user' && !m._synthetic && !m._tool) || {}).content || '';
+      // A remote conversation's transcript is on the server, so there is no
+      // message count to show for it.
+      const meta = AgentsMode.isRemote(c)
+        ? `Agents${c._remoteOnly ? ' · サーバー上の会話' : ''}`
+        : `${msgs.filter((m) => m.role !== 'system' && !m._synthetic && !m._tool).length} msg`;
       main.append(
         el('div', { class: 'text-sm font-medium truncate' }, c.title || snippet.slice(0, 50) || '(無題)'),
-        el('div', { class: 'text-xs text-zinc-500 truncate' }, `${fmtDate(c.updatedAt || c.createdAt)} · ${c.messages.filter((m) => m.role !== 'system' && !m._synthetic && !m._tool).length} msg`)
+        el('div', { class: 'text-xs text-zinc-500 truncate' }, `${fmtDate(c.updatedAt || c.createdAt)} · ${meta}`)
       );
       main.addEventListener('click', () => { this.close(); ChatPanel.open({ conversationId: c.id }); });
 
@@ -7355,9 +7951,15 @@ textarea { resize: none; }
       del.appendChild(icon('trash', 'w-4 h-4'));
       del.addEventListener('click', async (e) => {
         e.stopPropagation();
-        if (await UI.confirm('この会話を削除しますか?')) {
-          Store.removeConversation(host, c.id);
-          await Store.saveDomains();
+        const remoteNote = AgentsMode.isRemote(c) ? '\n\nサーバー上のセッション (会話の記録) も削除され、他のデバイスからも見えなくなります。' : '';
+        if (await UI.confirm(`この会話を削除しますか?${remoteNote}`)) {
+          if (c._remoteOnly) {
+            RemoteHistory.drop(host, c.id);
+            AgentsMode.deleteSession(c.agent.sessionId);
+          } else {
+            Store.removeConversation(host, c.id);
+            await Store.saveDomains();
+          }
           row.remove();
           ScheduleBackup.mark();
         }
@@ -8038,9 +8640,10 @@ textarea { resize: none; }
       box.append(Form.sectionTitle('Agents API (サンドボックス実行)'));
 
       const info = el('div', { class: 'text-xs text-zinc-500 space-y-1' });
-      info.append(el('p', {}, 'オンにすると、新しく始める UserScript チャットを Claude の Agents API (Managed Agents) で実行します。エージェントは Anthropic のクラウド上のサンドボックス (bash・Node.js・Playwright + Chromium) で、作ったスクリプトを実際に動かして確認しながら作業します。ページの調査は今までどおりこのタブで行います。'));
+      info.append(el('p', {}, 'Claude のモデルで始める通常のチャットは、Claude の Agents API (Managed Agents) で実行されます (Gemini のチャットは従来どおりです)。'));
+      info.append(el('p', {}, '下のスイッチをオンにすると、新しく始める UserScript チャットも Agents API で実行します。エージェントは Anthropic のクラウド上のサンドボックス (bash・Node.js・Playwright + Chromium) で、作ったスクリプトを実際に動かして確認しながら作業します。ページの調査は今までどおりこのタブで行います。'));
       info.append(el('p', {}, '「一般」タブの Claude API キーを使います。料金はトークン代と、エージェントが動いている間のサンドボックス稼働料金 ($0.08/時間) です。待機中は稼働料金はかかりません。'));
-      info.append(el('p', {}, 'セッションの記録 (ページの HTML や作成したスクリプトを含む) は Anthropic 側に保存され、チャットを削除すると一緒に削除されます。'));
+      info.append(el('p', {}, '会話の記録 (共有したページ内容・添付ファイル・作成したスクリプトを含む) は Anthropic 側のセッションに保存され、このデバイスには会話の一覧情報だけを保存します。同じワークスペースの API キーを使う他のデバイスからも、メニューや会話履歴から開けます。チャットを削除するとセッションも削除されます。'));
       box.append(info);
 
       if (!AgentsAPI.available()) {
@@ -8108,16 +8711,20 @@ textarea { resize: none; }
       return box;
     },
 
-    // Picks the agent and environment UserScript sessions run on. Both live
-    // in the API key's workspace, so every device using a key of the same
-    // workspace can share them. The lists are fetched when this section is
-    // shown (or on demand), never at script load.
+    // Picks the agents (UserScript / chat) and the environment sessions run
+    // on. They live in the API key's workspace, so every device using a key
+    // of the same workspace can share them. The lists are fetched when this
+    // section is shown (or on demand), never at script load.
     agentsResources() {
       const s = Store.settings;
       const AUTO = '';
       const NEW = '__new__';
+      const KINDS = [
+        { kind: 'userscript', title: 'エージェント (UserScript 作成)' },
+        { kind: 'chat', title: 'エージェント (チャット)' }
+      ];
       const wrap = el('div', { class: 'space-y-3' });
-      let agents = null;
+      const agents = { userscript: null, chat: null };
       let envs = null;
       let busy = false;
       let note = '';
@@ -8144,7 +8751,7 @@ textarea { resize: none; }
         try {
           const [a, e] = await Promise.all([AgentsAPI.listAgents(), AgentsAPI.listEnvironments()]);
           const recent = (x, y) => AgentsMode.tsOf(y.updated_at || y.created_at) - AgentsMode.tsOf(x.updated_at || x.created_at);
-          agents = a.filter((x) => AgentsMode.isOwnAgent(x)).sort(recent);
+          for (const { kind } of KINDS) agents[kind] = a.filter((x) => AgentsMode.isOwnAgent(x, kind)).sort(recent);
           // Environments are never modified by this app, so one made
           // elsewhere is safe to pick; this app's own are listed first.
           envs = e.filter((x) => AgentsMode.isUsableEnvironment(x)).sort((x, y) => {
@@ -8167,20 +8774,21 @@ textarea { resize: none; }
         paint();
       };
 
-      const onAgent = (v) => run(async () => {
+      const onAgent = (kind) => (v) => run(async () => {
+        const k = AgentsMode.profile(kind).keys;
         if (v === NEW) {
-          const { body, hash } = AgentsMode.agentSpec();
+          const { body, hash } = AgentsMode.agentSpec(kind);
           const a = await AgentsAPI.createAgent(body);
-          Object.assign(s, { agentsAgentId: a.id, agentsAgentVersion: a.version, agentsAgentHash: hash });
-          if (agents) agents.unshift(a);
+          Object.assign(s, { [k.id]: a.id, [k.version]: a.version, [k.hash]: hash });
+          if (agents[kind]) agents[kind].unshift(a);
           UI.toast('エージェントを作成しました', 'success');
         } else if (v === AUTO) {
-          Object.assign(s, { agentsAgentId: '', agentsAgentVersion: 0, agentsAgentHash: '' });
+          Object.assign(s, { [k.id]: '', [k.version]: 0, [k.hash]: '' });
         } else {
-          const a = (agents || []).find((x) => x.id === v);
+          const a = (agents[kind] || []).find((x) => x.id === v);
           // The hash is cleared so the next session checks the agent against
           // this copy of the script (and updates or overrides as needed).
-          Object.assign(s, { agentsAgentId: v, agentsAgentVersion: a ? a.version : 0, agentsAgentHash: '' });
+          Object.assign(s, { [k.id]: v, [k.version]: a ? a.version : 0, [k.hash]: '' });
         }
       });
 
@@ -8213,18 +8821,23 @@ textarea { resize: none; }
 
       const paint = () => {
         clear(wrap);
-        wrap.append(picker('エージェント', agents, s.agentsAgentId, agentLabel, onAgent,
-          '自動 (このアプリで作成済みのものを使い、なければ作成)'));
+        for (const { kind, title } of KINDS) {
+          wrap.append(picker(title, agents[kind], s[AgentsMode.profile(kind).keys.id], agentLabel, onAgent(kind),
+            '自動 (このアプリで作成済みのものを使い、なければ作成)'));
+        }
         wrap.append(picker('環境 (サンドボックス)', envs, s.agentsEnvironmentId, envLabel, onEnv,
           '自動 (このアプリで作成済みのものを使い、なければ作成)'));
         wrap.append(el('p', { class: 'text-[11px] text-zinc-500' },
           '同じワークスペースの API キーを使う他のデバイスと、同じエージェント・環境を共有できます。エージェントの設定は、そのエージェントを最後に更新したものより新しいバージョンのスクリプトからだけ更新されます。古いバージョンのスクリプトは、エージェントを書き換えずに自分の設定でセッションを実行します。'));
         const ids = el('div', { class: 'text-[11px] text-zinc-500 space-y-0.5 break-all' });
-        ids.append(el('div', {}, `使用中のエージェント: ${s.agentsAgentId ? `${s.agentsAgentId} (v${s.agentsAgentVersion})` : '(未決定 — 次の実行時に決定)'}`));
+        for (const { kind, title } of KINDS) {
+          const k = AgentsMode.profile(kind).keys;
+          ids.append(el('div', {}, `使用中の${title}: ${s[k.id] ? `${s[k.id]} (v${s[k.version]})` : '(未決定 — 次の実行時に決定)'}`));
+        }
         ids.append(el('div', {}, `使用中の環境: ${s.agentsEnvironmentId || '(未決定 — 次の実行時に決定)'}`));
         wrap.append(ids);
         if (note) wrap.append(el('p', { class: 'text-[11px] text-red-600 dark:text-red-400' }, note));
-        const btn = Form.btn(busy ? '読み込み中…' : (agents ? '一覧を再読み込み' : '一覧を読み込む'), () => { if (!busy) load(); },
+        const btn = Form.btn(busy ? '読み込み中…' : (envs ? '一覧を再読み込み' : '一覧を読み込む'), () => { if (!busy) load(); },
           'bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-200');
         btn.disabled = busy;
         wrap.append(el('div', { class: 'flex flex-wrap gap-2' }, [btn]));
@@ -8550,10 +9163,11 @@ textarea { resize: none; }
         for (const c of dom.conversations) {
           const row = el('div', { class: 'flex items-start gap-2 p-3' });
           const main = el('div', { class: 'flex-1 min-w-0' });
-          const preview = (c.messages.find((m) => m.role === 'user' && !m._synthetic) || {}).content || '';
+          const msgs = c.messages || [];
+          const preview = (msgs.find((m) => m.role === 'user' && !m._synthetic) || {}).content || '';
           main.append(
             el('div', { class: 'text-sm font-medium truncate' }, c.title || preview.slice(0, 50) || '(無題)'),
-            el('div', { class: 'text-xs text-zinc-500 truncate' }, `${fmtDate(c.updatedAt || c.createdAt)} · ${c.messages.filter((m) => m.role !== 'system' && !m._synthetic).length} msg`)
+            el('div', { class: 'text-xs text-zinc-500 truncate' }, `${fmtDate(c.updatedAt || c.createdAt)} · ${AgentsMode.isRemote(c) ? 'Agents' : `${msgs.filter((m) => m.role !== 'system' && !m._synthetic).length} msg`}`)
           );
           if (preview && preview !== c.title) {
             main.append(el('div', { class: 'text-xs text-zinc-400 dark:text-zinc-500 mt-1 line-clamp-2 break-words' }, preview.slice(0, 160)));
