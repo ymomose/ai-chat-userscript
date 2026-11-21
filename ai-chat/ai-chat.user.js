@@ -2,7 +2,7 @@
 // @name         AI Chat Overlay
 // @name:ja      AI チャット オーバーレイ
 // @namespace    https://github.com/ym/userscripts/ai-chat
-// @version      2.5.0
+// @version      2.6.0
 // @description  Floating AI chat (Gemini / Claude) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode with secret-Gist publishing. Claude chats can optionally run on the Agents API, keeping transcripts server-side and shared across devices. Optimized for iOS Safari.
 // @description:ja Webページの内容を文脈として Gemini / Claude と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。作ったスクリプトはシークレット Gist に公開して URL からインストール・自動更新できる。Claude のチャットは Agents API でも実行でき、その場合は会話をサーバー側に保存して他のデバイスからも開ける。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
 // @author       ym
@@ -297,12 +297,11 @@
     // Models the user has explicitly added in Settings. The chat-side picker
     // shows only these; each provider's full catalog is fetched only to
     // populate the "add model" dropdown in Settings. Shape: [{ id, display }],
-    // plus capability hints for Claude models (see Claude.modelInfo).
+    // plus capability hints (Claude.modelInfo; Gemini `thinking`) and
+    // `effort`: the reasoning depth new chats on that model start with,
+    // chosen when the model is added (absent = the API's own default; see
+    // Providers.effortLevels). A chat can override it (conv.effort).
     addedModels: [],
-    // Claude `output_config.effort`. Empty means "send nothing" so the
-    // model's own default applies; a level the active model lacks is clamped
-    // to the nearest one it has (Claude.resolveEffort).
-    claudeEffort: '',
     globalSystemPrompt: 'You are a helpful AI assistant. The user is viewing a webpage; use its content as context. Respond in the same language as the user.',
     // System prompt for the UserScript authoring mode (chats started from the
     // FAB menu's "新規 UserScript" entry). Empty means "use the built-in
@@ -391,6 +390,22 @@
       if (!this.settings.addedModels.length && this.settings.model) {
         this.settings.addedModels.push({ id: this.settings.model, display: this.settings.model });
       }
+      if (this.migrateSettings()) await this.saveSettings();
+    },
+    // Up to v2.5 one `claudeEffort` applied to every Claude model; it now
+    // becomes the default effort of the Claude models already added. Also
+    // run on a Drive restore, whose backup may predate the change. Returns
+    // whether anything changed.
+    migrateSettings() {
+      const s = this.settings;
+      if (!('claudeEffort' in s)) return false;
+      if (s.claudeEffort) {
+        for (const m of s.addedModels || []) {
+          if (m && /^claude-/i.test(m.id) && m.effort === undefined) m.effort = s.claudeEffort;
+        }
+      }
+      delete s.claudeEffort;
+      return true;
     },
     async saveSettings() { await KV.set('settings', this.settings); },
     async saveDomains() { await KV.set('domains', this.serializeDomains()); },
@@ -819,8 +834,37 @@
         display: m.displayName || m.name,
         desc: m.description || '',
         inputTokens: m.inputTokenLimit,
-        outputTokens: m.outputTokenLimit
+        outputTokens: m.outputTokenLimit,
+        thinking: typeof m.thinking === 'boolean' ? m.thinking : undefined
       }));
+    },
+
+    // `thinkingConfig.thinkingLevel` values a model takes, lowest first.
+    // Gemini 3 and later take levels; which ones differs per family (per the
+    // thinking guide's model table). 2.5 and older take a token budget
+    // instead, so they get none here, as do image / audio variants and any
+    // model the Models API reported without thinking (`thinking` false).
+    thinkingLevels(modelId, thinking) {
+      const id = String(modelId || '').replace(/^models\//, '');
+      if (thinking === false) return [];
+      if (/-(image|tts|audio|live|embedding)\b/i.test(id)) {
+        return /^gemini-3\.\d+-flash-lite-image\b/i.test(id) ? ['minimal', 'high'] : [];
+      }
+      if (/^gemini-robotics-er-([2-9]|\d{2,})\b/i.test(id)) return ['minimal', 'low', 'medium', 'high'];
+      const v = id.match(/^gemini-(\d+)(?:\.(\d+))?-/i);
+      if (!v) return [];
+      const major = Number(v[1]);
+      const minor = Number(v[2] || 0);
+      if (major >= 4) return /-(neon|hydrogen)\b/i.test(id) ? ['low', 'medium', 'high', 'xhigh'] : ['low', 'medium', 'high'];
+      if (major !== 3) return [];
+      if (/-pro\b/i.test(id)) return minor === 0 ? ['low', 'high'] : ['low', 'medium', 'high'];
+      if (/-flash\b/i.test(id)) return minor >= 8 ? ['low', 'medium', 'high'] : ['minimal', 'low', 'medium', 'high'];
+      return [];
+    },
+    // The same for an added model, using the `thinking` flag saved with it.
+    profile(modelId) {
+      const saved = (Store.settings.addedModels || []).find((x) => x && x.id === modelId) || {};
+      return { thinkingLevels: this.thinkingLevels(modelId, saved.thinking) };
     },
 
     // Build Gemini "contents" array from our message history.
@@ -896,7 +940,10 @@
     // turn's first text part. Both signatures must survive into the stored
     // message so buildContents can replay them — see the THOUGHT SIGNATURES
     // note there.
-    async *streamGenerate({ apiKey, model, messages, systemPrompt, tools, onMetadata, onFunctionCall, onThoughtSignature, signal }) {
+    //
+    // `thinkingLevel` (one of the model's thinkingLevels) sets how deeply the
+    // model thinks; empty leaves the model's default.
+    async *streamGenerate({ apiKey, model, messages, systemPrompt, tools, thinkingLevel, onMetadata, onFunctionCall, onThoughtSignature, signal }) {
       if (!apiKey) throw new Error('API キーが設定されていません。設定画面から登録してください。');
       if (!model) throw new Error('モデルが選択されていません。');
       const streamUrl = `${API_BASE}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`;
@@ -904,6 +951,9 @@
         contents: this.buildContents(messages),
         generationConfig: { temperature: 0.7 }
       };
+      // The REST enum is upper case (MINIMAL / LOW / MEDIUM / HIGH / XHIGH).
+      const level = Providers.resolveEffort(thinkingLevel, this.profile(model).thinkingLevels);
+      if (level) body.generationConfig.thinkingConfig = { thinkingLevel: level.toUpperCase() };
       // Implicit context: tell the model the current local date so it can
       // resolve "today" / "yesterday" / "next Friday" without us threading
       // it through every user-facing prompt. Prepended to the system
@@ -1192,22 +1242,6 @@
       };
     },
 
-    // The requested effort if the model has it; otherwise the closest level
-    // below it, or failing that the lowest level the model offers.
-    resolveEffort(level, levels) {
-      if (!level || !Array.isArray(levels) || !levels.length) return null;
-      if (levels.includes(level)) return level;
-      const want = CLAUDE_EFFORT_LEVELS.indexOf(level);
-      const below = levels.filter((l) => CLAUDE_EFFORT_LEVELS.indexOf(l) <= want);
-      if (below.length) return below.reduce((a, b) => (CLAUDE_EFFORT_LEVELS.indexOf(a) > CLAUDE_EFFORT_LEVELS.indexOf(b) ? a : b));
-      return levels[0];
-    },
-
-    // The effort chats run `modelId` with: the Claude effort setting resolved
-    // against the levels the model offers ('' = the model's default).
-    chatEffort(modelId) {
-      return this.resolveEffort(Store.settings.claudeEffort, this.profile(modelId).effortLevels) || '';
-    },
 
     // Gemini functionDeclarations (UPPERCASE OpenAPI types) → Claude tool
     // definitions (JSON Schema). `eager_input_streaming` streams large tool
@@ -1564,7 +1598,7 @@
         };
         betas.push(CLAUDE_BETA_THINKING_BINDING);
       }
-      const eff = this.resolveEffort(effort, prof.effortLevels);
+      const eff = Providers.resolveEffort(effort, prof.effortLevels);
       if (eff) body.output_config = { effort: eff };
       const headers = this.headers(apiKey, betas.length ? { 'anthropic-beta': betas.join(',') } : null);
       const url = `${CLAUDE_API_BASE}/messages`;
@@ -1738,7 +1772,37 @@
     label(p) { return p === 'anthropic' ? 'Claude' : 'Gemini'; },
     apiKey(p) { return (p === 'anthropic' ? Store.settings.anthropicApiKey : Store.settings.apiKey) || ''; },
     abbreviate(id) { return this.of(id) === 'anthropic' ? Claude.abbreviate(id) : Gemini.abbreviate(id); },
-    listModels(p, apiKey) { return p === 'anthropic' ? Claude.listModels(apiKey) : Gemini.listModels(apiKey); }
+    listModels(p, apiKey) { return p === 'anthropic' ? Claude.listModels(apiKey) : Gemini.listModels(apiKey); },
+
+    // Effort ("reasoning depth"): Claude `output_config.effort` or Gemini
+    // `thinkingLevel`, on one scale so a level carried over to a model that
+    // lacks it can be mapped to a near one.
+    EFFORT_SCALE: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+    // The levels an added model takes, lowest first (none = no effort control).
+    effortLevels(id) {
+      return this.of(id) === 'anthropic' ? Claude.profile(id).effortLevels : Gemini.profile(id).thinkingLevels;
+    },
+    // The effort a model's new chats start with, chosen when it was added
+    // ('' = the API's own default).
+    defaultEffort(id) {
+      const m = (Store.settings.addedModels || []).find((x) => x && x.id === id);
+      return (m && m.effort) || '';
+    },
+    // The requested level if the model has it; otherwise the closest level
+    // below it, or failing that the lowest one the model offers. '' when no
+    // level was asked for or the model takes none.
+    resolveEffort(level, levels) {
+      if (!level || !Array.isArray(levels) || !levels.length) return '';
+      if (levels.includes(level)) return level;
+      const rank = (l) => this.EFFORT_SCALE.indexOf(l);
+      const below = levels.filter((l) => rank(l) <= rank(level));
+      if (below.length) return below.reduce((a, b) => (rank(a) > rank(b) ? a : b));
+      return levels[0];
+    },
+    // Short notes shown next to a level in pickers.
+    effortNote(level) {
+      return { minimal: '最小限の思考', low: '速い・低コスト', max: '最も深い・高コスト' }[level] || '';
+    }
   };
 
   // =========================================================================
@@ -1974,6 +2038,8 @@
       // Merge settings (keep our token/file id)
       const { driveToken, driveTokenExp, driveFileId } = Store.settings;
       Store.settings = Object.assign({}, DEFAULT_SETTINGS, data.settings, { driveToken, driveTokenExp, driveFileId });
+      if (!Array.isArray(Store.settings.addedModels)) Store.settings.addedModels = [];
+      Store.migrateSettings();
       Store.domains = data.domains || {};
       await Store.saveAll();
     }
@@ -5205,8 +5271,9 @@ textarea { resize: none; }
     },
     // Model / effort a conversation runs (or, before its session exists,
     // would run) with. UserScript chats follow the Agents settings; plain
-    // chats follow the chat model picker and the Claude effort setting (empty
-    // effort = the model's default).
+    // chats follow the chat model picker and, before the panel has a chat,
+    // the model's default effort (ChatPanel.currentEffort adds the chat's
+    // own choice; empty effort = the API's default).
     modelOf(conv, mode) {
       if (conv && conv.agent && conv.agent.model) return conv.agent.model;
       if (this.kindOf(conv, mode) === 'chat') return Store.settings.model || '';
@@ -5214,7 +5281,10 @@ textarea { resize: none; }
     },
     effortOf(conv, mode) {
       if (conv && conv.agent && conv.agent.model) return conv.agent.effort || '';
-      if (this.kindOf(conv, mode) === 'chat') return Claude.chatEffort(Store.settings.model || '');
+      if (this.kindOf(conv, mode) === 'chat') {
+        const model = Store.settings.model || '';
+        return Providers.resolveEffort(Providers.defaultEffort(model), Providers.effortLevels(model));
+      }
       return Store.settings.agentsEffort || DEFAULT_SETTINGS.agentsEffort;
     },
     effortLabel(effort) { return effort ? `effort ${effort}` : 'effort 既定'; },
@@ -6460,6 +6530,9 @@ textarea { resize: none; }
       // the feature back on after turning it off — handled below).
       this._lastInjectedUrl = null;
       this.conv = conv;
+      // Effort picked in this panel before its chat exists (undefined = the
+      // model's default); moved to conv.effort on the first send.
+      this.effortOverride = undefined;
       this.attachments = [];
 
       const panel = el('div', { class: 'fixed inset-0 aicx-panel aicx-enter-fade flex items-end justify-center', style: { zIndex: 30 } });
@@ -6574,12 +6647,17 @@ textarea { resize: none; }
           title: pageUrl
         }, pageTitle);
         link.addEventListener('click', (e) => e.stopPropagation());
-        const tail = el('span', { class: 'shrink-0 text-zinc-500 dark:text-zinc-400' },
-          AgentsMode.usesAgents(this.conv, this.mode)
-            ? ` · ${AgentsMode.modelOf(this.conv, this.mode) || '(モデル未選択)'} (${AgentsMode.effortLabel(AgentsMode.effortOf(this.conv, this.mode))})`
-            : Providers.of(Store.settings.model || '') === 'anthropic'
-              ? ` · ${Store.settings.model} (${AgentsMode.effortLabel(Claude.chatEffort(Store.settings.model))})`
-              : ` · ${Store.settings.model || '(モデル未選択)'}`);
+        // An Agents chat that exists (and every UserScript Agents panel)
+        // shows what its session runs with; otherwise the chat model and the
+        // effort this chat would send.
+        let tailText;
+        if (AgentsMode.usesAgents(this.conv, this.mode) && (isUserscript || (this.conv && this.conv.agent))) {
+          tailText = ` · ${AgentsMode.modelOf(this.conv, this.mode) || '(モデル未選択)'} (${AgentsMode.effortLabel(AgentsMode.effortOf(this.conv, this.mode))})`;
+        } else {
+          const id = Store.settings.model || '';
+          tailText = ` · ${id || '(モデル未選択)'}${Providers.effortLevels(id).length ? ` (${AgentsMode.effortLabel(this.currentEffort(id))})` : ''}`;
+        }
+        const tail = el('span', { class: 'shrink-0 text-zinc-500 dark:text-zinc-400' }, tailText);
         titleSub.append(link, tail);
       };
       updateTitleSub();
@@ -6823,14 +6901,11 @@ textarea { resize: none; }
           return;
         }
         const id = Store.settings.model || '';
-        if (Providers.of(id) === 'anthropic') {
-          const eff = Claude.chatEffort(id);
-          btnModelLabel.textContent = `${Providers.abbreviate(id)}${eff ? ` ${eff}` : ''}`;
-          btnModel.title = `モデル: ${id} / ${AgentsMode.effortLabel(eff)}`;
-          return;
-        }
-        btnModelLabel.textContent = Providers.abbreviate(id);
-        btnModel.title = `モデル: ${id || '(未選択)'}`;
+        const eff = this.currentEffort(id);
+        btnModelLabel.textContent = `${Providers.abbreviate(id)}${eff ? ` ${eff}` : ''}`;
+        btnModel.title = Providers.effortLevels(id).length
+          ? `モデル: ${id} / ${AgentsMode.effortLabel(eff)}`
+          : `モデル: ${id || '(未選択)'}`;
       };
       paintModelBtn();
       let modelPopover = null;
@@ -6908,11 +6983,11 @@ textarea { resize: none; }
 
         const models = Store.settings.addedModels || [];
         // A plain chat running on an Agents session keeps its model and
-        // effort; the picker then only sets them for new chats.
+        // effort; the picker then only sets the model for new chats.
         const runningOn = this.conv && this.conv.engine === 'agents' ? AgentsMode.modelOf(this.conv) : '';
         if (runningOn) {
           modelPopover.append(el('div', { class: 'text-[11px] text-zinc-500 px-3 py-2' },
-            `このチャットは Agents API の ${runningOn} / ${AgentsMode.effortLabel(AgentsMode.effortOf(this.conv))} で実行中です。ここでの変更は新しいチャットから反映されます。`));
+            `このチャットは Agents API の ${runningOn} / ${AgentsMode.effortLabel(AgentsMode.effortOf(this.conv))} で実行中です。モデルの変更は新しいチャットから反映されます。`));
         }
         if (!models.length) {
           modelPopover.append(el('div', { class: 'text-xs text-zinc-500 p-3' }, '使用するモデルが追加されていません。設定画面の「一般」タブから追加してください。'));
@@ -6925,6 +7000,12 @@ textarea { resize: none; }
             if (Store.settings.model !== m.id) {
               Store.settings.model = m.id;
               await Store.saveSettings();
+              // Another model starts from its own default effort.
+              this.effortOverride = undefined;
+              if (this.conv && this.conv.effort !== undefined) {
+                delete this.conv.effort;
+                Store.saveDomains();
+              }
               paintModelBtn();
               updateTitleSub();
             }
@@ -6956,31 +7037,30 @@ textarea { resize: none; }
           modelPopover.append(item('Agents API', 'サーバーに保存・他のデバイスからも開ける', on, () => pickEngine(true)));
         }
 
-        // Claude models: the effort setting (shared with Settings → Claude
-        // API), offering only the levels the selected model has. Messages API
-        // chats pick it up on the next send; Agents chats with a session
-        // already created, from the next new chat.
-        if (Providers.of(current) !== 'anthropic') return;
+        // This chat's effort (Claude effort / Gemini thinking level), offering
+        // only the levels the selected model has; models without any get no
+        // section. The choice applies to this chat alone: new chats and a
+        // model switch start from the default registered with the model. An
+        // Agents session keeps the effort it was created with.
+        const levels = Providers.effortLevels(current);
+        if (runningOn || !levels.length) return;
         modelPopover.append(head('effort'));
-        const levels = Claude.profile(current).effortLevels;
-        if (!levels.length) {
-          modelPopover.append(el('div', { class: 'text-[11px] text-zinc-500 px-3 py-2' }, 'このモデルは effort の指定に対応していません。'));
-          return;
-        }
-        const curEffort = Claude.chatEffort(current);
-        const effortSub = { low: '速い・低コスト', max: '最も深い・高コスト' };
-        const pickEffort = async (value) => {
-          if ((Store.settings.claudeEffort || '') !== value) {
-            Store.settings.claudeEffort = value;
-            await Store.saveSettings();
-            if (runningOn) UI.toast('このチャットのセッションは作成済みのため、新しいチャットから反映されます', 'info');
-            paintModelBtn();
-            updateTitleSub();
+        const curEffort = this.currentEffort(current);
+        const registered = Providers.resolveEffort(Providers.defaultEffort(current), levels);
+        const sub = (lv) => [Providers.effortNote(lv), lv === registered ? '登録時の既定' : ''].filter(Boolean).join(' · ') || null;
+        const pickEffort = (value) => {
+          if (this.conv) {
+            this.conv.effort = value;
+            Store.saveDomains();
+          } else {
+            this.effortOverride = value;
           }
+          paintModelBtn();
+          updateTitleSub();
           closeModelPop();
         };
-        modelPopover.append(item('既定', 'モデルの既定', !curEffort, () => pickEffort('')));
-        for (const e of levels) modelPopover.append(item(e, effortSub[e] || null, e === curEffort, () => pickEffort(e)));
+        modelPopover.append(item('API の既定', ['指定しない', registered === '' ? '登録時の既定' : ''].filter(Boolean).join(' · '), !curEffort, () => pickEffort('')));
+        for (const lv of levels) modelPopover.append(item(lv, sub(lv), lv === curEffort, () => pickEffort(lv)));
       });
       modelBtnWrap.append(btnModel);
 
@@ -7514,6 +7594,15 @@ textarea { resize: none; }
       }
     },
 
+    // The effort this panel's chat runs `model` with: the chat's own choice
+    // if it made one (conv.effort, or the panel's before the chat exists),
+    // else the default registered with the model, resolved against the
+    // levels the model offers. '' = the API's default (or no effort control).
+    currentEffort(model = Store.settings.model || '') {
+      const own = this.conv ? this.conv.effort : this.effortOverride;
+      return Providers.resolveEffort(own !== undefined ? own : Providers.defaultEffort(model), Providers.effortLevels(model));
+    },
+
     async send() {
       // One generation per conversation. Another conversation may generate
       // concurrently — each run owns its own AbortController and conv object.
@@ -7564,16 +7653,19 @@ textarea { resize: none; }
         this.conv = Store.newConversation(this.host, this.mode === UserScriptMode.ID ? UserScriptMode.ID : undefined);
         this.conv.pageUrl = location.href;
         this.conv.pageTitle = document.title || '';
+        if (this.effortOverride !== undefined) this.conv.effort = this.effortOverride;
+        this.effortOverride = undefined;
         if (useAgents) {
           // The engine and the model / effort the session will be created
           // with are fixed from here on. `remote`: only a catalog entry is
           // stored locally (see Store.serializeDomains).
           this.conv.engine = 'agents';
           this.conv.remote = true;
+          const kind = AgentsMode.kindOf(null, this.mode);
           this.conv.agent = {
-            kind: AgentsMode.kindOf(null, this.mode),
+            kind,
             model: AgentsMode.modelOf(null, this.mode),
-            effort: AgentsMode.effortOf(null, this.mode)
+            effort: kind === 'chat' ? this.currentEffort() : AgentsMode.effortOf(null, this.mode)
           };
         }
         if (this.els && this.els.updateTitleSub) this.els.updateTitleSub();
@@ -7677,6 +7769,8 @@ textarea { resize: none; }
       // abort handler can salvage the text of an interrupted turn.
       let claudeOut = null;
       const isClaude = provider === 'anthropic';
+      // Read once, like the model: the panel may switch chats mid-run.
+      const effort = this.currentEffort(model);
       // The web toggles are read once: they belong to the panel, which may
       // be showing a different conversation by the time a later round runs.
       const webSearch = !!this.webGrounding;
@@ -7765,7 +7859,7 @@ textarea { resize: none; }
                 tools: claudeTools,
                 webSearch,
                 webFetch,
-                effort: Store.settings.claudeEffort,
+                effort,
                 out: claudeOut,
                 onThinking: (t) => {
                   pending.thinking = t;
@@ -7782,6 +7876,7 @@ textarea { resize: none; }
                 messages: apiMessages,
                 systemPrompt,
                 tools,
+                thinkingLevel: effort,
                 onMetadata: (meta) => { grounding = meta; },
                 // The signature must be stored alongside the call it came with:
                 // Gemini 3 rejects the next request outright if a replayed
@@ -8292,7 +8387,7 @@ textarea { resize: none; }
 
       const modelWrap = el('div', { class: 'space-y-2' });
       modelWrap.append(Form.label('使用するモデル'));
-      modelWrap.append(el('p', { class: 'text-[11px] text-zinc-500' }, '追加したモデルだけがチャット画面のモデル選択に表示されます。Gemini と Claude のモデルを混在して追加でき、選んだモデルに応じた API キーが使われます。チェックの付いた行が現在のアクティブモデルです。'));
+      modelWrap.append(el('p', { class: 'text-[11px] text-zinc-500' }, '追加したモデルだけがチャット画面のモデル選択に表示されます。Gemini と Claude のモデルを混在して追加でき、選んだモデルに応じた API キーが使われます。チェックの付いた行が現在のアクティブモデルです。effort (推論の深さ) は、モデルがどれだけ深く考えてから答えるかです。高いほど難しい課題の精度が上がる一方、応答が遅く・高コストになります。対応している Claude と Gemini 3 以降のモデルでは、追加するときに選んだ値がそのモデルで始めるチャットの既定になり、チャットごとにチャット画面のモデルボタンから変更できます。'));
       const listWrap = el('div', { class: 'space-y-1' });
       modelWrap.append(listWrap);
       box.append(modelWrap);
@@ -8328,7 +8423,8 @@ textarea { resize: none; }
           const text = el('div', { class: 'flex-1 min-w-0' });
           text.append(
             el('div', { class: 'text-sm font-medium truncate' }, m.display || m.id),
-            el('div', { class: 'text-[11px] text-zinc-500 dark:text-zinc-400 truncate' }, `${Providers.label(Providers.of(m.id))} · ${m.id}`)
+            el('div', { class: 'text-[11px] text-zinc-500 dark:text-zinc-400 truncate' },
+              `${Providers.label(Providers.of(m.id))} · ${m.id}${Providers.effortLevels(m.id).length ? ` · effort ${m.effort || 'API の既定'}` : ''}`)
           );
           const del = el('button', { class: 'w-9 h-9 shrink-0 rounded-lg text-zinc-500 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-900/30 flex items-center justify-center aicx-tap', type: 'button', 'aria-label': 'モデルを削除' });
           del.appendChild(icon('trash', 'w-4 h-4'));
@@ -8377,9 +8473,37 @@ textarea { resize: none; }
         const refreshBtn = Form.btn('再取得', () => renderAvailable(true), 'bg-zinc-200 dark:bg-zinc-700 text-zinc-800 dark:text-zinc-100 shrink-0');
         refreshBtn.prepend(icon('refresh', 'w-3 h-3 mr-1 inline'));
         addRow.append(addSel, addBtn, refreshBtn);
+        // The default effort registered with the model being added: only the
+        // levels that model takes (Claude effort / Gemini thinking level).
+        const effortSel = el('select', { class: 'flex-1 min-w-0 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg text-sm px-3 py-2', 'aria-label': 'effort の既定' });
+        const effortRow = el('div', { class: 'flex items-center gap-2 mt-2' });
+        effortRow.append(el('span', { class: 'text-xs text-zinc-500 shrink-0' }, 'effort の既定'), effortSel);
+        const levelsOf = (m) => {
+          if (!m) return [];
+          if (p === 'anthropic') return Array.isArray(m.effortLevels) ? m.effortLevels : Claude.profile(m.id).effortLevels;
+          return Gemini.thinkingLevels(m.id, m.thinking);
+        };
+        const paintEffortSel = () => {
+          const m = (this.models[p] || []).find((x) => x.id === addSel.value);
+          const levels = levelsOf(m);
+          clear(effortSel);
+          if (!levels.length) {
+            effortSel.appendChild(el('option', { value: '' }, m ? '(このモデルは effort 非対応)' : '—'));
+            effortSel.disabled = true;
+            return;
+          }
+          effortSel.appendChild(el('option', { value: '' }, 'API の既定 (指定しない)'));
+          for (const lv of levels) {
+            const note = Providers.effortNote(lv);
+            effortSel.appendChild(el('option', { value: lv }, note ? `${lv} (${note})` : lv));
+          }
+          effortSel.disabled = false;
+        };
+        addSel.addEventListener('change', paintEffortSel);
+        paintEffortSel();
         const hint = el('p', { class: 'text-[11px] text-zinc-500' }, '');
         const addWrap = el('div');
-        addWrap.append(Form.label('モデルを追加'), addRow, hint);
+        addWrap.append(Form.label('モデルを追加'), addRow, effortRow, hint);
         wrap.append(addWrap);
 
         const addSelected = async () => {
@@ -8395,6 +8519,9 @@ textarea { resize: none; }
           if (m.maxTokens) entry.maxTokens = m.maxTokens;
           if (typeof m.adaptive === 'boolean') entry.adaptive = m.adaptive;
           if (Array.isArray(m.effortLevels)) entry.effortLevels = m.effortLevels;
+          // Gemini: whether the model thinks at all (Gemini.thinkingLevels).
+          if (typeof m.thinking === 'boolean') entry.thinking = m.thinking;
+          if (!effortSel.disabled && effortSel.value) entry.effort = effortSel.value;
           Store.settings.addedModels.push(entry);
           if (!Store.settings.model) Store.settings.model = m.id;
           await Store.saveSettings();
@@ -8411,6 +8538,7 @@ textarea { resize: none; }
             addBtn.disabled = true;
             refreshBtn.disabled = true;
             hint.textContent = 'API キーを入力するとモデル一覧を取得できます。';
+            paintEffortSel();
             return;
           }
           refreshBtn.disabled = false;
@@ -8446,6 +8574,7 @@ textarea { resize: none; }
             addSel.disabled = false;
             addBtn.disabled = false;
           }
+          paintEffortSel();
         };
         // Typing a key fires on every keystroke; only fetch once it settles.
         const refetchSoon = debounce(() => renderAvailable(), 600);
@@ -8459,24 +8588,10 @@ textarea { resize: none; }
         keyUrl: 'https://aistudio.google.com/apikey', keySite: 'Google AI Studio'
       }));
 
-      const claudeBlock = providerBlock('anthropic', {
+      box.append(providerBlock('anthropic', {
         title: 'Claude API', keyField: 'anthropicApiKey', placeholder: 'sk-ant-...',
         keyUrl: 'https://platform.claude.com/settings/keys', keySite: 'Claude Console'
-      });
-      const effortWrap = el('div');
-      effortWrap.append(Form.label('推論の深さ (effort)'));
-      effortWrap.append(Form.select([
-        { value: '', label: 'モデルの既定' },
-        { value: 'low', label: 'low (速い・低コスト)' },
-        { value: 'medium', label: 'medium' },
-        { value: 'high', label: 'high' },
-        { value: 'xhigh', label: 'xhigh' },
-        { value: 'max', label: 'max (最も深い・高コスト)' }
-      ], Store.settings.claudeEffort || '', (v) => { Store.settings.claudeEffort = v; Store.saveSettings(); }));
-      effortWrap.append(el('p', { class: 'text-[11px] text-zinc-500 mt-1' },
-        'Claude がどれだけ深く考えてから答えるか。高いほど難しい課題の精度が上がる一方、応答が遅く・高コストになります。モデルが対応していない段階は近い段階に自動で調整されます。Gemini には適用されません。チャット画面のモデルボタンからも変更できます (Agents API で実行中のチャットでは、次に作成するチャットから反映されます)。'));
-      claudeBlock.append(effortWrap);
-      box.append(claudeBlock);
+      }));
 
       renderAdded();
 
@@ -8784,7 +8899,7 @@ textarea { resize: none; }
         { value: 'xhigh', label: 'xhigh' },
         { value: 'max', label: 'max (最も深い・高コスト)' }
       ], s.agentsEffort, (v) => { s.agentsEffort = v; Store.saveSettings(); }));
-      effortWrap.append(el('p', { class: 'text-[11px] text-zinc-500 mt-1' }, 'モデルと effort はチャット画面のモデルボタンからも変更できます。変更は次に作成するセッションから反映されます。通常のチャットは、チャット画面で選んだモデルと「一般」タブの effort を使います。'));
+      effortWrap.append(el('p', { class: 'text-[11px] text-zinc-500 mt-1' }, 'モデルと effort はチャット画面のモデルボタンからも変更できます。変更は次に作成するセッションから反映されます。通常のチャットは、チャット画面で選んだモデルと、そのチャットの effort (既定はモデルを追加したときに選んだ値) を使います。'));
       box.append(effortWrap);
 
       const budgetNote = el('p', { class: 'text-[11px] text-zinc-500 mt-1' });
