@@ -2,9 +2,9 @@
 // @name         AI Chat Overlay
 // @name:ja      AI チャット オーバーレイ
 // @namespace    https://github.com/ym/userscripts/ai-chat
-// @version      2.4.0
-// @description  Floating AI chat (Gemini / Claude) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode with secret-Gist publishing. Claude chats run on the Agents API, keeping transcripts server-side and shared across devices. Optimized for iOS Safari.
-// @description:ja Webページの内容を文脈として Gemini / Claude と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。作ったスクリプトはシークレット Gist に公開して URL からインストール・自動更新できる。Claude のチャットは Agents API で実行し、会話はサーバー側に保存して他のデバイスからも開ける。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
+// @version      2.5.0
+// @description  Floating AI chat (Gemini / Claude) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode with secret-Gist publishing. Claude chats can optionally run on the Agents API, keeping transcripts server-side and shared across devices. Optimized for iOS Safari.
+// @description:ja Webページの内容を文脈として Gemini / Claude と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。作ったスクリプトはシークレット Gist に公開して URL からインストール・自動更新できる。Claude のチャットは Agents API でも実行でき、その場合は会話をサーバー側に保存して他のデバイスからも開ける。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
 // @author       ym
 // @match        *://*/*
 // @run-at       document-idle
@@ -351,6 +351,10 @@
     // cloud sandbox (bash, files, Playwright) while the page-inspection tools
     // still execute here, in the user's tab. See AgentsMode.
     agentsEnabled: false,
+    // When on, new plain chats with a Claude model run as a Managed Agents
+    // session (transcript kept server-side, shared across devices) instead of
+    // the Messages API (stored locally).
+    agentsChatEnabled: false,
     agentsModel: 'claude-opus-5-5',
     agentsEffort: 'high',
     // Per-session spend cap. The API only takes USD, so the yen amount is
@@ -5149,13 +5153,15 @@ textarea { resize: none; }
 - Web 検索や URL の取得は、ユーザーが有効にしたときだけ使える。`,
 
     enabled() { return !!Store.settings.agentsEnabled; },
-    // Plain chats run on the Agents API whenever a Claude model is selected
-    // (the API needs GM_xmlhttpRequest; without it Claude chats stay on the
-    // Messages API, stored locally as before). Gemini chats never do.
-    chatEnabled() {
+    // Plain chats run on the Agents API when the user switched it on and the
+    // selected model can (a Claude model Managed Agents runs, and
+    // GM_xmlhttpRequest to reach the API). Otherwise Claude chats use the
+    // Messages API, stored locally; Gemini chats never use the Agents API.
+    chatAvailable() {
       const model = Store.settings.model || '';
       return Providers.of(model) === 'anthropic' && this.supportsModel(model) && AgentsAPI.available();
     },
+    chatEnabled() { return !!Store.settings.agentsChatEnabled && this.chatAvailable(); },
     // Managed Agents runs Claude 4.5 and later. Older ids (Claude 2 / 3,
     // Opus / Sonnet 4 and Opus 4.1) keep using the Messages API.
     supportsModel(id) {
@@ -6542,20 +6548,23 @@ textarea { resize: none; }
           class: 'shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-900 text-indigo-700 dark:text-indigo-200'
         }, 'UserScript'));
       }
-      if (AgentsMode.usesAgents(conv, this.mode)) {
-        titleRow.append(el('span', {
-          class: 'shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-900 text-emerald-700 dark:text-emerald-200',
-          title: isUserscript
-            ? 'Agents API (クラウドのサンドボックスで検証しながら作成)'
-            : 'Agents API (会話はサーバーのセッションに保存され、他のデバイスからも開けます)'
-        }, 'Agents'));
-      }
-      titleRow.append(titleTop);
+      // Repainted when a fresh panel's model or engine choice changes.
+      const agentsChip = el('span', {
+        class: 'shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-900 text-emerald-700 dark:text-emerald-200',
+        title: isUserscript
+          ? 'Agents API (クラウドのサンドボックスで検証しながら作成)'
+          : 'Agents API (会話はサーバーのセッションに保存され、他のデバイスからも開けます)'
+      }, 'Agents');
+      const paintAgentsChip = () => agentsChip.classList.toggle('hidden', !AgentsMode.usesAgents(this.conv, this.mode));
+      titleRow.append(agentsChip, titleTop);
       const titleSub = el('div', { class: 'text-[11px] text-zinc-500 dark:text-zinc-400 flex items-center gap-1 min-w-0' });
       // Rebuild the subtitle from the stored pageUrl/pageTitle on the conv
       // (set at first-send time) so reopening a stored conversation on a
-      // different page still shows the page it was originally about.
+      // different page still shows the page it was originally about. The
+      // Agents chip follows along: model / engine changes and the first send
+      // all come through here.
       const updateTitleSub = () => {
+        paintAgentsChip();
         clear(titleSub);
         const pageUrl = (this.conv && this.conv.pageUrl) || location.href;
         const pageTitle = (this.conv && this.conv.pageTitle) || document.title || pageUrl;
@@ -6921,6 +6930,30 @@ textarea { resize: none; }
             }
             closeModelPop();
           }));
+        }
+
+        // Plain chats with a Claude model the Agents API runs: which engine
+        // new chats use (shared with Settings → Agents API). A conversation
+        // keeps the engine it was created with.
+        if (!isUserscript && AgentsMode.chatAvailable()) {
+          const on = !!Store.settings.agentsChatEnabled;
+          modelPopover.append(head('実行方式'));
+          if (this.conv && this.conv.engine !== 'agents') {
+            modelPopover.append(el('div', { class: 'text-[11px] text-zinc-500 px-3 py-2' },
+              'このチャットは Messages API で実行中です。ここでの変更は新しいチャットから反映されます。'));
+          }
+          const pickEngine = async (value) => {
+            if (on !== value) {
+              Store.settings.agentsChatEnabled = value;
+              await Store.saveSettings();
+              if (this.conv) UI.toast('このチャットの実行方式は変わりません。新しいチャットから反映されます', 'info');
+              paintModelBtn();
+              updateTitleSub();
+            }
+            closeModelPop();
+          };
+          modelPopover.append(item('Messages API', 'このデバイスに保存', !on, () => pickEngine(false)));
+          modelPopover.append(item('Agents API', 'サーバーに保存・他のデバイスからも開ける', on, () => pickEngine(true)));
         }
 
         // Claude models: the effort setting (shared with Settings → Claude
@@ -8717,8 +8750,8 @@ textarea { resize: none; }
       box.append(Form.sectionTitle('Agents API (サンドボックス実行)'));
 
       const info = el('div', { class: 'text-xs text-zinc-500 space-y-1' });
-      info.append(el('p', {}, 'Claude のモデルで始める通常のチャットは、Claude の Agents API (Managed Agents) で実行されます (Gemini のチャットは従来どおりです)。'));
-      info.append(el('p', {}, '下のスイッチをオンにすると、新しく始める UserScript チャットも Agents API で実行します。エージェントは Anthropic のクラウド上のサンドボックス (bash・Node.js・Playwright + Chromium) で、作ったスクリプトを実際に動かして確認しながら作業します。ページの調査は今までどおりこのタブで行います。'));
+      info.append(el('p', {}, '下のスイッチをオンにすると、新しく始める通常のチャット (Claude のモデルのみ。Gemini は対象外) や UserScript チャットを Claude の Agents API (Managed Agents) で実行します。オフのときは Messages API で実行し、会話はこのデバイスに保存します。通常のチャットの切り替えは、チャット画面のモデルボタンからもできます。'));
+      info.append(el('p', {}, 'UserScript チャットでは、エージェントは Anthropic のクラウド上のサンドボックス (bash・Node.js・Playwright + Chromium) で、作ったスクリプトを実際に動かして確認しながら作業します。ページの調査は今までどおりこのタブで行います。'));
       info.append(el('p', {}, '「一般」タブの Claude API キーを使います。料金はトークン代と、エージェントが動いている間のサンドボックス稼働料金 ($0.08/時間) です。待機中は稼働料金はかかりません。'));
       info.append(el('p', {}, '会話の記録 (共有したページ内容・添付ファイル・作成したスクリプトを含む) は Anthropic 側のセッションに保存され、このデバイスには会話の一覧情報だけを保存します。同じワークスペースの API キーを使う他のデバイスからも、メニューや会話履歴から開けます。チャットを削除するとセッションも削除されます。'));
       box.append(info);
@@ -8728,19 +8761,22 @@ textarea { resize: none; }
         return box;
       }
 
+      box.append(Form.checkbox('通常のチャット (Claude のモデル) で Agents API を使う', s.agentsChatEnabled, (v) => {
+        s.agentsChatEnabled = v; Store.saveSettings();
+      }));
       box.append(Form.checkbox('UserScript 作成モードで Agents API を使う', s.agentsEnabled, (v) => {
         s.agentsEnabled = v; Store.saveSettings();
       }));
 
       const models = AgentsMode.models();
       const modelWrap = el('div');
-      modelWrap.append(Form.label('モデル'));
+      modelWrap.append(Form.label('UserScript チャットのモデル'));
       modelWrap.append(Form.select(models.map((m) => ({ value: m.id, label: `${m.display} (${m.id})` })),
         s.agentsModel, (v) => { s.agentsModel = v; Store.saveSettings(); }));
       box.append(modelWrap);
 
       const effortWrap = el('div');
-      effortWrap.append(Form.label('推論の深さ (effort)'));
+      effortWrap.append(Form.label('UserScript チャットの推論の深さ (effort)'));
       effortWrap.append(Form.select([
         { value: 'low', label: 'low (速い・低コスト)' },
         { value: 'medium', label: 'medium' },
@@ -8748,7 +8784,7 @@ textarea { resize: none; }
         { value: 'xhigh', label: 'xhigh' },
         { value: 'max', label: 'max (最も深い・高コスト)' }
       ], s.agentsEffort, (v) => { s.agentsEffort = v; Store.saveSettings(); }));
-      effortWrap.append(el('p', { class: 'text-[11px] text-zinc-500 mt-1' }, 'モデルと effort はチャット画面のモデルボタンからも変更できます。変更は次に作成するセッションから反映されます。'));
+      effortWrap.append(el('p', { class: 'text-[11px] text-zinc-500 mt-1' }, 'モデルと effort はチャット画面のモデルボタンからも変更できます。変更は次に作成するセッションから反映されます。通常のチャットは、チャット画面で選んだモデルと「一般」タブの effort を使います。'));
       box.append(effortWrap);
 
       const budgetNote = el('p', { class: 'text-[11px] text-zinc-500 mt-1' });
