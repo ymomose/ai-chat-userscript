@@ -2,7 +2,7 @@
 // @name         AI Chat Overlay
 // @name:ja      AI チャット オーバーレイ
 // @namespace    https://github.com/ym/userscripts/ai-chat
-// @version      2.6.0
+// @version      2.7.0
 // @description  Floating AI chat (Gemini / Claude) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode with secret-Gist publishing. Claude chats can optionally run on the Agents API, keeping transcripts server-side and shared across devices. Optimized for iOS Safari.
 // @description:ja Webページの内容を文脈として Gemini / Claude と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。作ったスクリプトはシークレット Gist に公開して URL からインストール・自動更新できる。Claude のチャットは Agents API でも実行でき、その場合は会話をサーバー側に保存して他のデバイスからも開ける。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
 // @author       ym
@@ -593,6 +593,34 @@
       const handle = _gmXhr({
         method, url, headers, data: body, responseType: 'text',
         onload: (r) => resolve({ status: r.status, statusText: r.statusText, responseText: r.responseText }),
+        onerror: (r) => reject(gmNetworkError(r, url)),
+        ontimeout: () => reject(new Error('Request timed out')),
+        onabort: () => reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }))
+      });
+      if (signal) {
+        const onAbort = () => { try { handle && handle.abort && handle.abort(); } catch {} };
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+    });
+  }
+
+  // Binary variant of gmRequest: resolves to { status, statusText, bytes }
+  // where `bytes` is an ArrayBuffer (null when the manager returned no
+  // binary body). `anonymous` leaves the target site's cookies out.
+  function gmRequestBytes({ method = 'GET', url, headers, signal, anonymous = false }) {
+    return new Promise((resolve, reject) => {
+      if (!_gmXhr) { reject(new Error('GM_xmlhttpRequest is unavailable')); return; }
+      if (signal && signal.aborted) {
+        reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }));
+        return;
+      }
+      const handle = _gmXhr({
+        method, url, headers, responseType: 'arraybuffer', anonymous,
+        onload: (r) => {
+          // The buffer may come from the manager's realm, so no instanceof.
+          const b = r.response;
+          resolve({ status: r.status, statusText: r.statusText, bytes: b && typeof b.byteLength === 'number' ? b : null });
+        },
         onerror: (r) => reject(gmNetworkError(r, url)),
         ontimeout: () => reject(new Error('Request timed out')),
         onabort: () => reject(Object.assign(new Error('Aborted'), { name: 'AbortError' }))
@@ -1880,6 +1908,23 @@
     deleteSession(id) { return this.request('DELETE', `/sessions/${encodeURIComponent(id)}`); },
     sendEvents(id, events, opts) { return this.request('POST', `/sessions/${encodeURIComponent(id)}/events`, { events }, opts); },
 
+    // Files API. A session's files are what its agent wrote to
+    // /mnt/session/outputs/ (captured shortly after the session goes idle);
+    // `scope_id` needs the managed-agents beta header, which every request
+    // here carries.
+    listSessionFiles(sessionId) { return this.listAll(`/files?scope_id=${encodeURIComponent(sessionId)}&limit=100`); },
+    deleteFile(id) { return this.request('DELETE', `/files/${encodeURIComponent(id)}`); },
+    async downloadFile(id, { signal } = {}) {
+      if (!this.available()) throw new Error('この環境では GM_xmlhttpRequest が使えないため、Agents API を利用できません。');
+      const r = await gmRequestBytes({ url: `${CLAUDE_API_BASE}/files/${encodeURIComponent(id)}/content`, headers: this.headers(), signal });
+      if (r.status >= 200 && r.status < 300 && r.bytes) return r.bytes;
+      let text = '';
+      try { text = r.bytes ? new TextDecoder().decode(r.bytes) : ''; } catch {}
+      const err = Claude.httpError(r.status, text || r.statusText || '');
+      err.message = err.message.replace(/^Claude request failed/, 'Agents API エラー');
+      throw err;
+    },
+
     // Every item of a list endpoint. Most endpoints page with `page` /
     // `next_page`, but environments are documented with `after_id` /
     // `has_more`, so both cursors are followed. Capped so an unusually large
@@ -2676,7 +2721,7 @@
   //    precompiled path above.
   // ------------------------------------------------------------------------
   /* @TAILWIND_CSS_START */
-  const TAILWIND_CSS = `.\\!container{width:100%!important}.container{width:100%}@media (min-width:640px){.\\!container{max-width:640px!important}.container{max-width:640px}}@media (min-width:768px){.\\!container{max-width:768px!important}.container{max-width:768px}}@media (min-width:1024px){.\\!container{max-width:1024px!important}.container{max-width:1024px}}@media (min-width:1280px){.\\!container{max-width:1280px!important}.container{max-width:1280px}}@media (min-width:1536px){.\\!container{max-width:1536px!important}.container{max-width:1536px}}.pointer-events-none{pointer-events:none}.pointer-events-auto{pointer-events:auto}.\\!visible{visibility:visible!important}.visible{visibility:visible}.invisible{visibility:hidden}.fixed{position:fixed}.absolute{position:absolute}.relative{position:relative}.inset-0{inset:0}.bottom-4{bottom:1em}.bottom-full{bottom:100%}.left-0{left:0}.left-1{left:.25em}.left-1\\/2{left:50%}.z-20{z-index:20}.mx-3{margin-left:.75em;margin-right:.75em}.my-1{margin-top:.25em;margin-bottom:.25em}.my-2{margin-top:.5em;margin-bottom:.5em}.my-3{margin-top:.75em;margin-bottom:.75em}.mb-1{margin-bottom:.25em}.mb-2{margin-bottom:.5em}.mb-3{margin-bottom:.75em}.ml-5{margin-left:1.25em}.mr-1{margin-right:.25em}.mr-2{margin-right:.5em}.mt-0{margin-top:0}.mt-0\\.5{margin-top:.125em}.mt-1{margin-top:.25em}.mt-1\\.5{margin-top:.375em}.mt-2{margin-top:.5em}.mt-3{margin-top:.75em}.mt-4{margin-top:1em}.line-clamp-2{-webkit-line-clamp:2}.line-clamp-2,.line-clamp-3{overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical}.line-clamp-3{-webkit-line-clamp:3}.\\!block{display:block!important}.block{display:block}.inline-block{display:inline-block}.inline{display:inline}.flex{display:flex}.inline-flex{display:inline-flex}.table{display:table}.grid{display:grid}.contents{display:contents}.hidden{display:none}.h-1{height:.25em}.h-10{height:2.5em}.h-3{height:.75em}.h-3\\.5{height:.875em}.h-4{height:1em}.h-5{height:1.25em}.h-6{height:1.5em}.h-64{height:16em}.h-7{height:1.75em}.h-8{height:2em}.h-9{height:2.25em}.h-auto{height:auto}.max-h-40{max-height:10em}.max-h-64{max-height:16em}.max-h-80{max-height:20em}.max-h-\\[160px\\]{max-height:160px}.max-h-\\[85dvh\\]{max-height:85dvh}.min-h-\\[40px\\]{min-height:40px}.w-10{width:2.5em}.w-24{width:6em}.w-3{width:.75em}.w-3\\.5{width:.875em}.w-4{width:1em}.w-5{width:1.25em}.w-6{width:1.5em}.w-7{width:1.75em}.w-72{width:18em}.w-8{width:2em}.w-9{width:2.25em}.w-full{width:100%}.min-w-0{min-width:0}.min-w-\\[220px\\]{min-width:220px}.min-w-\\[80px\\]{min-width:80px}.max-w-2xl{max-width:42em}.max-w-\\[160px\\]{max-width:160px}.max-w-\\[200px\\]{max-width:200px}.max-w-\\[85\\%\\]{max-width:85%}.max-w-\\[90\\%\\]{max-width:90%}.max-w-full{max-width:100%}.max-w-sm{max-width:24em}.max-w-xl{max-width:36em}.flex-1{flex:1 1 0%}.flex-shrink,.shrink{flex-shrink:1}.shrink-0{flex-shrink:0}.grow{flex-grow:1}.border-collapse{border-collapse:collapse}.-translate-x-1{--tw-translate-x:-0.25em}.-translate-x-1,.-translate-x-1\\/2{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.-translate-x-1\\/2{--tw-translate-x:-50%}.transform{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.cursor-pointer{cursor:pointer}.select-none{-webkit-user-select:none;-moz-user-select:none;user-select:none}.select-all{-webkit-user-select:all;-moz-user-select:all;user-select:all}.resize{resize:both}.list-decimal{list-style-type:decimal}.list-disc{list-style-type:disc}.grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}.grid-cols-6{grid-template-columns:repeat(6,minmax(0,1fr))}.grid-cols-\\[auto_1fr\\]{grid-template-columns:auto 1fr}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.items-start{align-items:flex-start}.items-end{align-items:flex-end}.items-center{align-items:center}.justify-start{justify-content:flex-start}.justify-end{justify-content:flex-end}.justify-center{justify-content:center}.gap-1{gap:.25em}.gap-2{gap:.5em}.gap-3{gap:.75em}.gap-x-3{-moz-column-gap:.75em;column-gap:.75em}.gap-y-1{row-gap:.25em}.space-y-0>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(0px*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(0px*var(--tw-space-y-reverse))}.space-y-0\\.5>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.125em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.125em*var(--tw-space-y-reverse))}.space-y-1>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.25em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.25em*var(--tw-space-y-reverse))}.space-y-2>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.5em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.5em*var(--tw-space-y-reverse))}.space-y-3>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.75em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.75em*var(--tw-space-y-reverse))}.space-y-6>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(1.5em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(1.5em*var(--tw-space-y-reverse))}.divide-y>:not([hidden])~:not([hidden]){--tw-divide-y-reverse:0;border-top-width:calc(1px*(1 - var(--tw-divide-y-reverse)));border-bottom-width:calc(1px*var(--tw-divide-y-reverse))}.divide-zinc-100>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(244 244 245/var(--tw-divide-opacity,1))}.overflow-auto{overflow:auto}.overflow-hidden{overflow:hidden}.overflow-x-auto{overflow-x:auto}.overflow-y-auto{overflow-y:auto}.truncate{overflow:hidden;text-overflow:ellipsis}.truncate,.whitespace-nowrap{white-space:nowrap}.whitespace-pre-wrap{white-space:pre-wrap}.break-words{overflow-wrap:break-word}.break-all{word-break:break-all}.rounded{border-radius:.25em}.rounded-2xl{border-radius:1em}.rounded-full{border-radius:9999px}.rounded-lg{border-radius:.5em}.rounded-md{border-radius:.375em}.rounded-xl{border-radius:.75em}.rounded-r-lg{border-top-right-radius:.5em;border-bottom-right-radius:.5em}.rounded-t-2xl{border-top-left-radius:1em;border-top-right-radius:1em}.border{border-width:1px}.border-b{border-bottom-width:1px}.border-b-2{border-bottom-width:2px}.border-l-4{border-left-width:4px}.border-t{border-top-width:1px}.border-dashed{border-style:dashed}.border-indigo-200{--tw-border-opacity:1;border-color:rgb(199 210 254/var(--tw-border-opacity,1))}.border-indigo-500{--tw-border-opacity:1;border-color:rgb(99 102 241/var(--tw-border-opacity,1))}.border-indigo-600{--tw-border-opacity:1;border-color:rgb(79 70 229/var(--tw-border-opacity,1))}.border-transparent{border-color:transparent}.border-zinc-100{--tw-border-opacity:1;border-color:rgb(244 244 245/var(--tw-border-opacity,1))}.border-zinc-200{--tw-border-opacity:1;border-color:rgb(228 228 231/var(--tw-border-opacity,1))}.border-zinc-300{--tw-border-opacity:1;border-color:rgb(212 212 216/var(--tw-border-opacity,1))}.bg-amber-50{--tw-bg-opacity:1;background-color:rgb(255 251 235/var(--tw-bg-opacity,1))}.bg-amber-900{--tw-bg-opacity:1;background-color:rgb(120 53 15/var(--tw-bg-opacity,1))}.bg-black{--tw-bg-opacity:1;background-color:rgb(0 0 0/var(--tw-bg-opacity,1))}.bg-black\\/30{background-color:rgba(0,0,0,.3)}.bg-black\\/40{background-color:rgba(0,0,0,.4)}.bg-emerald-100{--tw-bg-opacity:1;background-color:rgb(209 250 229/var(--tw-bg-opacity,1))}.bg-emerald-600{--tw-bg-opacity:1;background-color:rgb(5 150 105/var(--tw-bg-opacity,1))}.bg-indigo-100{--tw-bg-opacity:1;background-color:rgb(224 231 255/var(--tw-bg-opacity,1))}.bg-indigo-50{--tw-bg-opacity:1;background-color:rgb(238 242 255/var(--tw-bg-opacity,1))}.bg-indigo-600{--tw-bg-opacity:1;background-color:rgb(79 70 229/var(--tw-bg-opacity,1))}.bg-indigo-900{--tw-bg-opacity:1;background-color:rgb(49 46 129/var(--tw-bg-opacity,1))}.bg-red-50{--tw-bg-opacity:1;background-color:rgb(254 242 242/var(--tw-bg-opacity,1))}.bg-red-600{--tw-bg-opacity:1;background-color:rgb(220 38 38/var(--tw-bg-opacity,1))}.bg-red-900{--tw-bg-opacity:1;background-color:rgb(127 29 29/var(--tw-bg-opacity,1))}.bg-transparent{background-color:transparent}.bg-white{--tw-bg-opacity:1;background-color:rgb(255 255 255/var(--tw-bg-opacity,1))}.bg-white\\/70{background-color:hsla(0,0%,100%,.7)}.bg-zinc-100{--tw-bg-opacity:1;background-color:rgb(244 244 245/var(--tw-bg-opacity,1))}.bg-zinc-200{--tw-bg-opacity:1;background-color:rgb(228 228 231/var(--tw-bg-opacity,1))}.bg-zinc-300{--tw-bg-opacity:1;background-color:rgb(212 212 216/var(--tw-bg-opacity,1))}.bg-zinc-50{--tw-bg-opacity:1;background-color:rgb(250 250 250/var(--tw-bg-opacity,1))}.bg-zinc-700{--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.bg-zinc-800{--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.bg-zinc-900{--tw-bg-opacity:1;background-color:rgb(24 24 27/var(--tw-bg-opacity,1))}.object-cover{-o-object-fit:cover;object-fit:cover}.p-0{padding:0}.p-1{padding:.25em}.p-2{padding:.5em}.p-3{padding:.75em}.p-4{padding:1em}.p-8{padding:2em}.px-1{padding-left:.25em;padding-right:.25em}.px-1\\.5{padding-left:.375em;padding-right:.375em}.px-2{padding-left:.5em;padding-right:.5em}.px-3{padding-left:.75em;padding-right:.75em}.px-4{padding-left:1em;padding-right:1em}.py-0{padding-top:0;padding-bottom:0}.py-0\\.5{padding-top:.125em;padding-bottom:.125em}.py-1{padding-top:.25em;padding-bottom:.25em}.py-1\\.5{padding-top:.375em;padding-bottom:.375em}.py-2{padding-top:.5em;padding-bottom:.5em}.py-2\\.5{padding-top:.625em;padding-bottom:.625em}.py-3{padding-top:.75em;padding-bottom:.75em}.py-8{padding-top:2em;padding-bottom:2em}.pb-1{padding-bottom:.25em}.pb-2{padding-bottom:.5em}.pb-3{padding-bottom:.75em}.pl-3{padding-left:.75em}.pt-0{padding-top:0}.pt-0\\.5{padding-top:.125em}.pt-1{padding-top:.25em}.pt-2{padding-top:.5em}.pt-3{padding-top:.75em}.pt-4{padding-top:1em}.text-left{text-align:left}.text-center{text-align:center}.align-top{vertical-align:top}.font-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.text-\\[0\\.85em\\]{font-size:.85em}.text-\\[10px\\]{font-size:10px}.text-\\[11px\\]{font-size:11px}.text-base{font-size:16px;line-height:24px}.text-lg{font-size:18px;line-height:28px}.text-sm{font-size:14px;line-height:20px}.text-xl{font-size:20px;line-height:28px}.text-xs{font-size:12px;line-height:16px}.font-bold{font-weight:700}.font-medium{font-weight:500}.font-semibold{font-weight:600}.uppercase{text-transform:uppercase}.italic{font-style:italic}.leading-none{line-height:1}.leading-relaxed{line-height:1.625}.tracking-wide{letter-spacing:.025em}.tracking-wider{letter-spacing:.05em}.text-amber-800{--tw-text-opacity:1;color:rgb(146 64 14/var(--tw-text-opacity,1))}.text-blue-600{--tw-text-opacity:1;color:rgb(37 99 235/var(--tw-text-opacity,1))}.text-emerald-600{--tw-text-opacity:1;color:rgb(5 150 105/var(--tw-text-opacity,1))}.text-emerald-700{--tw-text-opacity:1;color:rgb(4 120 87/var(--tw-text-opacity,1))}.text-indigo-600{--tw-text-opacity:1;color:rgb(79 70 229/var(--tw-text-opacity,1))}.text-indigo-700{--tw-text-opacity:1;color:rgb(67 56 202/var(--tw-text-opacity,1))}.text-inherit{color:inherit}.text-red-600{--tw-text-opacity:1;color:rgb(220 38 38/var(--tw-text-opacity,1))}.text-red-700{--tw-text-opacity:1;color:rgb(185 28 28/var(--tw-text-opacity,1))}.text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.text-zinc-100{--tw-text-opacity:1;color:rgb(244 244 245/var(--tw-text-opacity,1))}.text-zinc-400{--tw-text-opacity:1;color:rgb(161 161 170/var(--tw-text-opacity,1))}.text-zinc-500{--tw-text-opacity:1;color:rgb(113 113 122/var(--tw-text-opacity,1))}.text-zinc-600{--tw-text-opacity:1;color:rgb(82 82 91/var(--tw-text-opacity,1))}.text-zinc-700{--tw-text-opacity:1;color:rgb(63 63 70/var(--tw-text-opacity,1))}.text-zinc-800{--tw-text-opacity:1;color:rgb(39 39 42/var(--tw-text-opacity,1))}.text-zinc-900{--tw-text-opacity:1;color:rgb(24 24 27/var(--tw-text-opacity,1))}.underline{text-decoration-line:underline}.antialiased{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}.opacity-80{opacity:.8}.shadow{--tw-shadow:0 1px 3px 0 rgba(0,0,0,.1),0 1px 2px -1px rgba(0,0,0,.1);--tw-shadow-colored:0 1px 3px 0 var(--tw-shadow-color),0 1px 2px -1px var(--tw-shadow-color)}.shadow,.shadow-2xl{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-2xl{--tw-shadow:0 25px 50px -12px rgba(0,0,0,.25);--tw-shadow-colored:0 25px 50px -12px var(--tw-shadow-color)}.shadow-lg{--tw-shadow:0 10px 15px -3px rgba(0,0,0,.1),0 4px 6px -4px rgba(0,0,0,.1);--tw-shadow-colored:0 10px 15px -3px var(--tw-shadow-color),0 4px 6px -4px var(--tw-shadow-color)}.shadow-lg,.shadow-xl{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-xl{--tw-shadow:0 20px 25px -5px rgba(0,0,0,.1),0 8px 10px -6px rgba(0,0,0,.1);--tw-shadow-colored:0 20px 25px -5px var(--tw-shadow-color),0 8px 10px -6px var(--tw-shadow-color)}.outline{outline-style:solid}.ring{--tw-ring-offset-shadow:var(--tw-ring-inset) 0 0 0 var(--tw-ring-offset-width) var(--tw-ring-offset-color);--tw-ring-shadow:var(--tw-ring-inset) 0 0 0 calc(3px + var(--tw-ring-offset-width)) var(--tw-ring-color);box-shadow:var(--tw-ring-offset-shadow),var(--tw-ring-shadow),var(--tw-shadow,0 0 #0000)}.blur{--tw-blur:blur(8px)}.blur,.filter{filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.transition{transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,-webkit-backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter,-webkit-backdrop-filter;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.ease-out{transition-timing-function:cubic-bezier(0,0,.2,1)}.empty\\:hidden:empty{display:none}.hover\\:bg-indigo-50:hover{--tw-bg-opacity:1;background-color:rgb(238 242 255/var(--tw-bg-opacity,1))}.hover\\:bg-red-50:hover{--tw-bg-opacity:1;background-color:rgb(254 242 242/var(--tw-bg-opacity,1))}.hover\\:bg-zinc-100:hover{--tw-bg-opacity:1;background-color:rgb(244 244 245/var(--tw-bg-opacity,1))}.hover\\:bg-zinc-50:hover{--tw-bg-opacity:1;background-color:rgb(250 250 250/var(--tw-bg-opacity,1))}.hover\\:text-red-500:hover{--tw-text-opacity:1;color:rgb(239 68 68/var(--tw-text-opacity,1))}.hover\\:text-red-600:hover{--tw-text-opacity:1;color:rgb(220 38 38/var(--tw-text-opacity,1))}.hover\\:text-zinc-600:hover{--tw-text-opacity:1;color:rgb(82 82 91/var(--tw-text-opacity,1))}.hover\\:text-zinc-700:hover{--tw-text-opacity:1;color:rgb(63 63 70/var(--tw-text-opacity,1))}.hover\\:underline:hover{text-decoration-line:underline}.disabled\\:opacity-50:disabled{opacity:.5}.dark\\:divide-zinc-800:is(.dark *)>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(39 39 42/var(--tw-divide-opacity,1))}.dark\\:border-indigo-800:is(.dark *){--tw-border-opacity:1;border-color:rgb(55 48 163/var(--tw-border-opacity,1))}.dark\\:border-zinc-600:is(.dark *){--tw-border-opacity:1;border-color:rgb(82 82 91/var(--tw-border-opacity,1))}.dark\\:border-zinc-700:is(.dark *){--tw-border-opacity:1;border-color:rgb(63 63 70/var(--tw-border-opacity,1))}.dark\\:border-zinc-800:is(.dark *){--tw-border-opacity:1;border-color:rgb(39 39 42/var(--tw-border-opacity,1))}.dark\\:bg-amber-900\\/30:is(.dark *){background-color:rgba(120,53,15,.3)}.dark\\:bg-emerald-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(6 78 59/var(--tw-bg-opacity,1))}.dark\\:bg-indigo-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(49 46 129/var(--tw-bg-opacity,1))}.dark\\:bg-indigo-900\\/30:is(.dark *){background-color:rgba(49,46,129,.3)}.dark\\:bg-indigo-900\\/40:is(.dark *){background-color:rgba(49,46,129,.4)}.dark\\:bg-red-900\\/30:is(.dark *){background-color:rgba(127,29,29,.3)}.dark\\:bg-zinc-600:is(.dark *){--tw-bg-opacity:1;background-color:rgb(82 82 91/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-700:is(.dark *){--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-800:is(.dark *){--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-800\\/50:is(.dark *){background-color:rgba(39,39,42,.5)}.dark\\:bg-zinc-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(24 24 27/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-900\\/40:is(.dark *){background-color:rgba(24,24,27,.4)}.dark\\:text-amber-200:is(.dark *){--tw-text-opacity:1;color:rgb(253 230 138/var(--tw-text-opacity,1))}.dark\\:text-blue-400:is(.dark *){--tw-text-opacity:1;color:rgb(96 165 250/var(--tw-text-opacity,1))}.dark\\:text-emerald-200:is(.dark *){--tw-text-opacity:1;color:rgb(167 243 208/var(--tw-text-opacity,1))}.dark\\:text-indigo-200:is(.dark *){--tw-text-opacity:1;color:rgb(199 210 254/var(--tw-text-opacity,1))}.dark\\:text-indigo-300:is(.dark *){--tw-text-opacity:1;color:rgb(165 180 252/var(--tw-text-opacity,1))}.dark\\:text-indigo-400:is(.dark *){--tw-text-opacity:1;color:rgb(129 140 248/var(--tw-text-opacity,1))}.dark\\:text-red-300:is(.dark *){--tw-text-opacity:1;color:rgb(252 165 165/var(--tw-text-opacity,1))}.dark\\:text-red-400:is(.dark *){--tw-text-opacity:1;color:rgb(248 113 113/var(--tw-text-opacity,1))}.dark\\:text-zinc-100:is(.dark *){--tw-text-opacity:1;color:rgb(244 244 245/var(--tw-text-opacity,1))}.dark\\:text-zinc-200:is(.dark *){--tw-text-opacity:1;color:rgb(228 228 231/var(--tw-text-opacity,1))}.dark\\:text-zinc-300:is(.dark *){--tw-text-opacity:1;color:rgb(212 212 216/var(--tw-text-opacity,1))}.dark\\:text-zinc-400:is(.dark *){--tw-text-opacity:1;color:rgb(161 161 170/var(--tw-text-opacity,1))}.dark\\:text-zinc-500:is(.dark *){--tw-text-opacity:1;color:rgb(113 113 122/var(--tw-text-opacity,1))}.dark\\:hover\\:bg-indigo-900\\/40:hover:is(.dark *){background-color:rgba(49,46,129,.4)}.dark\\:hover\\:bg-red-900\\/30:hover:is(.dark *){background-color:rgba(127,29,29,.3)}.dark\\:hover\\:bg-zinc-700:hover:is(.dark *){--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.dark\\:hover\\:bg-zinc-800:hover:is(.dark *){--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.dark\\:hover\\:bg-zinc-800\\/50:hover:is(.dark *){background-color:rgba(39,39,42,.5)}.dark\\:hover\\:bg-zinc-800\\/60:hover:is(.dark *){background-color:rgba(39,39,42,.6)}.dark\\:hover\\:text-zinc-200:hover:is(.dark *){--tw-text-opacity:1;color:rgb(228 228 231/var(--tw-text-opacity,1))}@media (min-width:640px){.sm\\:mx-auto{margin-left:auto;margin-right:auto}.sm\\:my-4{margin-top:1em}.sm\\:mb-4,.sm\\:my-4{margin-bottom:1em}.sm\\:h-\\[calc\\(100dvh-2em\\)\\]{height:calc(100dvh - 2em)}.sm\\:max-w-4xl{max-width:56em}.sm\\:max-w-5xl{max-width:64em}.sm\\:max-w-6xl{max-width:72em}.sm\\:items-stretch{align-items:stretch}.sm\\:rounded-2xl{border-radius:1em}}`;
+  const TAILWIND_CSS = `.\\!container{width:100%!important}.container{width:100%}@media (min-width:640px){.\\!container{max-width:640px!important}.container{max-width:640px}}@media (min-width:768px){.\\!container{max-width:768px!important}.container{max-width:768px}}@media (min-width:1024px){.\\!container{max-width:1024px!important}.container{max-width:1024px}}@media (min-width:1280px){.\\!container{max-width:1280px!important}.container{max-width:1280px}}@media (min-width:1536px){.\\!container{max-width:1536px!important}.container{max-width:1536px}}.pointer-events-none{pointer-events:none}.pointer-events-auto{pointer-events:auto}.\\!visible{visibility:visible!important}.visible{visibility:visible}.invisible{visibility:hidden}.fixed{position:fixed}.absolute{position:absolute}.relative{position:relative}.inset-0{inset:0}.bottom-4{bottom:1em}.bottom-full{bottom:100%}.left-0{left:0}.left-1{left:.25em}.left-1\\/2{left:50%}.z-20{z-index:20}.mx-3{margin-left:.75em;margin-right:.75em}.my-1{margin-top:.25em;margin-bottom:.25em}.my-2{margin-top:.5em;margin-bottom:.5em}.my-3{margin-top:.75em;margin-bottom:.75em}.mb-1{margin-bottom:.25em}.mb-2{margin-bottom:.5em}.mb-3{margin-bottom:.75em}.ml-5{margin-left:1.25em}.mr-1{margin-right:.25em}.mr-2{margin-right:.5em}.mt-0{margin-top:0}.mt-0\\.5{margin-top:.125em}.mt-1{margin-top:.25em}.mt-1\\.5{margin-top:.375em}.mt-2{margin-top:.5em}.mt-3{margin-top:.75em}.mt-4{margin-top:1em}.line-clamp-2{-webkit-line-clamp:2}.line-clamp-2,.line-clamp-3{overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical}.line-clamp-3{-webkit-line-clamp:3}.\\!block{display:block!important}.block{display:block}.inline-block{display:inline-block}.inline{display:inline}.flex{display:flex}.inline-flex{display:inline-flex}.table{display:table}.grid{display:grid}.contents{display:contents}.hidden{display:none}.h-1{height:.25em}.h-10{height:2.5em}.h-3{height:.75em}.h-3\\.5{height:.875em}.h-4{height:1em}.h-5{height:1.25em}.h-6{height:1.5em}.h-64{height:16em}.h-7{height:1.75em}.h-8{height:2em}.h-9{height:2.25em}.h-auto{height:auto}.max-h-40{max-height:10em}.max-h-64{max-height:16em}.max-h-80{max-height:20em}.max-h-96{max-height:24em}.max-h-\\[160px\\]{max-height:160px}.max-h-\\[85dvh\\]{max-height:85dvh}.min-h-\\[40px\\]{min-height:40px}.w-10{width:2.5em}.w-24{width:6em}.w-3{width:.75em}.w-3\\.5{width:.875em}.w-4{width:1em}.w-5{width:1.25em}.w-6{width:1.5em}.w-7{width:1.75em}.w-72{width:18em}.w-8{width:2em}.w-9{width:2.25em}.w-full{width:100%}.min-w-0{min-width:0}.min-w-\\[220px\\]{min-width:220px}.min-w-\\[80px\\]{min-width:80px}.max-w-2xl{max-width:42em}.max-w-\\[160px\\]{max-width:160px}.max-w-\\[200px\\]{max-width:200px}.max-w-\\[85\\%\\]{max-width:85%}.max-w-\\[90\\%\\]{max-width:90%}.max-w-full{max-width:100%}.max-w-sm{max-width:24em}.max-w-xl{max-width:36em}.flex-1{flex:1 1 0%}.flex-shrink,.shrink{flex-shrink:1}.shrink-0{flex-shrink:0}.grow{flex-grow:1}.border-collapse{border-collapse:collapse}.-translate-x-1{--tw-translate-x:-0.25em}.-translate-x-1,.-translate-x-1\\/2{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.-translate-x-1\\/2{--tw-translate-x:-50%}.transform{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.cursor-pointer{cursor:pointer}.cursor-zoom-in{cursor:zoom-in}.select-none{-webkit-user-select:none;-moz-user-select:none;user-select:none}.select-all{-webkit-user-select:all;-moz-user-select:all;user-select:all}.resize{resize:both}.list-decimal{list-style-type:decimal}.list-disc{list-style-type:disc}.grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}.grid-cols-6{grid-template-columns:repeat(6,minmax(0,1fr))}.grid-cols-\\[auto_1fr\\]{grid-template-columns:auto 1fr}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.items-start{align-items:flex-start}.items-end{align-items:flex-end}.items-center{align-items:center}.justify-start{justify-content:flex-start}.justify-end{justify-content:flex-end}.justify-center{justify-content:center}.gap-1{gap:.25em}.gap-2{gap:.5em}.gap-3{gap:.75em}.gap-x-3{-moz-column-gap:.75em;column-gap:.75em}.gap-y-1{row-gap:.25em}.space-y-0>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(0px*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(0px*var(--tw-space-y-reverse))}.space-y-0\\.5>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.125em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.125em*var(--tw-space-y-reverse))}.space-y-1>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.25em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.25em*var(--tw-space-y-reverse))}.space-y-2>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.5em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.5em*var(--tw-space-y-reverse))}.space-y-3>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.75em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.75em*var(--tw-space-y-reverse))}.space-y-6>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(1.5em*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(1.5em*var(--tw-space-y-reverse))}.divide-y>:not([hidden])~:not([hidden]){--tw-divide-y-reverse:0;border-top-width:calc(1px*(1 - var(--tw-divide-y-reverse)));border-bottom-width:calc(1px*var(--tw-divide-y-reverse))}.divide-zinc-100>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(244 244 245/var(--tw-divide-opacity,1))}.overflow-auto{overflow:auto}.overflow-hidden{overflow:hidden}.overflow-x-auto{overflow-x:auto}.overflow-y-auto{overflow-y:auto}.truncate{overflow:hidden;text-overflow:ellipsis}.truncate,.whitespace-nowrap{white-space:nowrap}.whitespace-pre-wrap{white-space:pre-wrap}.break-words{overflow-wrap:break-word}.break-all{word-break:break-all}.rounded{border-radius:.25em}.rounded-2xl{border-radius:1em}.rounded-full{border-radius:9999px}.rounded-lg{border-radius:.5em}.rounded-md{border-radius:.375em}.rounded-xl{border-radius:.75em}.rounded-r-lg{border-top-right-radius:.5em;border-bottom-right-radius:.5em}.rounded-t-2xl{border-top-left-radius:1em;border-top-right-radius:1em}.border{border-width:1px}.border-b{border-bottom-width:1px}.border-b-2{border-bottom-width:2px}.border-l-4{border-left-width:4px}.border-t{border-top-width:1px}.border-dashed{border-style:dashed}.border-indigo-200{--tw-border-opacity:1;border-color:rgb(199 210 254/var(--tw-border-opacity,1))}.border-indigo-500{--tw-border-opacity:1;border-color:rgb(99 102 241/var(--tw-border-opacity,1))}.border-indigo-600{--tw-border-opacity:1;border-color:rgb(79 70 229/var(--tw-border-opacity,1))}.border-transparent{border-color:transparent}.border-zinc-100{--tw-border-opacity:1;border-color:rgb(244 244 245/var(--tw-border-opacity,1))}.border-zinc-200{--tw-border-opacity:1;border-color:rgb(228 228 231/var(--tw-border-opacity,1))}.border-zinc-300{--tw-border-opacity:1;border-color:rgb(212 212 216/var(--tw-border-opacity,1))}.bg-amber-50{--tw-bg-opacity:1;background-color:rgb(255 251 235/var(--tw-bg-opacity,1))}.bg-amber-900{--tw-bg-opacity:1;background-color:rgb(120 53 15/var(--tw-bg-opacity,1))}.bg-black{--tw-bg-opacity:1;background-color:rgb(0 0 0/var(--tw-bg-opacity,1))}.bg-black\\/30{background-color:rgba(0,0,0,.3)}.bg-black\\/40{background-color:rgba(0,0,0,.4)}.bg-emerald-100{--tw-bg-opacity:1;background-color:rgb(209 250 229/var(--tw-bg-opacity,1))}.bg-emerald-600{--tw-bg-opacity:1;background-color:rgb(5 150 105/var(--tw-bg-opacity,1))}.bg-indigo-100{--tw-bg-opacity:1;background-color:rgb(224 231 255/var(--tw-bg-opacity,1))}.bg-indigo-50{--tw-bg-opacity:1;background-color:rgb(238 242 255/var(--tw-bg-opacity,1))}.bg-indigo-600{--tw-bg-opacity:1;background-color:rgb(79 70 229/var(--tw-bg-opacity,1))}.bg-indigo-900{--tw-bg-opacity:1;background-color:rgb(49 46 129/var(--tw-bg-opacity,1))}.bg-red-50{--tw-bg-opacity:1;background-color:rgb(254 242 242/var(--tw-bg-opacity,1))}.bg-red-600{--tw-bg-opacity:1;background-color:rgb(220 38 38/var(--tw-bg-opacity,1))}.bg-red-900{--tw-bg-opacity:1;background-color:rgb(127 29 29/var(--tw-bg-opacity,1))}.bg-transparent{background-color:transparent}.bg-white{--tw-bg-opacity:1;background-color:rgb(255 255 255/var(--tw-bg-opacity,1))}.bg-white\\/70{background-color:hsla(0,0%,100%,.7)}.bg-zinc-100{--tw-bg-opacity:1;background-color:rgb(244 244 245/var(--tw-bg-opacity,1))}.bg-zinc-200{--tw-bg-opacity:1;background-color:rgb(228 228 231/var(--tw-bg-opacity,1))}.bg-zinc-300{--tw-bg-opacity:1;background-color:rgb(212 212 216/var(--tw-bg-opacity,1))}.bg-zinc-50{--tw-bg-opacity:1;background-color:rgb(250 250 250/var(--tw-bg-opacity,1))}.bg-zinc-700{--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.bg-zinc-800{--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.bg-zinc-900{--tw-bg-opacity:1;background-color:rgb(24 24 27/var(--tw-bg-opacity,1))}.object-cover{-o-object-fit:cover;object-fit:cover}.p-0{padding:0}.p-1{padding:.25em}.p-2{padding:.5em}.p-3{padding:.75em}.p-4{padding:1em}.p-8{padding:2em}.px-1{padding-left:.25em;padding-right:.25em}.px-1\\.5{padding-left:.375em;padding-right:.375em}.px-2{padding-left:.5em;padding-right:.5em}.px-3{padding-left:.75em;padding-right:.75em}.px-4{padding-left:1em;padding-right:1em}.py-0{padding-top:0;padding-bottom:0}.py-0\\.5{padding-top:.125em;padding-bottom:.125em}.py-1{padding-top:.25em;padding-bottom:.25em}.py-1\\.5{padding-top:.375em;padding-bottom:.375em}.py-2{padding-top:.5em;padding-bottom:.5em}.py-2\\.5{padding-top:.625em;padding-bottom:.625em}.py-3{padding-top:.75em;padding-bottom:.75em}.py-4{padding-top:1em;padding-bottom:1em}.py-8{padding-top:2em;padding-bottom:2em}.pb-1{padding-bottom:.25em}.pb-2{padding-bottom:.5em}.pb-3{padding-bottom:.75em}.pl-3{padding-left:.75em}.pt-0{padding-top:0}.pt-0\\.5{padding-top:.125em}.pt-1{padding-top:.25em}.pt-2{padding-top:.5em}.pt-3{padding-top:.75em}.pt-4{padding-top:1em}.text-left{text-align:left}.text-center{text-align:center}.align-top{vertical-align:top}.font-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.text-\\[0\\.85em\\]{font-size:.85em}.text-\\[10px\\]{font-size:10px}.text-\\[11px\\]{font-size:11px}.text-base{font-size:16px;line-height:24px}.text-lg{font-size:18px;line-height:28px}.text-sm{font-size:14px;line-height:20px}.text-xl{font-size:20px;line-height:28px}.text-xs{font-size:12px;line-height:16px}.font-bold{font-weight:700}.font-medium{font-weight:500}.font-semibold{font-weight:600}.uppercase{text-transform:uppercase}.italic{font-style:italic}.leading-none{line-height:1}.leading-relaxed{line-height:1.625}.tracking-wide{letter-spacing:.025em}.tracking-wider{letter-spacing:.05em}.text-amber-800{--tw-text-opacity:1;color:rgb(146 64 14/var(--tw-text-opacity,1))}.text-blue-600{--tw-text-opacity:1;color:rgb(37 99 235/var(--tw-text-opacity,1))}.text-emerald-600{--tw-text-opacity:1;color:rgb(5 150 105/var(--tw-text-opacity,1))}.text-emerald-700{--tw-text-opacity:1;color:rgb(4 120 87/var(--tw-text-opacity,1))}.text-indigo-600{--tw-text-opacity:1;color:rgb(79 70 229/var(--tw-text-opacity,1))}.text-indigo-700{--tw-text-opacity:1;color:rgb(67 56 202/var(--tw-text-opacity,1))}.text-inherit{color:inherit}.text-red-600{--tw-text-opacity:1;color:rgb(220 38 38/var(--tw-text-opacity,1))}.text-red-700{--tw-text-opacity:1;color:rgb(185 28 28/var(--tw-text-opacity,1))}.text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.text-zinc-100{--tw-text-opacity:1;color:rgb(244 244 245/var(--tw-text-opacity,1))}.text-zinc-400{--tw-text-opacity:1;color:rgb(161 161 170/var(--tw-text-opacity,1))}.text-zinc-500{--tw-text-opacity:1;color:rgb(113 113 122/var(--tw-text-opacity,1))}.text-zinc-600{--tw-text-opacity:1;color:rgb(82 82 91/var(--tw-text-opacity,1))}.text-zinc-700{--tw-text-opacity:1;color:rgb(63 63 70/var(--tw-text-opacity,1))}.text-zinc-800{--tw-text-opacity:1;color:rgb(39 39 42/var(--tw-text-opacity,1))}.text-zinc-900{--tw-text-opacity:1;color:rgb(24 24 27/var(--tw-text-opacity,1))}.underline{text-decoration-line:underline}.antialiased{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}.opacity-80{opacity:.8}.shadow{--tw-shadow:0 1px 3px 0 rgba(0,0,0,.1),0 1px 2px -1px rgba(0,0,0,.1);--tw-shadow-colored:0 1px 3px 0 var(--tw-shadow-color),0 1px 2px -1px var(--tw-shadow-color)}.shadow,.shadow-2xl{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-2xl{--tw-shadow:0 25px 50px -12px rgba(0,0,0,.25);--tw-shadow-colored:0 25px 50px -12px var(--tw-shadow-color)}.shadow-lg{--tw-shadow:0 10px 15px -3px rgba(0,0,0,.1),0 4px 6px -4px rgba(0,0,0,.1);--tw-shadow-colored:0 10px 15px -3px var(--tw-shadow-color),0 4px 6px -4px var(--tw-shadow-color)}.shadow-lg,.shadow-xl{box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-xl{--tw-shadow:0 20px 25px -5px rgba(0,0,0,.1),0 8px 10px -6px rgba(0,0,0,.1);--tw-shadow-colored:0 20px 25px -5px var(--tw-shadow-color),0 8px 10px -6px var(--tw-shadow-color)}.outline{outline-style:solid}.ring{--tw-ring-offset-shadow:var(--tw-ring-inset) 0 0 0 var(--tw-ring-offset-width) var(--tw-ring-offset-color);--tw-ring-shadow:var(--tw-ring-inset) 0 0 0 calc(3px + var(--tw-ring-offset-width)) var(--tw-ring-color);box-shadow:var(--tw-ring-offset-shadow),var(--tw-ring-shadow),var(--tw-shadow,0 0 #0000)}.blur{--tw-blur:blur(8px)}.blur,.filter{filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.transition{transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,-webkit-backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter,-webkit-backdrop-filter;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.ease-out{transition-timing-function:cubic-bezier(0,0,.2,1)}.empty\\:hidden:empty{display:none}.hover\\:bg-indigo-50:hover{--tw-bg-opacity:1;background-color:rgb(238 242 255/var(--tw-bg-opacity,1))}.hover\\:bg-red-50:hover{--tw-bg-opacity:1;background-color:rgb(254 242 242/var(--tw-bg-opacity,1))}.hover\\:bg-zinc-100:hover{--tw-bg-opacity:1;background-color:rgb(244 244 245/var(--tw-bg-opacity,1))}.hover\\:bg-zinc-50:hover{--tw-bg-opacity:1;background-color:rgb(250 250 250/var(--tw-bg-opacity,1))}.hover\\:text-red-500:hover{--tw-text-opacity:1;color:rgb(239 68 68/var(--tw-text-opacity,1))}.hover\\:text-red-600:hover{--tw-text-opacity:1;color:rgb(220 38 38/var(--tw-text-opacity,1))}.hover\\:text-zinc-600:hover{--tw-text-opacity:1;color:rgb(82 82 91/var(--tw-text-opacity,1))}.hover\\:text-zinc-700:hover{--tw-text-opacity:1;color:rgb(63 63 70/var(--tw-text-opacity,1))}.hover\\:underline:hover{text-decoration-line:underline}.disabled\\:opacity-50:disabled{opacity:.5}.dark\\:divide-zinc-800:is(.dark *)>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(39 39 42/var(--tw-divide-opacity,1))}.dark\\:border-indigo-800:is(.dark *){--tw-border-opacity:1;border-color:rgb(55 48 163/var(--tw-border-opacity,1))}.dark\\:border-zinc-600:is(.dark *){--tw-border-opacity:1;border-color:rgb(82 82 91/var(--tw-border-opacity,1))}.dark\\:border-zinc-700:is(.dark *){--tw-border-opacity:1;border-color:rgb(63 63 70/var(--tw-border-opacity,1))}.dark\\:border-zinc-800:is(.dark *){--tw-border-opacity:1;border-color:rgb(39 39 42/var(--tw-border-opacity,1))}.dark\\:bg-amber-900\\/30:is(.dark *){background-color:rgba(120,53,15,.3)}.dark\\:bg-emerald-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(6 78 59/var(--tw-bg-opacity,1))}.dark\\:bg-indigo-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(49 46 129/var(--tw-bg-opacity,1))}.dark\\:bg-indigo-900\\/30:is(.dark *){background-color:rgba(49,46,129,.3)}.dark\\:bg-indigo-900\\/40:is(.dark *){background-color:rgba(49,46,129,.4)}.dark\\:bg-red-900\\/30:is(.dark *){background-color:rgba(127,29,29,.3)}.dark\\:bg-zinc-600:is(.dark *){--tw-bg-opacity:1;background-color:rgb(82 82 91/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-700:is(.dark *){--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-800:is(.dark *){--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-800\\/50:is(.dark *){background-color:rgba(39,39,42,.5)}.dark\\:bg-zinc-900:is(.dark *){--tw-bg-opacity:1;background-color:rgb(24 24 27/var(--tw-bg-opacity,1))}.dark\\:bg-zinc-900\\/40:is(.dark *){background-color:rgba(24,24,27,.4)}.dark\\:text-amber-200:is(.dark *){--tw-text-opacity:1;color:rgb(253 230 138/var(--tw-text-opacity,1))}.dark\\:text-blue-400:is(.dark *){--tw-text-opacity:1;color:rgb(96 165 250/var(--tw-text-opacity,1))}.dark\\:text-emerald-200:is(.dark *){--tw-text-opacity:1;color:rgb(167 243 208/var(--tw-text-opacity,1))}.dark\\:text-indigo-200:is(.dark *){--tw-text-opacity:1;color:rgb(199 210 254/var(--tw-text-opacity,1))}.dark\\:text-indigo-300:is(.dark *){--tw-text-opacity:1;color:rgb(165 180 252/var(--tw-text-opacity,1))}.dark\\:text-indigo-400:is(.dark *){--tw-text-opacity:1;color:rgb(129 140 248/var(--tw-text-opacity,1))}.dark\\:text-red-300:is(.dark *){--tw-text-opacity:1;color:rgb(252 165 165/var(--tw-text-opacity,1))}.dark\\:text-red-400:is(.dark *){--tw-text-opacity:1;color:rgb(248 113 113/var(--tw-text-opacity,1))}.dark\\:text-zinc-100:is(.dark *){--tw-text-opacity:1;color:rgb(244 244 245/var(--tw-text-opacity,1))}.dark\\:text-zinc-200:is(.dark *){--tw-text-opacity:1;color:rgb(228 228 231/var(--tw-text-opacity,1))}.dark\\:text-zinc-300:is(.dark *){--tw-text-opacity:1;color:rgb(212 212 216/var(--tw-text-opacity,1))}.dark\\:text-zinc-400:is(.dark *){--tw-text-opacity:1;color:rgb(161 161 170/var(--tw-text-opacity,1))}.dark\\:text-zinc-500:is(.dark *){--tw-text-opacity:1;color:rgb(113 113 122/var(--tw-text-opacity,1))}.dark\\:hover\\:bg-indigo-900\\/40:hover:is(.dark *){background-color:rgba(49,46,129,.4)}.dark\\:hover\\:bg-red-900\\/30:hover:is(.dark *){background-color:rgba(127,29,29,.3)}.dark\\:hover\\:bg-zinc-700:hover:is(.dark *){--tw-bg-opacity:1;background-color:rgb(63 63 70/var(--tw-bg-opacity,1))}.dark\\:hover\\:bg-zinc-800:hover:is(.dark *){--tw-bg-opacity:1;background-color:rgb(39 39 42/var(--tw-bg-opacity,1))}.dark\\:hover\\:bg-zinc-800\\/50:hover:is(.dark *){background-color:rgba(39,39,42,.5)}.dark\\:hover\\:bg-zinc-800\\/60:hover:is(.dark *){background-color:rgba(39,39,42,.6)}.dark\\:hover\\:text-zinc-200:hover:is(.dark *){--tw-text-opacity:1;color:rgb(228 228 231/var(--tw-text-opacity,1))}@media (min-width:640px){.sm\\:mx-auto{margin-left:auto;margin-right:auto}.sm\\:my-4{margin-top:1em}.sm\\:mb-4,.sm\\:my-4{margin-bottom:1em}.sm\\:h-\\[calc\\(100dvh-2em\\)\\]{height:calc(100dvh - 2em)}.sm\\:max-w-4xl{max-width:56em}.sm\\:max-w-5xl{max-width:64em}.sm\\:max-w-6xl{max-width:72em}.sm\\:items-stretch{align-items:stretch}.sm\\:rounded-2xl{border-radius:1em}}`;
   /* @TAILWIND_CSS_END */
 
   const BASE_CSS = `
@@ -3748,6 +3793,7 @@ textarea { resize: none; }
         case 'ask_user_choice':             return `質問: ${a.question || ''}`;
         case 'request_existing_userscript': return '既存 UserScript の入力を要求';
         case 'output_userscript':           return 'UserScript を出力';
+        case 'show_image':                  return `画像を表示: ${a.caption || a.path || a.url || ''}`;
         default:                            return call.name;
       }
     },
@@ -4632,7 +4678,12 @@ textarea { resize: none; }
     },
 
     openScriptTab(code) {
-      const url = this._blobUrl(code);
+      this.openBlobTab(new Blob([code], { type: 'text/plain;charset=utf-8' }));
+    },
+
+    // Opens a Blob (a script, an image) in a new tab.
+    openBlobTab(blob) {
+      const url = URL.createObjectURL(blob);
       const gmOpen = (typeof GM_openInTab === 'function') ? GM_openInTab
         : (typeof GM !== 'undefined' && GM && typeof GM.openInTab === 'function') ? GM.openInTab.bind(GM)
         : null;
@@ -4696,6 +4747,11 @@ textarea { resize: none; }
         // output_userscript's ack carries no information the install card
         // above doesn't already show.
         if (fr.name === 'output_userscript' && fr.response && !fr.response.error) continue;
+        // show_image's result is the image itself.
+        if (fr.name === 'show_image' && fr.response && fr.response.shown) {
+          frag.appendChild(AgentsMode.renderImage(fr.response));
+          continue;
+        }
         const r = fr.response || {};
         let detail;
         try { detail = JSON.stringify(r, null, 2); } catch { detail = String(r); }
@@ -5207,16 +5263,22 @@ textarea { resize: none; }
 - Playwright (Node) と Chromium が入っている。グローバルにインストールされているので \`NODE_PATH=$(npm root -g) node test.js\` のように実行する。公開ページはサンドボックスの Chromium で開いてスクリプトを注入し、動作を確認する。GM_* API を使うスクリプトは簡単なスタブを用意して確認する。
 - ログインが必要なページや、サンドボックスから見え方が異なるページ (ボット対策・地域差など) は、run_snippet でユーザーのブラウザ上の挙動を確認する。
 - 確認が済んだら output_userscript でスクリプトを提出する。チャット本文にスクリプト全文を貼らない。
+- 画像 (動作確認のスクリーンショットなど) をユーザーに見せると分かりやすいときは、/mnt/session/outputs/ に保存してから show_image にそのパスを渡す。画像はユーザーのチャット画面に表示される。
 - 確認できなかった点があれば、最後の説明で正直に伝える。`,
     // Sandbox tool output kept in the transcript (the agent sees all of it).
     RESULT_KEEP_CHARS: 4000,
+    // Where a session's agent saves files the user should get (show_image
+    // reads images from here through the Files API).
+    OUTPUTS_DIR: '/mnt/session/outputs/',
+    IMAGE_MAX_BYTES: 10 * 1024 * 1024,
     // How long to wait for the session to settle after the user pressed stop.
     INTERRUPT_GRACE_MS: 20000,
 
     CHAT_PROMPT: `## 実行環境 (Agents API)
 - ユーザーはブラウザで Web ページを見ながら、このチャットであなたと会話している。
 - ユーザーメッセージの前に、ページの内容・ページで選択しているテキスト・添付ファイルが [見出し] 付きのブロックとして付くことがある。最後のブロックがユーザーの入力したメッセージ。
-- Web 検索や URL の取得は、ユーザーが有効にしたときだけ使える。`,
+- Web 検索や URL の取得は、ユーザーが有効にしたときだけ使える。
+- 画像を見せると分かりやすいときは、画像の URL (https) を show_image に渡すとユーザーのチャット画面に表示できる。`,
 
     enabled() { return !!Store.settings.agentsEnabled; },
     // Plain chats run on the Agents API when the user switched it on and the
@@ -5322,8 +5384,38 @@ textarea { resize: none; }
           default_config: { enabled: true, permission_policy: { type: 'auto' } },
           configs: [{ name: 'web_fetch', enabled: false }, { name: 'web_search', enabled: false }]
         },
-        ...custom
+        ...custom,
+        this.imageTool('userscript')
       ];
+    },
+
+    // show_image: puts an image in the user's chat. UserScript agents pass a
+    // file they saved under OUTPUTS_DIR (or a URL); chat agents have no
+    // sandbox tools, so a URL only.
+    imageTool(kind) {
+      const S = (description) => ({ type: 'STRING', description });
+      const properties = {
+        url: S('表示する画像の URL (https)。'),
+        caption: S('画像の下に表示する短い説明。省略可。')
+      };
+      let description;
+      if (kind === 'chat') {
+        description = '画像をユーザーのチャット画面に表示する。url に画像の URL (https) を渡す。PNG / JPEG / GIF / WebP、10 MB まで。1 回の呼び出しで 1 枚。';
+      } else {
+        properties.path = S(`サンドボックスに保存した画像ファイルのパス。${this.OUTPUTS_DIR} 以下であること (例: ${this.OUTPUTS_DIR}screenshot.png)。`);
+        description = `画像をユーザーのチャット画面に表示する。サンドボックスで作った画像 (Playwright のスクリーンショットなど) は ${this.OUTPUTS_DIR} に保存してから path に渡す (同じ名前で上書きすると前の画像が表示されることがあるので、毎回別のファイル名にする)。Web 上の画像は url に渡す。path と url はどちらか一方だけ指定する。PNG / JPEG / GIF / WebP、10 MB まで。1 回の呼び出しで 1 枚。`;
+      }
+      const decl = {
+        name: 'show_image', description,
+        parameters: { type: 'OBJECT', properties, required: kind === 'chat' ? ['url'] : [] }
+      };
+      const { eager_input_streaming, ...tool } = Claude.convertTools([decl])[0];
+      return Object.assign({ type: 'custom' }, tool);
+    },
+    // A plain-chat session's tools: the web tools the user switched on, and
+    // show_image.
+    chatTools(web) {
+      return [...this.webTools(web), this.imageTool('chat')];
     },
 
     // An error meaning the agent / environment / session an id points at no
@@ -5348,8 +5440,8 @@ textarea { resize: none; }
           // Sessions always override the prompt with the domain's / global
           // one, so this only matters when an agent is used elsewhere.
           system: () => `${DEFAULT_SETTINGS.globalSystemPrompt}\n\n${this.CHAT_PROMPT}`,
-          // Web search / fetch are switched on per session (see webTools).
-          tools: () => []
+          // Web search / fetch are switched on per session (see chatTools).
+          tools: () => [this.imageTool('chat')]
         };
       }
       return {
@@ -5520,7 +5612,7 @@ textarea { resize: none; }
         const overrides = Object.assign({}, agent.overrides || {});
         if (kind === 'chat') {
           overrides.system = this.chatSystemPrompt(host);
-          overrides.tools = this.webTools(web);
+          overrides.tools = this.chatTools(web);
         }
         return AgentsAPI.createSession({
           agent: Object.assign({
@@ -5556,7 +5648,21 @@ textarea { resize: none; }
         const sid = c && c.agent && c.agent.sessionId;
         if (!sid) continue;
         c.agent.sessionId = null;
-        this.deleteSession(sid);
+        this.deleteSessionFiles(sid).finally(() => this.deleteSession(sid));
+      }
+    },
+
+    // The files the session wrote to OUTPUTS_DIR (images it showed with
+    // show_image, among others) live on in the Files API; they go with the
+    // conversation. Best effort, like the session itself.
+    async deleteSessionFiles(sid) {
+      try {
+        const files = await AgentsAPI.listSessionFiles(sid);
+        for (const f of files) {
+          if (f && f.id) await AgentsAPI.deleteFile(f.id).catch((e) => console.warn('[aicx] could not delete session file', f.id, e));
+        }
+      } catch (e) {
+        console.warn('[aicx] could not list session files', sid, e);
       }
     },
 
@@ -5581,6 +5687,160 @@ textarea { resize: none; }
       } catch (e) {
         console.warn('[aicx] could not delete Agents session', sid, e);
       }
+    },
+
+    // ---- show_image -------------------------------------------------------
+    // Runs a show_image call: finds the image, loads it (checking it really
+    // is one) and reports what the chat shows. The response is also what the
+    // transcript keeps (and what a rebuilt transcript reads back), so it
+    // carries what renderImage needs to load the image again later.
+    async showImage(args, { sid, kind }) {
+      const caption = String(args.caption || '').trim().slice(0, 300) || undefined;
+      try {
+        if (args.path && args.url) return { error: 'path と url はどちらか一方だけ指定してください。' };
+        if (args.url) {
+          const u = this.checkImageUrl(args.url);
+          if (u.error) return u;
+          const img = await this.loadImage({ url: u.url });
+          return { shown: true, url: u.url, mime_type: img.mime, bytes: img.bytes, caption };
+        }
+        if (kind === 'chat') return { error: 'url に画像の URL を指定してください。' };
+        if (!args.path) return { error: 'path (サンドボックスの画像ファイル) か url を指定してください。' };
+        const rel = this.outputsRel(args.path);
+        if (!rel) return { error: `画像は ${this.OUTPUTS_DIR} 以下に保存して、そのパスを指定してください (例: ${this.OUTPUTS_DIR}screenshot.png)。` };
+        if (!/\.(png|jpe?g|gif|webp)$/i.test(rel)) return { error: '表示できるのは PNG / JPEG / GIF / WebP の画像です。' };
+        const file = await this.findOutputFile(sid, rel);
+        if (!file) return { error: `${this.OUTPUTS_DIR}${rel} が見つかりませんでした。ファイルを保存したか確認してください。` };
+        const img = await this.loadImage({ file_id: file.id });
+        return { shown: true, path: this.OUTPUTS_DIR + rel, file_id: file.id, mime_type: img.mime, bytes: img.bytes, caption };
+      } catch (e) {
+        return { error: (e && e.message) || String(e) };
+      }
+    },
+
+    // `path` relative to OUTPUTS_DIR, or '' when it points anywhere else.
+    outputsRel(path) {
+      const p = String(path || '').trim().replace(/\\/g, '/');
+      if (!p.startsWith(this.OUTPUTS_DIR)) return '';
+      const rel = p.slice(this.OUTPUTS_DIR.length);
+      if (!rel || rel.split('/').some((seg) => !seg || seg === '.' || seg === '..')) return '';
+      return rel;
+    },
+
+    // Image URLs are fetched from the user's browser, so only public https
+    // hosts, and without the site's cookies (see fetchImage).
+    checkImageUrl(raw) {
+      let u;
+      try { u = new URL(String(raw || '').trim()); } catch { return { error: 'url を URL として読み取れませんでした。' }; }
+      if (u.protocol !== 'https:') return { error: 'url には https の URL を指定してください。' };
+      const h = u.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+      const local = h === 'localhost' || /\.(localhost|local|internal|lan|home|arpa)$/.test(h)
+        || /^(0|10|127)\./.test(h) || /^192\.168\./.test(h) || /^172\.(1[6-9]|2\d|3[01])\./.test(h)
+        || /^169\.254\./.test(h) || /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(h)
+        || h === '::1' || /^f[cd][0-9a-f]{0,2}:/.test(h) || /^fe80:/.test(h)
+        || (!h.includes('.') && !h.includes(':'));
+      if (local) return { error: 'ローカルネットワークの URL の画像は表示できません。' };
+      return { url: u.href };
+    },
+
+    // The newest file the session wrote at OUTPUTS_DIR/`rel`. Output files
+    // appear in the Files API a few seconds after the session goes idle
+    // (which it does while waiting on this tool), so the lookup retries.
+    async findOutputFile(sid, rel) {
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      const base = rel.split('/').pop();
+      const newest = (list) => list.sort((a, b) => this.tsOf(b.created_at) - this.tsOf(a.created_at))[0] || null;
+      for (const wait of [0, 1000, 1500, 2000, 2500, 3000]) {
+        if (wait) await sleep(wait);
+        const files = (await AgentsAPI.listSessionFiles(sid)).filter((f) => f && f.id && typeof f.filename === 'string');
+        const exact = files.filter((f) => f.filename === rel || f.filename.endsWith(`/${rel}`));
+        const hit = newest(exact.length ? exact : files.filter((f) => f.filename.split('/').pop() === base));
+        if (hit) return hit;
+      }
+      return null;
+    },
+
+    // Images loaded during this page view, by source ('file:<id>' or
+    // 'url:<url>'): promises in `_images`, settled ones also in
+    // `_imagesReady` so a re-render can paint them without a flash. Nothing
+    // is written to storage; a reopened conversation loads them again.
+    _images: new Map(),
+    _imagesReady: new Map(),
+    imageKey(ref) { return ref.file_id ? `file:${ref.file_id}` : `url:${ref.url}`; },
+    loadImage(ref) {
+      const key = this.imageKey(ref);
+      let p = this._images.get(key);
+      if (!p) {
+        p = this.fetchImage(ref).then((img) => {
+          if (this._images.get(key) === p) this._imagesReady.set(key, img);
+          return img;
+        });
+        p.catch(() => { if (this._images.get(key) === p) this._images.delete(key); });
+        this._images.set(key, p);
+        while (this._images.size > 40) {
+          const oldest = this._images.keys().next().value;
+          this._images.delete(oldest);
+          this._imagesReady.delete(oldest);
+        }
+      }
+      return p;
+    },
+    async fetchImage(ref) {
+      let bytes;
+      if (ref.file_id) {
+        bytes = await AgentsAPI.downloadFile(ref.file_id);
+      } else {
+        const r = await gmRequestBytes({ url: ref.url, headers: { accept: 'image/png,image/jpeg,image/gif,image/webp,image/*;q=0.8' }, anonymous: true });
+        if (r.status < 200 || r.status >= 300) throw new Error(`画像を取得できませんでした (HTTP ${r.status})。`);
+        bytes = r.bytes;
+      }
+      if (!bytes || !bytes.byteLength) throw new Error('画像のデータを受け取れませんでした。');
+      if (bytes.byteLength > this.IMAGE_MAX_BYTES) throw new Error(`画像が大きすぎます (${(bytes.byteLength / 1048576).toFixed(1)} MB。上限は 10 MB)。`);
+      // Trust the bytes, not the file name or Content-Type.
+      const mime = this.sniffImage(new Uint8Array(bytes, 0, Math.min(16, bytes.byteLength)));
+      if (!mime) throw new Error('PNG / JPEG / GIF / WebP の画像ではありません。');
+      const blob = new Blob([bytes], { type: mime });
+      const dataUrl = await new Promise((resolve, reject) => {
+        const fr = new FileReader();
+        fr.onload = () => resolve(fr.result);
+        fr.onerror = () => reject(fr.error || new Error('画像を読み込めませんでした。'));
+        fr.readAsDataURL(blob);
+      });
+      return { dataUrl, blob, mime, bytes: bytes.byteLength };
+    },
+    sniffImage(b) {
+      const at = (i, ...xs) => xs.every((x, k) => b[i + k] === x);
+      if (at(0, 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) return 'image/png';
+      if (at(0, 0xff, 0xd8, 0xff)) return 'image/jpeg';
+      if (at(0, 0x47, 0x49, 0x46, 0x38)) return 'image/gif';
+      if (at(0, 0x52, 0x49, 0x46, 0x46) && at(8, 0x57, 0x45, 0x42, 0x50)) return 'image/webp';
+      return '';
+    },
+
+    // The chat's card for a show_image result; tapping the image opens it
+    // full size in a new tab.
+    renderImage(r) {
+      const fig = el('figure', { class: 'w-full my-2' });
+      const box = el('div', { class: 'inline-block max-w-full rounded-lg overflow-hidden border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800' });
+      fig.append(box);
+      if (r.caption) fig.append(el('figcaption', { class: 'mt-1 text-[11px] text-zinc-500 dark:text-zinc-400 break-words' }, r.caption));
+      const status = (t) => {
+        clear(box);
+        box.append(el('div', { class: 'px-3 py-4 text-[11px] text-zinc-500 dark:text-zinc-400' }, t));
+      };
+      const paint = (img) => {
+        clear(box);
+        const im = el('img', { src: img.dataUrl, alt: r.caption || '画像', class: 'block max-w-full h-auto max-h-96 cursor-zoom-in' });
+        im.addEventListener('click', () => UserScriptMode.openBlobTab(img.blob));
+        box.append(im);
+      };
+      const ref = r.file_id ? { file_id: r.file_id } : r.url ? { url: r.url } : null;
+      if (!ref) { status('画像の情報がありません'); return fig; }
+      const ready = this._imagesReady.get(this.imageKey(ref));
+      if (ready) { paint(ready); return fig; }
+      status('画像を読み込み中…');
+      this.loadImage(ref).then(paint, (e) => status(`画像を読み込めませんでした: ${(e && e.message) || e}`));
+      return fig;
     },
 
     // Processed-at timestamps carry up to nanoseconds; compare them as
@@ -6028,7 +6288,7 @@ textarea { resize: none; }
       } else if (kind === 'chat' && web && (!!web.search !== !!(st.web && st.web.search) || !!web.fetch !== !!(st.web && st.web.fetch))) {
         // The web toggles changed since the last turn: swap the session's
         // tools (allowed while it is idle, which it is between turns).
-        await AgentsAPI.updateSession(st.sessionId, { agent: { tools: this.webTools(web) } });
+        await AgentsAPI.updateSession(st.sessionId, { agent: { tools: this.chatTools(web) } });
         st.web = { search: !!web.search, fetch: !!web.fetch };
         save();
       }
@@ -6107,6 +6367,12 @@ textarea { resize: none; }
             if (replay) {
               response = { error: 'ページの再読み込みなどで、このツール呼び出しは実行されませんでした。必要ならもう一度呼び出してください。' };
               isError = true;
+            } else if (ev.name === 'show_image') {
+              const problem = Claude.validateInput(this.imageTool(kind).input_schema, call.args);
+              response = problem
+                ? { error: `ツール入力が不正です: ${problem}` }
+                : await this.showImage(call.args, { sid, kind });
+              isError = !!(response && response.error);
             } else {
               const decl = UserScriptMode.toolDeclarations().find((d) => d.name === ev.name);
               const schema = decl ? Claude.convertTools([decl])[0].input_schema : null;
@@ -8869,6 +9135,7 @@ textarea { resize: none; }
       info.append(el('p', {}, 'UserScript チャットでは、エージェントは Anthropic のクラウド上のサンドボックス (bash・Node.js・Playwright + Chromium) で、作ったスクリプトを実際に動かして確認しながら作業します。ページの調査は今までどおりこのタブで行います。'));
       info.append(el('p', {}, '「一般」タブの Claude API キーを使います。料金はトークン代と、エージェントが動いている間のサンドボックス稼働料金 ($0.08/時間) です。待機中は稼働料金はかかりません。'));
       info.append(el('p', {}, '会話の記録 (共有したページ内容・添付ファイル・作成したスクリプトを含む) は Anthropic 側のセッションに保存され、このデバイスには会話の一覧情報だけを保存します。同じワークスペースの API キーを使う他のデバイスからも、メニューや会話履歴から開けます。チャットを削除するとセッションも削除されます。'));
+      info.append(el('p', {}, 'エージェントは、サンドボックスで撮ったスクリーンショットや Web 上の画像をチャット画面に表示できます (show_image ツール)。サンドボックスの画像は Anthropic の Files API に保存され、チャットを削除すると一緒に削除されます。Web 上の画像は、このブラウザから Cookie を送らずに取得します。'));
       box.append(info);
 
       if (!AgentsAPI.available()) {
