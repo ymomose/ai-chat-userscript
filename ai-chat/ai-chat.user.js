@@ -2,7 +2,7 @@
 // @name         AI Chat Overlay
 // @name:ja      AI チャット オーバーレイ
 // @namespace    https://github.com/ym/userscripts/ai-chat
-// @version      2.3.0
+// @version      2.4.0
 // @description  Floating AI chat (Gemini / Claude) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode with secret-Gist publishing. Claude chats run on the Agents API, keeping transcripts server-side and shared across devices. Optimized for iOS Safari.
 // @description:ja Webページの内容を文脈として Gemini / Claude と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。作ったスクリプトはシークレット Gist に公開して URL からインストール・自動更新できる。Claude のチャットは Agents API で実行し、会話はサーバー側に保存して他のデバイスからも開ける。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
 // @author       ym
@@ -1197,6 +1197,12 @@
       const below = levels.filter((l) => CLAUDE_EFFORT_LEVELS.indexOf(l) <= want);
       if (below.length) return below.reduce((a, b) => (CLAUDE_EFFORT_LEVELS.indexOf(a) > CLAUDE_EFFORT_LEVELS.indexOf(b) ? a : b));
       return levels[0];
+    },
+
+    // The effort chats run `modelId` with: the Claude effort setting resolved
+    // against the levels the model offers ('' = the model's default).
+    chatEffort(modelId) {
+      return this.resolveEffort(Store.settings.claudeEffort, this.profile(modelId).effortLevels) || '';
     },
 
     // Gemini functionDeclarations (UPPERCASE OpenAPI types) → Claude tool
@@ -5202,10 +5208,7 @@ textarea { resize: none; }
     },
     effortOf(conv, mode) {
       if (conv && conv.agent && conv.agent.model) return conv.agent.effort || '';
-      if (this.kindOf(conv, mode) === 'chat') {
-        const model = Store.settings.model || '';
-        return Claude.resolveEffort(Store.settings.claudeEffort, Claude.profile(model).effortLevels) || '';
-      }
+      if (this.kindOf(conv, mode) === 'chat') return Claude.chatEffort(Store.settings.model || '');
       return Store.settings.agentsEffort || DEFAULT_SETTINGS.agentsEffort;
     },
     effortLabel(effort) { return effort ? `effort ${effort}` : 'effort 既定'; },
@@ -6565,7 +6568,9 @@ textarea { resize: none; }
         const tail = el('span', { class: 'shrink-0 text-zinc-500 dark:text-zinc-400' },
           AgentsMode.usesAgents(this.conv, this.mode)
             ? ` · ${AgentsMode.modelOf(this.conv, this.mode) || '(モデル未選択)'} (${AgentsMode.effortLabel(AgentsMode.effortOf(this.conv, this.mode))})`
-            : ` · ${Store.settings.model || '(モデル未選択)'}`);
+            : Providers.of(Store.settings.model || '') === 'anthropic'
+              ? ` · ${Store.settings.model} (${AgentsMode.effortLabel(Claude.chatEffort(Store.settings.model))})`
+              : ` · ${Store.settings.model || '(モデル未選択)'}`);
         titleSub.append(link, tail);
       };
       updateTitleSub();
@@ -6808,8 +6813,15 @@ textarea { resize: none; }
           btnModel.title = `Agents API モデル: ${id} / ${AgentsMode.effortLabel(eff)}`;
           return;
         }
-        btnModelLabel.textContent = Providers.abbreviate(Store.settings.model || '');
-        btnModel.title = `モデル: ${Store.settings.model || '(未選択)'}`;
+        const id = Store.settings.model || '';
+        if (Providers.of(id) === 'anthropic') {
+          const eff = Claude.chatEffort(id);
+          btnModelLabel.textContent = `${Providers.abbreviate(id)}${eff ? ` ${eff}` : ''}`;
+          btnModel.title = `モデル: ${id} / ${AgentsMode.effortLabel(eff)}`;
+          return;
+        }
+        btnModelLabel.textContent = Providers.abbreviate(id);
+        btnModel.title = `モデル: ${id || '(未選択)'}`;
       };
       paintModelBtn();
       let modelPopover = null;
@@ -6831,6 +6843,32 @@ textarea { resize: none; }
         modelBtnWrap.append(modelPopover);
         btnModel.setAttribute('aria-expanded', 'true');
         setTimeout(() => document.addEventListener('pointerdown', onModelDocDown, true), 0);
+        // Anchored to the button's left edge, the menu runs off the right
+        // side on phone-width screens; shift it back inside the viewport once
+        // its items (appended below) are laid out.
+        requestAnimationFrame(() => {
+          if (!modelPopover) return;
+          const r = modelPopover.getBoundingClientRect();
+          const shift = Math.max(0, Math.min(r.right - (window.innerWidth - 8), r.left - 8));
+          if (shift) modelPopover.style.left = `${-shift}px`;
+        });
+
+        const item = (label, sub, active, onClick) => {
+          const b = el('button', {
+            type: 'button',
+            class: `w-full text-left px-3 py-2 rounded flex items-start gap-2 aicx-tap ${active ? 'bg-indigo-50 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-200' : 'hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200'}`,
+            role: 'menuitemradio', 'aria-checked': active ? 'true' : 'false'
+          });
+          const mark = el('span', { class: 'w-3.5 h-3.5 inline-flex items-center justify-center shrink-0 mt-0.5' });
+          if (active) mark.appendChild(icon('check', 'w-3.5 h-3.5'));
+          const t = el('div', { class: 'flex-1 min-w-0' });
+          t.append(el('div', { class: 'text-xs font-medium truncate' }, label));
+          if (sub) t.append(el('div', { class: 'text-[10px] text-zinc-500 dark:text-zinc-400 truncate' }, sub));
+          b.append(mark, t);
+          b.addEventListener('click', onClick);
+          return b;
+        };
+        const head = (t) => el('div', { class: 'px-3 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-500' }, t);
 
         // Agents API UserScript chats: model + effort for the session. A
         // session keeps the model it was created with, so once one exists the
@@ -6846,22 +6884,6 @@ textarea { resize: none; }
             updateTitleSub();
             closeModelPop();
           };
-          const item = (label, sub, active, onClick) => {
-            const b = el('button', {
-              type: 'button',
-              class: `w-full text-left px-3 py-2 rounded flex items-start gap-2 aicx-tap ${active ? 'bg-indigo-50 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-200' : 'hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200'}`,
-              role: 'menuitemradio', 'aria-checked': active ? 'true' : 'false'
-            });
-            const mark = el('span', { class: 'w-3.5 h-3.5 inline-flex items-center justify-center shrink-0 mt-0.5' });
-            if (active) mark.appendChild(icon('check', 'w-3.5 h-3.5'));
-            const t = el('div', { class: 'flex-1 min-w-0' });
-            t.append(el('div', { class: 'text-xs font-medium truncate' }, label));
-            if (sub) t.append(el('div', { class: 'text-[10px] text-zinc-500 dark:text-zinc-400 truncate' }, sub));
-            b.append(mark, t);
-            b.addEventListener('click', onClick);
-            return b;
-          };
-          const head = (t) => el('div', { class: 'px-3 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-500' }, t);
           if (locked) {
             modelPopover.append(el('div', { class: 'text-[11px] text-zinc-500 px-3 py-2' },
               `このチャットは ${AgentsMode.modelOf(this.conv)} / ${AgentsMode.effortLabel(AgentsMode.effortOf(this.conv))} で実行中です。変更は新しい UserScript チャットから反映されます。`));
@@ -6876,35 +6898,21 @@ textarea { resize: none; }
         }
 
         const models = Store.settings.addedModels || [];
-        // A plain chat running on an Agents session keeps its model; the
-        // picker then only sets the model for new chats.
+        // A plain chat running on an Agents session keeps its model and
+        // effort; the picker then only sets them for new chats.
         const runningOn = this.conv && this.conv.engine === 'agents' ? AgentsMode.modelOf(this.conv) : '';
         if (runningOn) {
           modelPopover.append(el('div', { class: 'text-[11px] text-zinc-500 px-3 py-2' },
-            `このチャットは Agents API の ${runningOn} で実行中です。ここでの変更は新しいチャットから反映されます。`));
+            `このチャットは Agents API の ${runningOn} / ${AgentsMode.effortLabel(AgentsMode.effortOf(this.conv))} で実行中です。ここでの変更は新しいチャットから反映されます。`));
         }
         if (!models.length) {
           modelPopover.append(el('div', { class: 'text-xs text-zinc-500 p-3' }, '使用するモデルが追加されていません。設定画面の「一般」タブから追加してください。'));
           return;
         }
         const current = Store.settings.model || '';
+        modelPopover.append(head('モデル'));
         for (const m of models) {
-          const active = m.id === current;
-          const item = el('button', {
-            type: 'button',
-            class: `w-full text-left px-3 py-2 rounded flex items-start gap-2 aicx-tap ${active ? 'bg-indigo-50 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-200' : 'hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200'}`,
-            role: 'menuitemradio',
-            'aria-checked': active ? 'true' : 'false'
-          });
-          const mark = el('span', { class: 'w-3.5 h-3.5 inline-flex items-center justify-center shrink-0 mt-0.5' });
-          if (active) mark.appendChild(icon('check', 'w-3.5 h-3.5'));
-          const text = el('div', { class: 'flex-1 min-w-0' });
-          text.append(
-            el('div', { class: 'text-xs font-medium truncate' }, m.display || m.id),
-            el('div', { class: 'text-[10px] text-zinc-500 dark:text-zinc-400 truncate' }, `${Providers.label(Providers.of(m.id))} · ${m.id}`)
-          );
-          item.append(mark, text);
-          item.addEventListener('click', async () => {
+          modelPopover.append(item(m.display || m.id, `${Providers.label(Providers.of(m.id))} · ${m.id}`, m.id === current, async () => {
             if (Store.settings.model !== m.id) {
               Store.settings.model = m.id;
               await Store.saveSettings();
@@ -6912,9 +6920,34 @@ textarea { resize: none; }
               updateTitleSub();
             }
             closeModelPop();
-          });
-          modelPopover.append(item);
+          }));
         }
+
+        // Claude models: the effort setting (shared with Settings → Claude
+        // API), offering only the levels the selected model has. Messages API
+        // chats pick it up on the next send; Agents chats with a session
+        // already created, from the next new chat.
+        if (Providers.of(current) !== 'anthropic') return;
+        modelPopover.append(head('effort'));
+        const levels = Claude.profile(current).effortLevels;
+        if (!levels.length) {
+          modelPopover.append(el('div', { class: 'text-[11px] text-zinc-500 px-3 py-2' }, 'このモデルは effort の指定に対応していません。'));
+          return;
+        }
+        const curEffort = Claude.chatEffort(current);
+        const effortSub = { low: '速い・低コスト', max: '最も深い・高コスト' };
+        const pickEffort = async (value) => {
+          if ((Store.settings.claudeEffort || '') !== value) {
+            Store.settings.claudeEffort = value;
+            await Store.saveSettings();
+            if (runningOn) UI.toast('このチャットのセッションは作成済みのため、新しいチャットから反映されます', 'info');
+            paintModelBtn();
+            updateTitleSub();
+          }
+          closeModelPop();
+        };
+        modelPopover.append(item('既定', 'モデルの既定', !curEffort, () => pickEffort('')));
+        for (const e of levels) modelPopover.append(item(e, effortSub[e] || null, e === curEffort, () => pickEffort(e)));
       });
       modelBtnWrap.append(btnModel);
 
@@ -8408,7 +8441,7 @@ textarea { resize: none; }
         { value: 'max', label: 'max (最も深い・高コスト)' }
       ], Store.settings.claudeEffort || '', (v) => { Store.settings.claudeEffort = v; Store.saveSettings(); }));
       effortWrap.append(el('p', { class: 'text-[11px] text-zinc-500 mt-1' },
-        'Claude がどれだけ深く考えてから答えるか。高いほど難しい課題の精度が上がる一方、応答が遅く・高コストになります。モデルが対応していない段階は近い段階に自動で調整されます。Gemini には適用されません。'));
+        'Claude がどれだけ深く考えてから答えるか。高いほど難しい課題の精度が上がる一方、応答が遅く・高コストになります。モデルが対応していない段階は近い段階に自動で調整されます。Gemini には適用されません。チャット画面のモデルボタンからも変更できます (Agents API で実行中のチャットでは、次に作成するチャットから反映されます)。'));
       claudeBlock.append(effortWrap);
       box.append(claudeBlock);
 
