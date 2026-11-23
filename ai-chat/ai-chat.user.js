@@ -2,7 +2,7 @@
 // @name         AI Chat Overlay
 // @name:ja      AI チャット オーバーレイ
 // @namespace    https://github.com/ym/userscripts/ai-chat
-// @version      2.8.0
+// @version      2.9.0
 // @description  Floating AI chat (Gemini / Claude) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode with secret-Gist publishing. Claude chats can optionally run on the Agents API, keeping transcripts server-side and shared across devices. Optimized for iOS Safari.
 // @description:ja Webページの内容を文脈として Gemini / Claude と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。作ったスクリプトはシークレット Gist に公開して URL からインストール・自動更新できる。Claude のチャットは Agents API でも実行でき、その場合は会話をサーバー側に保存して他のデバイスからも開ける。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
 // @author       ym
@@ -432,7 +432,7 @@
         messages: [],
         agent: {
           kind: a.kind, sessionId: a.sessionId || null, model: a.model, effort: a.effort,
-          budgetCents: a.budgetCents, costCents: a.costCents || 0, web: a.web
+          budgetCents: a.budgetCents, costCents: a.costCents || 0, toolsRev: a.toolsRev
         }
       };
     },
@@ -5262,7 +5262,8 @@ textarea { resize: none; }
     AGENT_NAME: 'AI Chat Overlay — UserScript',
     SANDBOX_PROMPT: `## 実行環境 (Agents API)
 - あなたは Anthropic のクラウド上のサンドボックス (Ubuntu / Node.js 22 / Python) で bash とファイル操作 (read / write / edit / glob / grep) を使える。サンドボックスはユーザーのブラウザとは別のマシンで、ユーザーのログイン状態や Cookie は無い。
-- ユーザーが開いているページの調査には、カスタムツール (get_page_info / query_selector / get_page_html / fetch_resource / run_snippet / pick_element / ask_user_choice / request_existing_userscript) を使う。サンドボックスからユーザーのタブは操作できない。
+- Web 検索 (web_search) と URL の取得 (web_fetch) も使える。ライブラリや API の仕様、サイトの公開情報を調べるときに使う。
+- ユーザーが開いているページの調査には、カスタムツール (get_page_info / query_selector / get_page_html / fetch_resource / run_snippet / pick_element / ask_user_choice / request_existing_userscript) を使う。サンドボックスや web_fetch からユーザーのタブは操作できず、ユーザーと同じ見え方になるとも限らない。
 - 各ユーザーメッセージの先頭に、送信時点でユーザーが開いているページの URL・タイトル・推奨 @match が付いている。
 - 作成したスクリプトは /workspace に保存し、\`node --check\` で構文を確認する。
 - Playwright (Node) と Chromium が入っている。グローバルにインストールされているので \`NODE_PATH=$(npm root -g) node test.js\` のように実行する。公開ページはサンドボックスの Chromium で開いてスクリプトを注入し、動作を確認する。GM_* API を使うスクリプトは簡単なスタブを用意して確認する。
@@ -5285,8 +5286,9 @@ textarea { resize: none; }
     CHAT_PROMPT: `## 実行環境 (Agents API)
 - ユーザーはブラウザで Web ページを見ながら、このチャットであなたと会話している。
 - ユーザーメッセージの前に、ページの内容・ページで選択しているテキスト・添付ファイルが [見出し] 付きのブロックとして付くことがある。最後のブロックがユーザーの入力したメッセージ。
-- Web 検索や URL の取得は、ユーザーが有効にしたときだけ使える。
-- 画像を見せると分かりやすいときは、画像の URL (https) を show_image に渡すとユーザーのチャット画面に表示できる。`,
+- Web 検索 (web_search) と URL の取得 (web_fetch) を使える。最新の情報や、共有されたページの内容だけでは分からないことを調べるときに使う。
+- Anthropic のクラウド上のサンドボックス (Ubuntu / Node.js / Python) で bash とファイル操作 (read / write / edit / glob / grep) も使える。計算、データの集計・変換、コードの実行や確認に使う。サンドボックスはユーザーのブラウザとは別のマシンで、ユーザーのログイン状態や Cookie は無く、ユーザーのタブも操作できない。
+- 画像を見せると分かりやすいときは show_image でユーザーのチャット画面に表示できる。サンドボックスで作った画像 (グラフなど) は /mnt/session/outputs/ に保存してから path に、Web 上の画像は URL を url に渡す。`,
 
     enabled() { return !!Store.settings.agentsEnabled; },
     // Plain chats run on the Agents API when the user switched it on and the
@@ -5381,49 +5383,54 @@ textarea { resize: none; }
       return `${base}\n\n${this.SANDBOX_PROMPT}`;
     },
 
+    // Revision of the tools sessions run with. A session created with an
+    // older set (conv.agent.toolsRev) is given the current one on its next
+    // turn (see run()). 2: the whole agent toolset for both kinds.
+    TOOLS_REV: 2,
+
+    // The agent toolset with every tool it has at its default (bash, read,
+    // write, edit, glob, grep, web_fetch, web_search). Under the `auto`
+    // permission policy a call that can't be cleared as safe waits for the
+    // user's OK (the confirmation dialog of the run's tracker).
+    toolset() {
+      return { type: 'agent_toolset_20260401', default_config: { enabled: true, permission_policy: { type: 'auto' } } };
+    },
+
     tools() {
       // Same declarations as the local loop. Managed Agents custom tools take
       // no `eager_input_streaming`.
       const custom = Claude.convertTools(UserScriptMode.toolDeclarations())
         .map(({ eager_input_streaming, ...t }) => Object.assign({ type: 'custom' }, t));
-      return [
-        {
-          type: 'agent_toolset_20260401',
-          default_config: { enabled: true, permission_policy: { type: 'auto' } },
-          configs: [{ name: 'web_fetch', enabled: false }, { name: 'web_search', enabled: false }]
-        },
-        ...custom,
-        this.imageTool('userscript')
-      ];
+      return [this.toolset(), ...custom, this.imageTool()];
     },
 
-    // show_image: puts an image in the user's chat. UserScript agents pass a
-    // file they saved under OUTPUTS_DIR (or a URL); chat agents have no
-    // sandbox tools, so a URL only.
-    imageTool(kind) {
+    // show_image: puts an image in the user's chat — a file the agent saved
+    // under OUTPUTS_DIR in its sandbox, or a URL.
+    imageTool() {
       const S = (description) => ({ type: 'STRING', description });
-      const properties = {
-        url: S('表示する画像の URL (https)。'),
-        caption: S('画像の下に表示する短い説明。省略可。')
-      };
-      let description;
-      if (kind === 'chat') {
-        description = '画像をユーザーのチャット画面に表示する。url に画像の URL (https) を渡す。PNG / JPEG / GIF / WebP、10 MB まで。1 回の呼び出しで 1 枚。';
-      } else {
-        properties.path = S(`サンドボックスに保存した画像ファイルのパス。${this.OUTPUTS_DIR} 以下であること (例: ${this.OUTPUTS_DIR}screenshot.png)。`);
-        description = `画像をユーザーのチャット画面に表示する。サンドボックスで作った画像 (Playwright のスクリーンショットなど) は ${this.OUTPUTS_DIR} に保存してから path に渡す (同じ名前で上書きすると前の画像が表示されることがあるので、毎回別のファイル名にする)。Web 上の画像は url に渡す。path と url はどちらか一方だけ指定する。PNG / JPEG / GIF / WebP、10 MB まで。1 回の呼び出しで 1 枚。`;
-      }
       const decl = {
-        name: 'show_image', description,
-        parameters: { type: 'OBJECT', properties, required: kind === 'chat' ? ['url'] : [] }
+        name: 'show_image',
+        description: `画像をユーザーのチャット画面に表示する。サンドボックスで作った画像 (スクリーンショットやグラフなど) は ${this.OUTPUTS_DIR} に保存してから path に渡す (同じ名前で上書きすると前の画像が表示されることがあるので、毎回別のファイル名にする)。Web 上の画像は url に渡す。path と url はどちらか一方だけ指定する。PNG / JPEG / GIF / WebP、10 MB まで。1 回の呼び出しで 1 枚。`,
+        parameters: {
+          type: 'OBJECT',
+          properties: {
+            path: S(`サンドボックスに保存した画像ファイルのパス。${this.OUTPUTS_DIR} 以下であること (例: ${this.OUTPUTS_DIR}chart.png)。`),
+            url: S('表示する画像の URL (https)。'),
+            caption: S('画像の下に表示する短い説明。省略可。')
+          },
+          required: []
+        }
       };
       const { eager_input_streaming, ...tool } = Claude.convertTools([decl])[0];
       return Object.assign({ type: 'custom' }, tool);
     },
-    // A plain-chat session's tools: the web tools the user switched on, and
-    // show_image.
-    chatTools(web) {
-      return [...this.webTools(web), this.imageTool('chat')];
+    // A plain-chat session's tools: the agent toolset and show_image.
+    chatTools() {
+      return [this.toolset(), this.imageTool()];
+    },
+    // The tools a session of `kind` ('userscript' / 'chat') runs with.
+    toolsOf(kind) {
+      return kind === 'chat' ? this.chatTools() : this.tools();
     },
 
     // An error meaning the agent / environment / session an id points at no
@@ -5448,8 +5455,7 @@ textarea { resize: none; }
           // Sessions always override the prompt with the domain's / global
           // one, so this only matters when an agent is used elsewhere.
           system: () => `${DEFAULT_SETTINGS.globalSystemPrompt}\n\n${this.CHAT_PROMPT}`,
-          // Web search / fetch are switched on per session (see chatTools).
-          tools: () => [this.imageTool('chat')]
+          tools: () => this.chatTools()
         };
       }
       return {
@@ -5489,17 +5495,6 @@ textarea { resize: none; }
           metadata: { app: AGENTS_APP, kind: p.kind, config_hash: hash, script_version: scriptVersion() || '0' }
         }
       };
-    },
-
-    // Tools of a plain-chat session: the agent toolset with only the web
-    // tools the user switched on (none → no tools at all).
-    webTools(web) {
-      if (!web || (!web.search && !web.fetch)) return [];
-      return [{
-        type: 'agent_toolset_20260401',
-        default_config: { enabled: false },
-        configs: [{ name: 'web_search', enabled: !!web.search }, { name: 'web_fetch', enabled: !!web.fetch }]
-      }];
     },
 
     // The plain-chat system prompt for a page's domain.
@@ -5610,8 +5605,9 @@ textarea { resize: none; }
 
     // `host` and `kind` go into the session's metadata so the conversation
     // can be listed (and reopened) on other devices. Plain chats also get
-    // the domain's system prompt and the web tools the user switched on.
-    async createSession(conv, { host, web } = {}) {
+    // the domain's system prompt, and their tools are always set here (the
+    // shared chat agent may have been written by another copy).
+    async createSession(conv, { host } = {}) {
       const kind = this.kindOf(conv);
       const create = async () => {
         const agent = await this.ensureAgent(kind);
@@ -5620,7 +5616,7 @@ textarea { resize: none; }
         const overrides = Object.assign({}, agent.overrides || {});
         if (kind === 'chat') {
           overrides.system = this.chatSystemPrompt(host);
-          overrides.tools = this.chatTools(web);
+          overrides.tools = this.chatTools();
         }
         return AgentsAPI.createSession({
           agent: Object.assign({
@@ -5703,7 +5699,7 @@ textarea { resize: none; }
     // is one) and reports what the chat shows. The response is also what the
     // transcript keeps (and what a rebuilt transcript reads back), so it
     // carries what renderImage needs to load the image again later.
-    async showImage(args, { sid, kind }) {
+    async showImage(args, { sid }) {
       const caption = String(args.caption || '').trim().slice(0, 300) || undefined;
       try {
         if (args.path && args.url) return { error: 'path と url はどちらか一方だけ指定してください。' };
@@ -5713,7 +5709,6 @@ textarea { resize: none; }
           const img = await this.loadImage({ url: u.url });
           return { shown: true, url: u.url, mime_type: img.mime, bytes: img.bytes, caption };
         }
-        if (kind === 'chat') return { error: 'url に画像の URL を指定してください。' };
         if (!args.path) return { error: 'path (サンドボックスの画像ファイル) か url を指定してください。' };
         const rel = this.outputsRel(args.path);
         if (!rel) return { error: `画像は ${this.OUTPUTS_DIR} 以下に保存して、そのパスを指定してください (例: ${this.OUTPUTS_DIR}screenshot.png)。` };
@@ -6401,10 +6396,10 @@ textarea { resize: none; }
         if (how === 'decline') {
           response = { error: 'このツール呼び出しには応答できませんでした (別のデバイスやページの再読み込みで中断)。必要ならもう一度呼び出してください。' };
         } else if (call.name === 'show_image') {
-          const problem = Claude.validateInput(this.imageTool(kind).input_schema, call.args);
+          const problem = Claude.validateInput(this.imageTool().input_schema, call.args);
           response = problem
             ? { error: `ツール入力が不正です: ${problem}` }
-            : await this.showImage(call.args, { sid: t.sid, kind });
+            : await this.showImage(call.args, { sid: t.sid });
         } else {
           const decl = UserScriptMode.toolDeclarations().find((d) => d.name === call.name);
           const schema = decl ? Claude.convertTools([decl])[0].input_schema : null;
@@ -6763,7 +6758,7 @@ textarea { resize: none; }
     // `onPending(msg)` tells the caller which message to annotate if this
     // throws. Resolves when the session settles (end of turn, stop, budget
     // pause the user declined, or termination).
-    async run({ conv, host, panel, userMsg, text, selection, snapText, attachments, web, onPending, aborter }) {
+    async run({ conv, host, panel, userMsg, text, selection, snapText, attachments, onPending, aborter }) {
       const t = this._tracker({ conv, host, panel, onPending });
       const { st, kind } = t;
 
@@ -6789,18 +6784,12 @@ textarea { resize: none; }
         st.cursor = null;
         st.seen = [];
         st.unanswered = [];
-        session = await this.createSession(conv, { host, web });
+        session = await this.createSession(conv, { host });
         st.sessionId = session.id;
-        st.web = { search: !!(web && web.search), fetch: !!(web && web.fetch) };
+        st.toolsRev = this.TOOLS_REV;
         t.newSession();
         // The transcript of a session created here is the one in memory.
         this._loaded.add(conv.id);
-        t.save();
-      } else if (kind === 'chat' && web && (!!web.search !== !!(st.web && st.web.search) || !!web.fetch !== !!(st.web && st.web.fetch))) {
-        // The web toggles changed since the last turn: swap the session's
-        // tools (allowed while it is idle, which it is between turns).
-        await AgentsAPI.updateSession(st.sessionId, { agent: { tools: this.chatTools(web) } });
-        st.web = { search: !!web.search, fetch: !!web.fetch };
         t.save();
       }
       t.sid = st.sessionId;
@@ -6825,6 +6814,20 @@ textarea { resize: none; }
           t.clearPending();
           t.view();
           return;
+        }
+
+        // A session created with an older tool set gets the current one
+        // (allowed while it is idle, which it is between turns). Best
+        // effort: if the swap fails, this turn runs with the tools the
+        // session has and the next one tries again.
+        if ((st.toolsRev || 0) < this.TOOLS_REV) {
+          try {
+            await AgentsAPI.updateSession(t.sid, { agent: { tools: this.toolsOf(kind) } });
+            st.toolsRev = this.TOOLS_REV;
+            t.save();
+          } catch (e) {
+            console.warn('[aicx] could not update the session tools:', e);
+          }
         }
 
         await t.follow({
@@ -7322,15 +7325,19 @@ textarea { resize: none; }
           : 'Agents API (会話はサーバーのセッションに保存され、他のデバイスからも開けます)'
       }, 'Agents');
       const paintAgentsChip = () => agentsChip.classList.toggle('hidden', !AgentsMode.usesAgents(this.conv, this.mode));
+      // Shows / hides the composer's web toggles; set once they exist.
+      let paintWebTools = () => {};
       titleRow.append(agentsChip, titleTop);
       const titleSub = el('div', { class: 'text-[11px] text-zinc-500 dark:text-zinc-400 flex items-center gap-1 min-w-0' });
       // Rebuild the subtitle from the stored pageUrl/pageTitle on the conv
       // (set at first-send time) so reopening a stored conversation on a
       // different page still shows the page it was originally about. The
-      // Agents chip follows along: model / engine changes and the first send
-      // all come through here.
+      // Agents chip (and the web toggles, which Agents chats don't use)
+      // follow along: model / engine changes and the first send all come
+      // through here.
       const updateTitleSub = () => {
         paintAgentsChip();
+        paintWebTools();
         clear(titleSub);
         const pageUrl = (this.conv && this.conv.pageUrl) || location.href;
         const pageTitle = (this.conv && this.conv.pageTitle) || document.title || pageUrl;
@@ -7496,6 +7503,14 @@ textarea { resize: none; }
         this.urlContext = !this.urlContext;
         updateUrlCtxBtn();
       });
+      // Agents chats always have web search / fetch (agent toolset), so the
+      // toggles are hidden there.
+      paintWebTools = () => {
+        const agents = AgentsMode.usesAgents(this.conv, this.mode);
+        btnWeb.classList.toggle('hidden', agents);
+        btnUrlCtx.classList.toggle('hidden', agents);
+      };
+      paintWebTools();
 
       // Extraction-mode picker — lets the user switch the extraction mode
       // (including "抽出なし", which turns off page-context injection
@@ -8530,6 +8545,8 @@ textarea { resize: none; }
       const effort = this.currentEffort(model);
       // The web toggles are read once: they belong to the panel, which may
       // be showing a different conversation by the time a later round runs.
+      // Agents sessions ignore them: web search / fetch are part of the
+      // agent toolset they always have.
       const webSearch = !!this.webGrounding;
       const webFetch = !!this.urlContext;
 
@@ -8540,7 +8557,6 @@ textarea { resize: none; }
             selection: selectedText || '',
             snapText: pendingSnap ? Page.formatForPrompt(pendingSnap) : '',
             attachments: userMsg.attachments || [],
-            web: { search: webSearch, fetch: webFetch },
             onPending: (m) => { pending = m; },
             aborter
           });
@@ -9624,6 +9640,7 @@ textarea { resize: none; }
       const info = el('div', { class: 'text-xs text-zinc-500 space-y-1' });
       info.append(el('p', {}, '下のスイッチをオンにすると、新しく始める通常のチャット (Claude のモデルのみ。Gemini は対象外) や UserScript チャットを Claude の Agents API (Managed Agents) で実行します。オフのときは Messages API で実行し、会話はこのデバイスに保存します。通常のチャットの切り替えは、チャット画面のモデルボタンからもできます。'));
       info.append(el('p', {}, 'UserScript チャットでは、エージェントは Anthropic のクラウド上のサンドボックス (bash・Node.js・Playwright + Chromium) で、作ったスクリプトを実際に動かして確認しながら作業します。ページの調査は今までどおりこのタブで行います。'));
+      info.append(el('p', {}, 'どちらのチャットでも、エージェントは既定のツール (サンドボックスでの bash・ファイル操作、Web 検索、URL の取得) をすべて使えます。自動で安全と判断できない操作は、実行前に確認ダイアログを表示します。作成済みの会話も、次に送信したときに同じツール構成に切り替わります。'));
       info.append(el('p', {}, '「一般」タブの Claude API キーを使います。料金はトークン代と、エージェントが動いている間のサンドボックス稼働料金 ($0.08/時間) です。待機中は稼働料金はかかりません。'));
       info.append(el('p', {}, '会話の記録 (共有したページ内容・添付ファイル・作成したスクリプトを含む) は Anthropic 側のセッションに保存され、このデバイスには会話の一覧情報だけを保存します。同じワークスペースの API キーを使う他のデバイスからも、メニューや会話履歴から開けます。チャットを削除するとセッションも削除されます。'));
       info.append(el('p', {}, 'エージェントは、サンドボックスで撮ったスクリーンショットや Web 上の画像をチャット画面に表示できます (show_image ツール)。サンドボックスの画像は Anthropic の Files API に保存され、チャットを削除すると一緒に削除されます。Web 上の画像は、このブラウザから Cookie を送らずに取得します。'));
