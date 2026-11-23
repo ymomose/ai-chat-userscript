@@ -2,7 +2,7 @@
 // @name         AI Chat Overlay
 // @name:ja      AI チャット オーバーレイ
 // @namespace    https://github.com/ym/userscripts/ai-chat
-// @version      2.7.0
+// @version      2.8.0
 // @description  Floating AI chat (Gemini / Claude) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode with secret-Gist publishing. Claude chats can optionally run on the Agents API, keeping transcripts server-side and shared across devices. Optimized for iOS Safari.
 // @description:ja Webページの内容を文脈として Gemini / Claude と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。作ったスクリプトはシークレット Gist に公開して URL からインストール・自動更新できる。Claude のチャットは Agents API でも実行でき、その場合は会話をサーバー側に保存して他のデバイスからも開ける。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
 // @author       ym
@@ -5253,6 +5253,11 @@ textarea { resize: none; }
   // (assistant turns with functionCalls, `_tool` turns with
   // functionResponses), so the existing renderer and install cards apply.
   // Sandbox tools appear under the name `sandbox.<tool>`.
+  //
+  // The session outlives the page: when the page driving a run is reloaded
+  // (or another tab / device drives it), opening the conversation again
+  // reopens the SSE feed and follows the run live (resume(); which page
+  // answers the session's requests is settled by AgentsLive).
   const AgentsMode = {
     AGENT_NAME: 'AI Chat Overlay — UserScript',
     SANDBOX_PROMPT: `## 実行環境 (Agents API)
@@ -5273,6 +5278,9 @@ textarea { resize: none; }
     IMAGE_MAX_BYTES: 10 * 1024 * 1024,
     // How long to wait for the session to settle after the user pressed stop.
     INTERRUPT_GRACE_MS: 20000,
+    // How often a run watching another tab checks whether that tab is gone
+    // (and the run should be taken over here).
+    TAKEOVER_CHECK_MS: 5000,
 
     CHAT_PROMPT: `## 実行環境 (Agents API)
 - ユーザーはブラウザで Web ページを見ながら、このチャットであなたと会話している。
@@ -5648,6 +5656,7 @@ textarea { resize: none; }
         const sid = c && c.agent && c.agent.sessionId;
         if (!sid) continue;
         c.agent.sessionId = null;
+        AgentsLive.drop(c.id);
         this.deleteSessionFiles(sid).finally(() => this.deleteSession(sid));
       }
     },
@@ -5952,18 +5961,61 @@ textarea { resize: none; }
       return out;
     },
 
+    // The messages one user.message shows as: the page it shared as a
+    // context banner (with the hidden ack the renderer skips), then what the
+    // user typed.
+    userTurn(ev, at) {
+      const p = this.parseUserContent(ev.content);
+      const out = [];
+      if (p.page) {
+        out.push({ id: uid(), role: 'user', _synthetic: true, _contextUrl: p.page.url, _contextTitle: p.page.title, content: p.page.text, createdAt: at });
+        out.push({ id: uid(), role: 'assistant', _synthetic: true, content: '(context received)', createdAt: at });
+      }
+      out.push({
+        id: uid(), role: 'user', content: p.text, createdAt: at,
+        attachments: p.attachments.length ? p.attachments : undefined,
+        selection: p.selection || undefined
+      });
+      return out;
+    },
+
+    // Whether the session has nothing left to do once `ev` happened, given
+    // whether it had before (`prev`): a turn or a request's answer sets it
+    // working, an idle that waits on no request (or termination) settles
+    // it. Events that say neither keep `prev`.
+    settledAfter(ev, prev) {
+      switch (ev.type) {
+        case 'user.message':
+        case 'user.custom_tool_result':
+        case 'user.tool_confirmation':
+        case 'session.status_running':
+        case 'session.status_rescheduled':
+          return false;
+        case 'session.status_idle':
+          return !(ev.stop_reason && ev.stop_reason.type === 'requires_action');
+        case 'session.status_terminated':
+          return true;
+        default:
+          return prev;
+      }
+    },
+
     // Rebuilds a conversation's messages from its session's events, in the
     // shape run() produces live: user turns (the shared page as a context
     // banner), assistant text, tool calls and their results, and the cost
     // line at the end of each turn. Nothing is executed or sent. Also
     // returns the requests still waiting for this side (custom tool calls
-    // and permission asks nobody answered), which run() settles before
-    // sending the next message.
+    // and permission asks nobody answered), which run() and resume() settle,
+    // whether the session was still at work when the events were read
+    // (`settled` false: the page driving it may have been reloaded), and
+    // the id of the last user.message (the turn a run is about).
     transcriptOf(events, conv) {
       const msgs = [];
       const st = (conv && conv.agent) || {};
       let cur = null;
       let cost = 0;
+      let settled = true;
+      let lastMsg = null;
       const asked = new Map();
       const ts = (ev) => this.tsOf(ev.processed_at || ev.created_at) || now();
       const textOf = (ev) => (ev.content || []).filter((b) => b && b.type === 'text').map((b) => b.text).join('');
@@ -5996,18 +6048,11 @@ textarea { resize: none; }
       };
       for (const ev of events || []) {
         if (!ev || !ev.type) continue;
+        settled = this.settledAfter(ev, settled);
         switch (ev.type) {
           case 'user.message': {
-            const p = this.parseUserContent(ev.content);
-            if (p.page) {
-              msgs.push({ id: uid(), role: 'user', _synthetic: true, _contextUrl: p.page.url, _contextTitle: p.page.title, content: p.page.text, createdAt: ts(ev) });
-              msgs.push({ id: uid(), role: 'assistant', _synthetic: true, content: '(context received)', createdAt: ts(ev) });
-            }
-            msgs.push({
-              id: uid(), role: 'user', content: p.text, createdAt: ts(ev),
-              attachments: p.attachments.length ? p.attachments : undefined,
-              selection: p.selection || undefined
-            });
+            msgs.push(...this.userTurn(ev, ts(ev)));
+            lastMsg = ev.id || lastMsg;
             cur = null;
             break;
           }
@@ -6083,7 +6128,7 @@ textarea { resize: none; }
       }
       const messages = msgs.filter((m) => m.role !== 'assistant' || m._synthetic || m.content
         || (m.functionCalls && m.functionCalls.length) || m.agentsInfo);
-      return { messages, costCents: cost, unanswered: [...asked].map(([id, type]) => ({ id, type })) };
+      return { messages, costCents: cost, unanswered: [...asked].map(([id, type]) => ({ id, type })), settled, lastMsg };
     },
 
     // Conversations whose transcript was fetched (or produced) during this
@@ -6113,6 +6158,10 @@ textarea { resize: none; }
       conv.messages = t.messages;
       st.costCents = t.costCents || st.costCents || 0;
       st.unanswered = t.unanswered;
+      // In memory only (not in the catalog entry): what ChatPanel needs to
+      // decide whether to take the run up again (see resume()).
+      st.settled = t.settled;
+      st.lastMsg = t.lastMsg;
       let cursor = null;
       for (const e of evs) if (e.processed_at && this.tsOf(e.processed_at) >= this.tsOf(cursor)) cursor = e.processed_at;
       st.cursor = cursor;
@@ -6217,17 +6266,45 @@ textarea { resize: none; }
       };
     },
 
-    // Runs one user turn of an Agents conversation. The user message and an
-    // empty pending assistant message have already been appended to `conv`.
-    // `onPending(msg)` tells the caller which message to annotate if this
-    // throws. Resolves when the session settles (end of turn, stop, budget
-    // pause the user declined, or termination).
-    async run({ conv, host, panel, userMsg, text, selection, snapText, attachments, web, onPending, aborter }) {
+    // ---- runs ---------------------------------------------------------------
+    // A run follows a session from this page: a turn sent here (run()), or a
+    // run taken up again when its conversation is opened (resume()). The
+    // tracker holds what a run keeps track of — the assistant message
+    // receiving output, the events seen, the requests answered — and shows
+    // and acts on the session's events. What becomes of the session's
+    // requests (custom tool calls, permission asks) is decided by `how`:
+    //   'live'    this page drives the session: run them, dialogs included;
+    //   'decline' answer them with an error without bothering the user
+    //             (requests from before a turn the user has just sent);
+    //   'watch'   leave them to the page driving the session (another tab or
+    //             device); they wait in `waiting` in case this page takes
+    //             the run over.
+    _tracker({ conv, host, panel, onPending }) {
       const st = conv.agent || (conv.agent = { model: this.modelOf(conv), effort: this.effortOf(conv) });
       const kind = this.kindOf(conv);
+      // A remote transcript is rebuilt from the events, so a user turn or a
+      // tool result this page did not produce is shown when its event comes
+      // in; a local (pre-2.2) one only holds this device's own turns.
+      const remote = this.isRemote(conv);
       const view = () => { if (panel.conv === conv) panel.render(); };
       const viewLast = () => { if (panel.conv === conv) panel.renderLastAssistant(); };
       const save = () => { Store.upsertConversation(host, conv); Store.saveDomains(); };
+      const t = {
+        st, kind, view, save,
+        sid: st.sessionId || null,
+        how: 'live',
+        // Whether a watcher takes the run over once the page driving it is
+        // gone (only when that page was another tab of this device).
+        canTakeOver: false,
+        lease: null,
+        waiting: new Map(),
+        // False while the session is at work or waits on a request (see
+        // settledAfter); seeded from the transcript rebuild.
+        settled: st.settled !== false,
+        lastMsg: st.lastMsg || null,
+        ownMsg: null,
+        interruptAt: 0
+      };
 
       // The assistant message currently receiving output (null after a tool
       // result, so the next output starts a new one below it).
@@ -6250,55 +6327,33 @@ textarea { resize: none; }
         m.content = (m.content ? `${m.content}\n\n` : '') + s;
       };
       const pushResult = (resp) => {
+        // A placeholder still waiting for output gives way to the result
+        // (a run taken up again opens one before it knows what comes next).
+        if (cur && cur === conv.messages[conv.messages.length - 1] && cur.role === 'assistant'
+          && !cur.content && !(cur.functionCalls && cur.functionCalls.length) && !cur.agentsInfo) conv.messages.pop();
         const last = conv.messages[conv.messages.length - 1];
         if (last && last._tool) last.functionResponses.push(resp);
         else conv.messages.push({ id: uid(), role: 'user', _tool: true, functionResponses: [resp], createdAt: now() });
         if (cur && cur.role === 'assistant') cur._pending = false;
         cur = null;
       };
-
-      // ---- session ---------------------------------------------------
-      let session = null;
-      if (st.sessionId) {
-        try {
-          session = await AgentsAPI.getSession(st.sessionId);
-        } catch (e) {
-          if (e.status !== 404) throw e;
+      const findCall = (id) => {
+        for (let i = conv.messages.length - 1; i >= 0; i--) {
+          const c = (conv.messages[i].functionCalls || []).find((x) => x.id === id);
+          if (c) return c;
         }
-        if (!session || session.status === 'terminated') {
-          st.sessionId = null;
-          note('_(前のセッションは終了していたため、新しいセッションで続けます。サンドボックスの状態は引き継がれません。)_');
-          view();
-        }
-      }
-      if (!st.sessionId) {
-        st.model = this.modelOf(conv);
-        st.effort = this.effortOf(conv);
-        st.budgetCents = this.budgetCents();
-        st.costCents = 0;
-        st.cursor = null;
-        st.seen = [];
-        st.unanswered = [];
-        session = await this.createSession(conv, { host, web });
-        st.sessionId = session.id;
-        st.web = { search: !!(web && web.search), fetch: !!(web && web.fetch) };
-        // The transcript of a session created here is the one in memory.
-        this._loaded.add(conv.id);
-        save();
-      } else if (kind === 'chat' && web && (!!web.search !== !!(st.web && st.web.search) || !!web.fetch !== !!(st.web && st.web.fetch))) {
-        // The web toggles changed since the last turn: swap the session's
-        // tools (allowed while it is idle, which it is between turns).
-        await AgentsAPI.updateSession(st.sessionId, { agent: { tools: this.chatTools(web) } });
-        st.web = { search: !!web.search, fetch: !!web.fetch };
-        save();
-      }
-      const sid = st.sessionId;
+        return null;
+      };
+      const hasResult = (id) => conv.messages.some((m) => (m.functionResponses || []).some((r) => r.id === id));
+      t.note = note;
+      t.clearPending = () => { for (const m of conv.messages) if (m._pending) m._pending = false; };
 
       const seen = new Set(st.seen || []);
       const answered = new Set();
-      const state = {
-        get cursor() { return st.cursor; }
-      };
+      // Requests this run answered (run, declined); see resume().
+      t.answeredHere = 0;
+      // A new session replaced the previous one: its events mean nothing.
+      t.newSession = () => { seen.clear(); answered.clear(); };
       const advance = (ev) => {
         if (ev.processed_at && this.tsOf(ev.processed_at) >= this.tsOf(st.cursor)) st.cursor = ev.processed_at;
         seen.add(ev.id);
@@ -6309,32 +6364,121 @@ textarea { resize: none; }
         const amt = u && u.list_cost && u.list_cost.amount;
         if (amt != null) st.costCents = parseInt(amt, 10) || 0;
       };
+      t.usageOf = usageOf;
 
-      const sendResult = async (toolUseId, response, isError) => {
-        answered.add(toolUseId);
-        await AgentsAPI.sendEvents(sid, [{
-          type: 'user.custom_tool_result',
-          custom_tool_use_id: toolUseId,
-          content: [{ type: 'text', text: JSON.stringify(response) }],
-          is_error: !!isError
-        }]);
-      };
-
-      const raiseBudget = async () => {
+      t.raiseBudget = async () => {
         const step = this.budgetCents();
         const ok = await UI.confirm(`費用の上限に達したため、エージェントを一時停止しました。\n\nこのセッションの累計: ${this.formatCost(st.costCents)}\n上限を ${this.formatCost(step)} 分引き上げて続けますか?`);
         if (!ok) return false;
         const amount = (st.costCents || 0) + step;
-        await AgentsAPI.updateSession(sid, { budget: { type: 'limit', max_list_cost: { amount: String(amount), currency: 'USD' } } });
+        await AgentsAPI.updateSession(t.sid, { budget: { type: 'limit', max_list_cost: { amount: String(amount), currency: 'USD' } } });
         st.budgetCents = amount;
         save();
         return true;
       };
 
-      // ---- event handling ----------------------------------------------
-      // `replay` = catching up on events from before this send (the page was
-      // reloaded mid-run, say). Tool requests from then are answered with an
-      // error instead of popping dialogs about a turn the user has left.
+      // ---- requests ------------------------------------------------------
+      // Before answering a request, a page checks it still drives the
+      // session: a tab the browser suspended (iOS) can come back after
+      // another page took its run over. Such a page only watches from then
+      // on, and may take the run back if that page goes away in turn.
+      const stillDriving = async () => {
+        if (!t.lease || await t.lease.owns()) return true;
+        t.lease.release();
+        t.lease = null;
+        t.how = 'watch';
+        t.canTakeOver = true;
+        return false;
+      };
+      const answerCustom = async (call, how) => {
+        if (answered.has(call.id)) return;
+        if (how === 'live' && !(await stillDriving())) how = 'watch';
+        if (how === 'watch') { t.waiting.set(call.id, { type: 'custom', call }); return; }
+        answered.add(call.id);
+        t.answeredHere++;
+        t.waiting.delete(call.id);
+        let response;
+        if (how === 'decline') {
+          response = { error: 'このツール呼び出しには応答できませんでした (別のデバイスやページの再読み込みで中断)。必要ならもう一度呼び出してください。' };
+        } else if (call.name === 'show_image') {
+          const problem = Claude.validateInput(this.imageTool(kind).input_schema, call.args);
+          response = problem
+            ? { error: `ツール入力が不正です: ${problem}` }
+            : await this.showImage(call.args, { sid: t.sid, kind });
+        } else {
+          const decl = UserScriptMode.toolDeclarations().find((d) => d.name === call.name);
+          const schema = decl ? Claude.convertTools([decl])[0].input_schema : null;
+          const problem = schema ? Claude.validateInput(schema, call.args) : null;
+          response = problem
+            ? { error: `ツール入力が不正です: ${problem}` }
+            : await UserScriptMode.execute(call, { conv, host, panel });
+        }
+        pushResult({ id: call.id, name: call.name, response });
+        view();
+        save();
+        const sent = AgentsAPI.sendEvents(t.sid, [{
+          type: 'user.custom_tool_result',
+          custom_tool_use_id: call.id,
+          content: [{ type: 'text', text: JSON.stringify(response) }],
+          is_error: !!(response && response.error)
+        }]);
+        // A decline is best effort: the request may have lapsed meanwhile.
+        if (how === 'decline') await sent.catch((e) => console.warn('[aicx] could not settle a pending request:', e));
+        else await sent;
+      };
+      const answerConfirm = async (id, name, input, how) => {
+        if (answered.has(id)) return;
+        if (how === 'live' && !(await stillDriving())) how = 'watch';
+        if (how === 'watch') { t.waiting.set(id, { type: 'confirm', name, input }); return; }
+        answered.add(id);
+        t.answeredHere++;
+        t.waiting.delete(id);
+        let allow = false;
+        if (how === 'live') {
+          const verdict = await UI.confirmCode({
+            title: 'サンドボックスでの実行を確認',
+            description: `エージェントがサンドボックスで「${name}」を実行しようとしています。自動では安全と判断できなかったため、確認が必要です。`,
+            code: JSON.stringify(input || {}, null, 2),
+            okLabel: '許可'
+          });
+          allow = !!verdict.ok;
+        }
+        const sent = AgentsAPI.sendEvents(t.sid, [allow
+          ? { type: 'user.tool_confirmation', tool_use_id: id, result: 'allow' }
+          : { type: 'user.tool_confirmation', tool_use_id: id, result: 'deny', deny_message: how === 'decline' ? '別のデバイスやページの再読み込みで確認できませんでした。' : 'ユーザーが実行を拒否しました。' }]);
+        if (how === 'decline') await sent.catch((e) => console.warn('[aicx] could not settle a pending request:', e));
+        else await sent;
+      };
+      // Each ask: { type: 'custom', id, call } or { type: 'confirm', id,
+      // name, input }.
+      const settleAsks = async (asks, how) => {
+        for (const a of asks) {
+          if (a.type === 'custom') await answerCustom(a.call, how);
+          else await answerConfirm(a.id, a.name, a.input, how);
+        }
+      };
+      // The requests the transcript rebuild found unanswered, as asks.
+      const pendingAsks = () => {
+        const out = (st.unanswered || []).filter((x) => !answered.has(x.id)).map((x) => {
+          const call = findCall(x.id);
+          return x.type === 'custom'
+            ? { type: 'custom', id: x.id, call: call || { id: x.id, name: 'tool', args: {} } }
+            : { type: 'confirm', id: x.id, name: call ? call.name.replace(/^sandbox\./, '') : 'tool', input: call ? call.args : {} };
+        });
+        st.unanswered = [];
+        return out;
+      };
+      // A watcher whose driving tab has gone takes the run over: it holds
+      // the lease from now on and answers what is waiting.
+      const takeOverIfVacant = async () => {
+        if ((await AgentsLive.role(conv.id, t.lastMsg)) !== 'drive') return;
+        t.lease = AgentsLive.hold(conv.id, t.sid, t.lastMsg);
+        t.how = 'live';
+        t.canTakeOver = false;
+        await settleAsks([...t.waiting].map(([id, w]) => Object.assign({ id }, w)), 'live');
+      };
+
+      // ---- events --------------------------------------------------------
       // Live preview state: which agent.message is being previewed, the text
       // of `cur` before it, and the deltas so far. The buffered agent.message
       // replaces the preview (deltas may have been shed).
@@ -6342,8 +6486,20 @@ textarea { resize: none; }
       let previewBase = '';
       let previewText = '';
       const joinText = (base, add) => base + (base && add ? '\n\n' : '') + add;
-      const handle = async (ev, { replay = false } = {}) => {
+      const handle = async (ev, how) => {
+        t.settled = this.settledAfter(ev, t.settled);
         switch (ev.type) {
+          case 'user.message':
+            t.lastMsg = ev.id || t.lastMsg;
+            // A turn sent from elsewhere (another device) while this page
+            // follows the session.
+            if (remote && ev.id !== t.ownMsg) {
+              conv.messages.push(...this.userTurn(ev, this.tsOf(ev.processed_at) || now()));
+              if (cur && cur.role === 'assistant') cur._pending = false;
+              cur = null;
+              view();
+            }
+            return;
           case 'agent.message': {
             const textOut = (ev.content || []).filter((b) => b && b.type === 'text').map((b) => b.text).join('');
             if (previewFor === ev.id && cur && cur.role === 'assistant') {
@@ -6361,60 +6517,44 @@ textarea { resize: none; }
             const call = { id: ev.id, name: ev.name, args: ev.input || {} };
             (m.functionCalls || (m.functionCalls = [])).push(call);
             view();
-            if (answered.has(ev.id)) return;
-            let response;
-            let isError = false;
-            if (replay) {
-              response = { error: 'ページの再読み込みなどで、このツール呼び出しは実行されませんでした。必要ならもう一度呼び出してください。' };
-              isError = true;
-            } else if (ev.name === 'show_image') {
-              const problem = Claude.validateInput(this.imageTool(kind).input_schema, call.args);
-              response = problem
-                ? { error: `ツール入力が不正です: ${problem}` }
-                : await this.showImage(call.args, { sid, kind });
-              isError = !!(response && response.error);
-            } else {
-              const decl = UserScriptMode.toolDeclarations().find((d) => d.name === ev.name);
-              const schema = decl ? Claude.convertTools([decl])[0].input_schema : null;
-              const problem = schema ? Claude.validateInput(schema, call.args) : null;
-              response = problem
-                ? { error: `ツール入力が不正です: ${problem}` }
-                : await UserScriptMode.execute(call, { conv, host, panel });
-              isError = !!(response && response.error);
-            }
-            pushResult({ id: ev.id, name: ev.name, response });
-            view();
-            save();
-            await sendResult(ev.id, response, isError);
+            await answerCustom(call, how);
             return;
           }
           case 'agent.tool_use': {
             const m = ensureCur();
-            const call = { id: ev.id, name: `sandbox.${ev.name}`, args: ev.input || {} };
-            (m.functionCalls || (m.functionCalls = [])).push(call);
+            (m.functionCalls || (m.functionCalls = [])).push({ id: ev.id, name: `sandbox.${ev.name}`, args: ev.input || {} });
             view();
-            if (ev.evaluated_permission === 'ask' && !answered.has(ev.id)) {
-              answered.add(ev.id);
-              let allow = false;
-              if (!replay) {
-                const verdict = await UI.confirmCode({
-                  title: 'サンドボックスでの実行を確認',
-                  description: `エージェントがサンドボックスで「${ev.name}」を実行しようとしています。自動では安全と判断できなかったため、確認が必要です。`,
-                  code: JSON.stringify(ev.input || {}, null, 2),
-                  okLabel: '許可'
-                });
-                allow = !!verdict.ok;
-              }
-              await AgentsAPI.sendEvents(sid, [allow
-                ? { type: 'user.tool_confirmation', tool_use_id: ev.id, result: 'allow' }
-                : { type: 'user.tool_confirmation', tool_use_id: ev.id, result: 'deny', deny_message: replay ? 'ページの再読み込みなどで確認できませんでした。' : 'ユーザーが実行を拒否しました。' }]);
+            if (ev.evaluated_permission === 'ask') await answerConfirm(ev.id, ev.name, ev.input || {}, how);
+            return;
+          }
+          case 'user.custom_tool_result': {
+            const id = ev.custom_tool_use_id;
+            if (!id) return;
+            answered.add(id);
+            t.waiting.delete(id);
+            // Answered by the page driving the session: show what it sent.
+            if (!hasResult(id)) {
+              const raw = (ev.content || []).filter((b) => b && b.type === 'text').map((b) => b.text).join('');
+              let response;
+              try { response = JSON.parse(raw); } catch { response = { output: raw }; }
+              const call = findCall(id);
+              pushResult({ id, name: (call && call.name) || 'tool', response });
+              view();
             }
             return;
           }
+          case 'user.tool_confirmation':
+            if (!ev.tool_use_id) return;
+            answered.add(ev.tool_use_id);
+            t.waiting.delete(ev.tool_use_id);
+            return;
+          case 'user.interrupt':
+            // A stop pressed elsewhere (this page notes its own at the end).
+            if (remote && !t.interruptAt) { note('_(停止しました)_'); view(); }
+            return;
           case 'agent.tool_result': {
             const out = (ev.content || []).filter((b) => b && b.type === 'text').map((b) => b.text).join('');
-            const callMsg = [...conv.messages].reverse().find((x) => x.functionCalls && x.functionCalls.some((c) => c.id === ev.tool_use_id));
-            const call = callMsg && callMsg.functionCalls.find((c) => c.id === ev.tool_use_id);
+            const call = findCall(ev.tool_use_id);
             const response = { output: out.length > this.RESULT_KEEP_CHARS ? `${out.slice(0, this.RESULT_KEEP_CHARS)}\n…(省略)` : out };
             if (ev.is_error) response.error = out.split('\n')[0].slice(0, 200) || 'エラー';
             pushResult({ id: ev.tool_use_id, name: (call && call.name) || 'sandbox.tool', response });
@@ -6444,159 +6584,300 @@ textarea { resize: none; }
         }
       };
 
-      // ---- catch up on anything since the last run ---------------------
-      // Output the session produced after this tab stopped listening (page
-      // reload mid-run) belongs ABOVE the message being sent now, so the new
-      // user turn and its placeholder are lifted off while it is replayed.
-      if (st.cursor || seen.size) {
-        const backlog = await AgentsAPI.listEvents(sid, st.cursor);
-        // Results already sent for a request must not be sent again.
+      // ---- catching up ---------------------------------------------------
+      // Events this page has not shown yet — what the session did after the
+      // page that drove it stopped listening (a reload mid-run), or what
+      // another device did — and the requests the transcript rebuild found
+      // unanswered; requests are handled as `how`. With `before` (the user
+      // message being sent now), all of it goes ABOVE that message and what
+      // follows it.
+      t.catchUp = async (how, before) => {
+        const backlog = (st.cursor || seen.size) ? await AgentsAPI.listEvents(t.sid, st.cursor) : [];
+        // Requests already answered (here, by an earlier page, or
+        // elsewhere) must not be answered again.
         for (const ev of backlog) {
           if (ev.type === 'user.custom_tool_result' && ev.custom_tool_use_id) answered.add(ev.custom_tool_use_id);
           if (ev.type === 'user.tool_confirmation' && ev.tool_use_id) answered.add(ev.tool_use_id);
         }
         const fresh = backlog.filter((ev) => ev.id && ev.processed_at && !seen.has(ev.id));
-        if (fresh.length) {
-          const at = conv.messages.indexOf(userMsg);
-          const tail = at >= 0 ? conv.messages.splice(at) : [];
-          cur = null;
-          for (const ev of fresh) {
-            advance(ev);
-            if (ev.type === 'session.usage') { usageOf(ev); continue; }
-            await handle(ev, { replay: true });
-          }
-          for (const m of conv.messages) if (m._pending) m._pending = false;
-          conv.messages.push(...tail);
-          cur = tail.length ? tail[tail.length - 1] : null;
-          if (cur) onPending(cur);
-          view();
-          save();
-        }
-      }
-
-      // Requests left waiting when the transcript was rebuilt from the server
-      // (another device, or a reload, left a tool call or permission ask
-      // unanswered). A session waiting on one accepts nothing else, so they
-      // are declined first.
-      const pendingAsks = (st.unanswered || []).filter((x) => !answered.has(x.id));
-      st.unanswered = [];
-      for (const ask of pendingAsks) {
-        answered.add(ask.id);
-        const ev = ask.type === 'custom'
-          ? { type: 'user.custom_tool_result', custom_tool_use_id: ask.id, content: [{ type: 'text', text: JSON.stringify({ error: 'このツール呼び出しには応答できませんでした (別のデバイスやページの再読み込みで中断)。必要ならもう一度呼び出してください。' }) }], is_error: true }
-          : { type: 'user.tool_confirmation', tool_use_id: ask.id, result: 'deny', deny_message: '別のデバイスやページの再読み込みで確認できませんでした。' };
-        await AgentsAPI.sendEvents(sid, [ev]).catch((e) => console.warn('[aicx] could not settle a pending request:', e));
-      }
-
-      // A session paused at its cap only accepts settle events.
-      const latest = await AgentsAPI.getSession(sid);
-      if (latest && latest.usage) usageOf(latest.usage);
-      const capped = latest && latest.budget && latest.budget.max_list_cost
-        && (st.costCents || 0) >= (parseInt(latest.budget.max_list_cost.amount, 10) || 0);
-      if (capped && !(await raiseBudget())) {
-        note('_(費用の上限に達しているため送信しませんでした。上限を引き上げると続けられます。)_');
-        if (cur) cur._pending = false;
-        view();
-        return;
-      }
-
-      // ---- live turn ------------------------------------------------------
-      const q = this._queue();
-      const feed = this._startFeed(sid, state, q);
-      let interruptAt = 0;
-      const onAbort = () => {
-        interruptAt = Date.now();
-        AgentsAPI.sendEvents(sid, [{ type: 'user.interrupt' }]).catch(() => {});
-      };
-      aborter.signal.addEventListener('abort', onAbort, { once: true });
-
-      try {
-        const sent = await AgentsAPI.sendEvents(sid, [{
-          type: 'user.message',
-          content: this.composeContent(kind, { text, selection, snapText, attachments })
-        }]);
-        const ourId = sent && sent.data && sent.data[0] && sent.data[0].id;
-        let ourProcessed = !ourId;
-
-        while (true) {
-          const ev = await q.take(1000);
-          if (interruptAt && Date.now() - interruptAt > this.INTERRUPT_GRACE_MS) break;
-          if (!ev) continue;
-
-          // Live preview of agent.message text (stream only, never persisted).
-          if (ev.type === 'event_start') {
-            if (ev.event && ev.event.type === 'agent.message' && !seen.has(ev.event.id)) {
-              const m = ensureCur({ forText: true });
-              previewFor = ev.event.id;
-              previewBase = m.content || '';
-              previewText = '';
-            }
-            continue;
-          }
-          if (ev.type === 'event_delta') {
-            const piece = ev.delta && ev.delta.content && ev.delta.content.text;
-            if (previewFor && ev.event_id === previewFor && piece && cur && cur.role === 'assistant') {
-              previewText += piece;
-              cur.content = joinText(previewBase, previewText);
-              viewLast();
-            }
-            continue;
-          }
-
-          if (!ev.id || !ev.processed_at || seen.has(ev.id)) continue;
+        const asks = pendingAsks();
+        if (!fresh.length && !asks.length) return;
+        const at = before ? conv.messages.indexOf(before) : -1;
+        const tail = at >= 0 ? conv.messages.splice(at) : [];
+        if (tail.length) cur = null;
+        // The asks are older than anything in the backlog.
+        await settleAsks(asks, how);
+        for (const ev of fresh) {
           advance(ev);
-          if (ev.type === 'user.message' && ev.id === ourId) ourProcessed = true;
+          await handle(ev, how);
+        }
+        if (tail.length) {
+          t.clearPending();
+          conv.messages.push(...tail);
+          cur = tail[tail.length - 1];
+          onPending(cur);
+        }
+        view();
+        save();
+      };
 
-          if (ev.type === 'session.status_terminated') {
-            note('_(セッションが終了しました。次の送信では新しいセッションを作成します。)_');
-            st.sessionId = null;
-            break;
-          }
-          if (ev.type === 'session.status_idle') {
-            const reason = (ev.stop_reason && ev.stop_reason.type) || 'end_turn';
-            if (reason === 'requires_action') {
-              // Requests we never received (a gap in the feed): fetch them.
-              const missing = ((ev.stop_reason && ev.stop_reason.event_ids) || []).filter((id) => !seen.has(id) && !answered.has(id));
-              if (missing.length) await feed.pollOnce().catch(() => {});
+      // A run taken up again: output continues the last assistant message,
+      // or starts below the last user / tool turn.
+      t.openTurn = () => {
+        const last = conv.messages[conv.messages.length - 1];
+        if (last && last.role === 'assistant' && !last._synthetic) {
+          cur = last;
+          cur._pending = true;
+          onPending(cur);
+        } else {
+          newAssistant();
+        }
+      };
+
+      // ---- following -----------------------------------------------------
+      // Follows the session live (SSE, with _startFeed's polling fallback)
+      // until it settles: the end of the turn, a stop (`aborter`), a budget
+      // pause the user declined, or termination. `send` (a new turn) posts
+      // the user.message once the feed is open and resolves to its event id.
+      t.follow = async ({ aborter, send }) => {
+        const sid = t.sid;
+        if (aborter.signal.aborted) {
+          // Stopped while catching up: a new turn is simply not sent, a run
+          // taken up again is interrupted.
+          t.interruptAt = Date.now();
+          if (!send) AgentsAPI.sendEvents(sid, [{ type: 'user.interrupt' }]).catch(() => {});
+          return;
+        }
+        const q = this._queue();
+        const feed = this._startFeed(sid, { get cursor() { return st.cursor; } }, q);
+        const onAbort = () => {
+          t.interruptAt = Date.now();
+          AgentsAPI.sendEvents(sid, [{ type: 'user.interrupt' }]).catch(() => {});
+        };
+        aborter.signal.addEventListener('abort', onAbort, { once: true });
+
+        try {
+          const ourId = send ? await send() : null;
+          if (ourId) t.ownMsg = t.lastMsg = ourId;
+          let ourProcessed = !ourId;
+          // Without an id from the API, the first user.message to come back
+          // is taken to be ours (it must not show up a second time).
+          let claimNext = !!send && !ourId;
+          let takeOverAt = Date.now();
+
+          while (true) {
+            const ev = await q.take(1000);
+            if (t.interruptAt && Date.now() - t.interruptAt > this.INTERRUPT_GRACE_MS) break;
+            if (t.how === 'watch' && t.canTakeOver && !t.interruptAt && Date.now() - takeOverAt > this.TAKEOVER_CHECK_MS) {
+              await takeOverIfVacant();
+              takeOverAt = Date.now();
+            }
+            if (!ev) continue;
+
+            // Live preview of agent.message text (stream only, never persisted).
+            if (ev.type === 'event_start') {
+              if (ev.event && ev.event.type === 'agent.message' && !seen.has(ev.event.id)) {
+                const m = ensureCur({ forText: true });
+                previewFor = ev.event.id;
+                previewBase = m.content || '';
+                previewText = '';
+              }
               continue;
             }
-            if (reason === 'budget_reached') {
-              if (await raiseBudget()) continue;
-              note(`_(費用の上限に達したため停止しました。このセッションの累計: ${this.formatCost(st.costCents)})_`);
+            if (ev.type === 'event_delta') {
+              const piece = ev.delta && ev.delta.content && ev.delta.content.text;
+              if (previewFor && ev.event_id === previewFor && piece && cur && cur.role === 'assistant') {
+                previewText += piece;
+                cur.content = joinText(previewBase, previewText);
+                viewLast();
+              }
+              continue;
+            }
+
+            if (!ev.id || !ev.processed_at || seen.has(ev.id)) continue;
+            advance(ev);
+            if (ev.type === 'user.message' && claimNext) { claimNext = false; t.ownMsg = t.lastMsg = ev.id; }
+            if (ev.type === 'user.message' && ev.id === ourId) ourProcessed = true;
+
+            if (ev.type === 'session.status_terminated') {
+              t.settled = true;
+              note('_(セッションが終了しました。次の送信では新しいセッションを作成します。)_');
+              st.sessionId = null;
               break;
             }
-            if (interruptAt) break;
-            if (!ourProcessed) {
-              // An idle left over from before our message was picked up (the
-              // session was still busy when we sent): keep waiting unless the
-              // history says our message has been processed.
-              const recent = await AgentsAPI.listEvents(sid, st.cursor).catch(() => []);
-              if (recent.some((x) => x.id === ourId && x.processed_at)) ourProcessed = true;
-              if (!ourProcessed) continue;
+            if (ev.type === 'session.status_idle') {
+              const reason = (ev.stop_reason && ev.stop_reason.type) || 'end_turn';
+              t.settled = reason !== 'requires_action';
+              if (reason === 'requires_action') {
+                // Requests we never received (a gap in the feed): fetch them.
+                const missing = ((ev.stop_reason && ev.stop_reason.event_ids) || []).filter((id) => !seen.has(id) && !answered.has(id));
+                if (missing.length) await feed.pollOnce().catch(() => {});
+                continue;
+              }
+              if (reason === 'budget_reached') {
+                // Raising the cap is up to the page driving the session.
+                if (t.how === 'live' && await t.raiseBudget()) continue;
+                note(`_(費用の上限に達したため停止しました。このセッションの累計: ${this.formatCost(st.costCents)})_`);
+                break;
+              }
+              if (t.interruptAt) break;
+              if (!ourProcessed) {
+                // An idle left over from before our message was picked up (the
+                // session was still busy when we sent): keep waiting unless the
+                // history says our message has been processed.
+                const recent = await AgentsAPI.listEvents(sid, st.cursor).catch(() => []);
+                if (recent.some((x) => x.id === ourId && x.processed_at)) ourProcessed = true;
+                if (!ourProcessed) continue;
+              }
+              if (reason === 'retries_exhausted') note('_(エージェントの処理がエラーまたは上限により停止しました。「続けて」と送ると再開できます。)_');
+              break;
             }
-            if (reason === 'retries_exhausted') note('_(エージェントの処理がエラーまたは上限により停止しました。「続けて」と送ると再開できます。)_');
-            break;
+            await handle(ev, t.how);
           }
-          await handle(ev);
+        } finally {
+          feed.stop();
+          aborter.signal.removeEventListener('abort', onAbort);
         }
-      } finally {
-        feed.stop();
-        aborter.signal.removeEventListener('abort', onAbort);
-      }
+      };
 
-      if (interruptAt) note('_(停止しました)_');
-      // Close the turn: no message left spinning, and the last assistant
+      // Closes the run: no message left spinning, and the last assistant
       // message carries the session's running cost.
-      for (const m of conv.messages) if (m._pending) m._pending = false;
-      let last = [...conv.messages].reverse().find((m) => m.role === 'assistant');
-      if (!last || last !== conv.messages[conv.messages.length - 1]) {
-        last = { id: uid(), role: 'assistant', content: '', createdAt: now() };
-        conv.messages.push(last);
+      t.close = () => {
+        if (t.interruptAt) note('_(停止しました)_');
+        t.clearPending();
+        let last = [...conv.messages].reverse().find((m) => m.role === 'assistant');
+        if (!last || last !== conv.messages[conv.messages.length - 1]) {
+          last = { id: uid(), role: 'assistant', content: '', createdAt: now() };
+          conv.messages.push(last);
+        }
+        last.agentsInfo = { model: st.model, effort: st.effort, costCents: st.costCents || 0 };
+        onPending(last);
+        view();
+        save();
+      };
+      return t;
+    },
+
+    // Runs one user turn of an Agents conversation. The user message and an
+    // empty pending assistant message have already been appended to `conv`.
+    // `onPending(msg)` tells the caller which message to annotate if this
+    // throws. Resolves when the session settles (end of turn, stop, budget
+    // pause the user declined, or termination).
+    async run({ conv, host, panel, userMsg, text, selection, snapText, attachments, web, onPending, aborter }) {
+      const t = this._tracker({ conv, host, panel, onPending });
+      const { st, kind } = t;
+
+      // ---- session ---------------------------------------------------
+      let session = null;
+      if (st.sessionId) {
+        try {
+          session = await AgentsAPI.getSession(st.sessionId);
+        } catch (e) {
+          if (e.status !== 404) throw e;
+        }
+        if (!session || session.status === 'terminated') {
+          st.sessionId = null;
+          t.note('_(前のセッションは終了していたため、新しいセッションで続けます。サンドボックスの状態は引き継がれません。)_');
+          t.view();
+        }
       }
-      last.agentsInfo = { model: st.model, effort: st.effort, costCents: st.costCents || 0 };
-      onPending(last);
-      view();
-      save();
+      if (!st.sessionId) {
+        st.model = this.modelOf(conv);
+        st.effort = this.effortOf(conv);
+        st.budgetCents = this.budgetCents();
+        st.costCents = 0;
+        st.cursor = null;
+        st.seen = [];
+        st.unanswered = [];
+        session = await this.createSession(conv, { host, web });
+        st.sessionId = session.id;
+        st.web = { search: !!(web && web.search), fetch: !!(web && web.fetch) };
+        t.newSession();
+        // The transcript of a session created here is the one in memory.
+        this._loaded.add(conv.id);
+        t.save();
+      } else if (kind === 'chat' && web && (!!web.search !== !!(st.web && st.web.search) || !!web.fetch !== !!(st.web && st.web.fetch))) {
+        // The web toggles changed since the last turn: swap the session's
+        // tools (allowed while it is idle, which it is between turns).
+        await AgentsAPI.updateSession(st.sessionId, { agent: { tools: this.chatTools(web) } });
+        st.web = { search: !!web.search, fetch: !!web.fetch };
+        t.save();
+      }
+      t.sid = st.sessionId;
+
+      // This page drives the session until the turn is over (see
+      // AgentsLive); the lease learns the turn's message once it is sent.
+      t.lease = AgentsLive.hold(conv.id, t.sid);
+      try {
+        // Output the session produced after the page that last drove it
+        // stopped listening, and requests nobody answered: shown above the
+        // message being sent now, the requests declined (a session waiting
+        // on one accepts nothing else).
+        await t.catchUp('decline', userMsg);
+
+        // A session paused at its cap only accepts settle events.
+        const latest = await AgentsAPI.getSession(t.sid);
+        if (latest && latest.usage) t.usageOf(latest.usage);
+        const capped = latest && latest.budget && latest.budget.max_list_cost
+          && (st.costCents || 0) >= (parseInt(latest.budget.max_list_cost.amount, 10) || 0);
+        if (capped && !(await t.raiseBudget())) {
+          t.note('_(費用の上限に達しているため送信しませんでした。上限を引き上げると続けられます。)_');
+          t.clearPending();
+          t.view();
+          return;
+        }
+
+        await t.follow({
+          aborter,
+          send: async () => {
+            const sent = await AgentsAPI.sendEvents(t.sid, [{
+              type: 'user.message',
+              content: this.composeContent(kind, { text, selection, snapText, attachments })
+            }]);
+            const id = (sent && sent.data && sent.data[0] && sent.data[0].id) || null;
+            if (id && t.lease) t.lease.msg(id);
+            return id;
+          }
+        });
+        t.close();
+      } finally {
+        if (t.lease) t.lease.release();
+      }
+    },
+
+    // Takes up a session that is still at work when its conversation is
+    // opened (ChatPanel.resumeIfActive, after loadTranscript): the page that
+    // drove it went away mid-run (reload, navigation), or another tab or
+    // device drives it. The SSE feed is opened again and the run shown live
+    // until the session settles. `role` comes from AgentsLive.role: 'drive'
+    // answers the requests left waiting and every new one; 'tab' and
+    // 'watch' only show the run, 'tab' taking it over once the tab driving
+    // it is gone.
+    async resume({ conv, host, panel, role, onPending, aborter }) {
+      const t = this._tracker({ conv, host, panel, onPending });
+      if (!t.sid) return;
+      t.how = role === 'drive' ? 'live' : 'watch';
+      t.canTakeOver = role === 'tab';
+      if (role === 'drive') t.lease = AgentsLive.hold(conv.id, t.sid, t.lastMsg);
+      try {
+        t.openTurn();
+        t.view();
+        // What happened since the transcript was read, and the requests it
+        // found waiting.
+        await t.catchUp(t.how);
+        if (!t.settled && !t.answeredHere && !t.waiting.size) {
+          // The events need not show the session settling (a stop pressed
+          // while it waited on a request, say), and with nothing answered
+          // here and nothing waiting there is no reason it would start
+          // again: ask the session itself.
+          const s = await AgentsAPI.getSession(t.sid).catch(() => null);
+          if (s && (s.status === 'idle' || s.status === 'terminated')) t.settled = true;
+        }
+        if (!t.settled) await t.follow({ aborter });
+        t.close();
+      } finally {
+        if (t.lease) t.lease.release();
+      }
     }
   };
 
@@ -6613,7 +6894,9 @@ textarea { resize: none; }
   // is the very same one `Store.domains` hands back.
   //
   // Scope note: this survives the panel, not the page. A reload or navigation
-  // still tears the run down — a userscript has nowhere else to run.
+  // still tears the run down — a userscript has nowhere else to run. An
+  // Agents run is the exception: its session goes on server-side, and the
+  // next page that opens the conversation follows it again (see AgentsLive).
   const Runs = {
     _map: new Map(),      // convId -> { aborter, host }
     _subs: new Set(),
@@ -6633,6 +6916,150 @@ textarea { resize: none; }
     stopAll() { for (const id of [...this._map.keys()]) this.stop(id); },
     subscribe(fn) { this._subs.add(fn); return () => this._subs.delete(fn); },
     _notify() { for (const fn of this._subs) { try { fn(); } catch {} } }
+  };
+
+  // =========================================================================
+  // 12.7b Agents run leases (which page drives a session)
+  // =========================================================================
+  //
+  // An Agents session keeps running on Anthropic's side when the page that
+  // drove it goes away (reload, navigation, a discarded tab), but nothing
+  // answers its tool calls any more: it waits until a page takes the run up
+  // again (AgentsMode.resume, when the conversation is opened). For that
+  // page to tell "a run of this device was cut off" from "another tab or
+  // device is driving it", a page driving a run keeps a lease in KV storage
+  // — one key per conversation, shared by the device's tabs and not part of
+  // the Drive backup — and removes it when the run ends. Whether the tab
+  // holding a lease is still alive is asked over a BroadcastChannel: a live
+  // tab answers at once, a reloaded or discarded one cannot.
+  const AgentsLive = {
+    TAB: uid(),
+    // How long a ping waits for the tab holding a lease to answer.
+    PING_MS: 500,
+    _held: new Map(), // convId -> the lease record this page holds
+    _ops: new Map(),  // convId -> tail of this page's storage ops for it
+    _ch: undefined,
+    key(convId) { return `agentsLive:${convId}`; },
+
+    // Runs this page's storage operations for one conversation in order, so
+    // a lease released at the end of one run can't delete the one the next
+    // run (sent right after) has just written. Resolves to fn's result.
+    _op(convId, fn) {
+      const next = (this._ops.get(convId) || Promise.resolve()).then(() => fn()).catch(() => undefined);
+      this._ops.set(convId, next);
+      return next;
+    },
+    _read(convId) {
+      return this._op(convId, () => KV.get(this.key(convId), null))
+        .then((l) => (l && typeof l === 'object' ? l : null));
+    },
+
+    // The channel the tabs of one origin share (null without
+    // BroadcastChannel, e.g. iOS before 15.4: a lease left behind then
+    // always reads as abandoned). Tabs on the same host under another
+    // scheme or port do not hear each other — an edge case that costs a
+    // second page driving the run.
+    channel() {
+      if (this._ch !== undefined) return this._ch;
+      this._ch = null;
+      try {
+        if (typeof BroadcastChannel !== 'function') return null;
+        const ch = new BroadcastChannel('aicx-agents-live');
+        ch.addEventListener('message', (e) => {
+          const d = e && e.data;
+          if (d && d.type === 'ping' && d.from !== this.TAB && this._held.has(d.conv)) {
+            try { ch.postMessage({ type: 'pong', nonce: d.nonce }); } catch {}
+          }
+        });
+        this._ch = ch;
+      } catch { /* unavailable */ }
+      return this._ch;
+    },
+
+    // Whether another tab of this device holds `convId`'s lease right now.
+    alive(convId) {
+      const ch = this.channel();
+      if (!ch) return Promise.resolve(false);
+      return new Promise((resolve) => {
+        const nonce = uid();
+        let timer = null;
+        const onMsg = (e) => {
+          const d = e && e.data;
+          if (d && d.type === 'pong' && d.nonce === nonce) done(true);
+        };
+        const done = (v) => {
+          clearTimeout(timer);
+          ch.removeEventListener('message', onMsg);
+          resolve(v);
+        };
+        timer = setTimeout(() => done(false), this.PING_MS);
+        ch.addEventListener('message', onMsg);
+        try { ch.postMessage({ type: 'ping', conv: convId, nonce, from: this.TAB }); } catch { done(false); }
+      });
+    },
+
+    // Marks this page as driving `convId`'s session. `msg` is the
+    // user.message of the turn being run, when known; the lease records it
+    // later through msg(id). owns() tells whether the stored lease is still
+    // this one (another page may have taken the run over); release() ends
+    // it, leaving another page's lease alone.
+    hold(convId, sid, msg) {
+      this.channel();
+      const key = this.key(convId);
+      const rec = { id: uid(), tab: this.TAB, sid, msg: msg || null, at: now() };
+      this._held.set(convId, rec);
+      const write = () => this._op(convId, () => KV.set(key, Object.assign({}, rec)));
+      write();
+      return {
+        msg: (id) => {
+          if (!id || this._held.get(convId) !== rec) return;
+          rec.msg = id;
+          write();
+        },
+        owns: async () => {
+          const l = await this._read(convId);
+          return !!(l && l.id === rec.id);
+        },
+        release: () => {
+          if (this._held.get(convId) !== rec) return;
+          this._held.delete(convId);
+          this._op(convId, async () => {
+            const l = await KV.get(key, null);
+            if (l && l.id === rec.id) await KV.del(key);
+          });
+        }
+      };
+    },
+
+    // How a page that finds `convId`'s session at work on the turn
+    // `lastMsg` (its latest user.message) should treat the run:
+    //   'drive' a page of this device drove it and is gone: take it over;
+    //   'tab'   another tab of this device drives it: watch, and take over
+    //           if that tab goes away;
+    //   'watch' no lease here (another device drives it), or a newer turn
+    //           was sent from elsewhere: only watch.
+    async role(convId, lastMsg) {
+      if (this._held.has(convId)) return 'tab';
+      const l = await this._read(convId);
+      if (!l) return 'watch';
+      if (l.msg && lastMsg && l.msg !== lastMsg) return 'watch';
+      return (await this.alive(convId)) ? 'tab' : 'drive';
+    },
+
+    // Removes a lease nobody holds any more (its run was cut off and the
+    // session has since settled).
+    async sweep(convId) {
+      if (this._held.has(convId)) return;
+      const l = await this._read(convId);
+      if (!l || await this.alive(convId)) return;
+      this._op(convId, () => KV.del(this.key(convId)));
+    },
+
+    // Forgets a deleted conversation's lease.
+    drop(convId) {
+      if (this._held.has(convId)) return;
+      this._op(convId, () => KV.del(this.key(convId)));
+    }
   };
 
   // =========================================================================
@@ -7379,18 +7806,82 @@ textarea { resize: none; }
 
     // Fetches a remote conversation's transcript and shows it. While it
     // loads (or after it failed) render() shows a placeholder and send()
-    // refuses, since the session may be waiting on a request.
+    // refuses, since the session may be waiting on a request. A session
+    // still at work is then followed live (resumeIfActive).
     async loadRemote(conv) {
       this._loading = conv.id;
       this._loadError = null;
       if (this.conv === conv) { this.render(); this.paintBusy(); }
+      let loaded = false;
       try {
         await AgentsMode.loadTranscript(conv);
+        loaded = true;
       } catch (e) {
         if (this._loading === conv.id) this._loadError = { id: conv.id, message: (e && e.message) || String(e) };
       }
       if (this._loading === conv.id) this._loading = null;
-      if (this.conv === conv && this.panel) { this.render(); this.paintBusy(); }
+      if (this.conv === conv && this.panel) {
+        this.render();
+        this.paintBusy();
+        if (loaded) this.resumeIfActive(conv);
+      }
+    },
+
+    // Follows an Agents run that is still going when its conversation is
+    // opened: the page that drove it was reloaded or left mid-run, or
+    // another tab / device drives it (see AgentsMode.resume). Registered in
+    // Runs like a send, so the composer shows the stop button (which
+    // interrupts the session), the FAB its busy ring, and closing the panel
+    // leaves it going.
+    async resumeIfActive(conv) {
+      const st = conv.agent || {};
+      if (!st.sessionId || Runs.has(conv.id) || !AgentsAPI.available()) return;
+      if (st.settled !== false) {
+        // Nothing running: a lease a cut-off run left behind is spent.
+        AgentsLive.sweep(conv.id).catch(() => {});
+        return;
+      }
+      const host = this.host;
+      const aborter = new AbortController();
+      const run = { aborter, host };
+      // Registered before anything is awaited, so send() can't start a turn
+      // into the busy session meanwhile.
+      Runs.add(conv.id, run);
+      this.paintBusy();
+      let pending = null;
+      let failed = false;
+      try {
+        const role = await AgentsLive.role(conv.id, st.lastMsg);
+        UI.toast(role === 'drive'
+          ? '中断していたエージェントの処理に再接続しました'
+          : '別のタブまたはデバイスで実行中のため、進捗だけを表示します', 'info');
+        await AgentsMode.resume({ conv, host, panel: this, role, aborter, onPending: (m) => { pending = m; } });
+      } catch (err) {
+        const aborted = err && err.name === 'AbortError';
+        failed = !aborted;
+        for (const m of conv.messages) if (m._pending) m._pending = false;
+        // The message the run was writing to, unless it has been replaced.
+        let target = pending && conv.messages.includes(pending) && pending.role === 'assistant' ? pending : null;
+        if (!target) {
+          target = { id: uid(), role: 'assistant', content: '', createdAt: now() };
+          conv.messages.push(target);
+        }
+        if (failed) target._error = true;
+        target.content = (target.content ? `${target.content}\n\n` : '')
+          + (aborted ? '_(停止しました)_' : `**エラー:** 実行中のセッションに再接続できませんでした: ${esc((err && err.message) || String(err))}`);
+        if (this.conv === conv) this.render();
+      } finally {
+        Runs.remove(conv.id, run);
+        if (this.conv === conv) {
+          this.paintBusy();
+        } else if (!aborter.signal.aborted) {
+          const label = (conv.title || '会話').slice(0, 24);
+          UI.toast(failed ? `「${label}」の生成が失敗しました` : `「${label}」の生成が完了しました`, failed ? 'error' : 'success');
+        }
+        Store.upsertConversation(host, conv);
+        await Store.saveDomains();
+        ScheduleBackup.mark();
+      }
     },
 
     bindResize(handle, sheet) {
