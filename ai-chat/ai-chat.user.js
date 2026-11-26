@@ -2,7 +2,7 @@
 // @name         AI Chat Overlay
 // @name:ja      AI チャット オーバーレイ
 // @namespace    https://github.com/ym/userscripts/ai-chat
-// @version      2.9.0
+// @version      2.10.0
 // @description  Floating AI chat (Gemini / Claude) with page context, per-domain history, templates, Google Drive backup, and an agentic UserScript authoring mode with secret-Gist publishing. Claude chats can optionally run on the Agents API, keeping transcripts server-side and shared across devices. Optimized for iOS Safari.
 // @description:ja Webページの内容を文脈として Gemini / Claude と対話できるオーバーレイ AI チャット。ページを解析して Tampermonkey 向け UserScript を作る「UserScript 作成モード」搭載。作ったスクリプトはシークレット Gist に公開して URL からインストール・自動更新できる。Claude のチャットは Agents API でも実行でき、その場合は会話をサーバー側に保存して他のデバイスからも開ける。ドメインごとの履歴・テンプレート・Google Drive バックアップ対応。iOS Safari 最適化。
 // @author       ym
@@ -83,6 +83,26 @@
         if (typeof GM_deleteValue === 'function') return GM_deleteValue(key);
       } catch {}
       try { localStorage.removeItem(KV_PREFIX + key); } catch {}
+    },
+    // Stored keys starting with `prefix`, from the same backend get/set use:
+    // the GM store when there is one, else this origin's `aicx:` entries in
+    // localStorage.
+    async keys(prefix = '') {
+      let list = [];
+      if (hasGM || hasGMlegacy) {
+        try {
+          if (hasGM && typeof GM.listValues === 'function') list = await GM.listValues();
+          else if (typeof GM_listValues === 'function') list = GM_listValues();
+        } catch { list = []; }
+      } else {
+        try {
+          for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            if (k && k.startsWith(KV_PREFIX)) list.push(k.slice(KV_PREFIX.length));
+          }
+        } catch {}
+      }
+      return (list || []).filter((k) => typeof k === 'string' && k.startsWith(prefix));
     }
   };
 
@@ -378,12 +398,46 @@
     agentsChatAgentHash: ''
   };
 
+  // Storage layout. Each part is its own KV key, so a page reads only what
+  // it uses:
+  //   settings        Store.settings — the only key read at startup
+  //   domain:<host>   one domain's prompt override, templates and history
+  //                   (Store.recordOf); read on the first FAB click on that
+  //                   host, or all at once by Store.loadAllDomains
+  //   att:<id>        one chat attachment's body { name, mimeType, dataUrl,
+  //                   savedAt }; read when its conversation is opened
+  //   historySweepAt  when the retention sweep last ran
+  // Up to v2.9 every domain lived in a single `domains` key with attachment
+  // bodies inline, so every page of every site read the whole history at
+  // startup. Store.migrateLegacyDomains splits that key up.
+  const DOMAIN_KEY_PREFIX = 'domain:';
+  const ATT_KEY_PREFIX = 'att:';
+  const SWEEP_AT_KEY = 'historySweepAt';
+  const SWEEP_INTERVAL_MS = 24 * 3600_000;
+  // An attachment body nothing references is deleted by the sweep only once
+  // it is this old: another tab writes a body just before the record that
+  // references it.
+  const ORPHAN_ATT_GRACE_MS = 3600_000;
+
   const Store = {
     settings: { ...DEFAULT_SETTINGS },
-    domains: {}, // { [host]: { systemPrompt?, templates: [], conversations: [] } }
+    // The domains this page has loaded: { [host]: { systemPrompt?,
+    // pageExtractMode?, templates: [], conversations: [] } }. A page loads
+    // its own host when the FAB is first clicked (ensureDomain) and the rest
+    // only when something needs all of them (loadAllDomains), so this is not
+    // the full set — read it only after one of those has resolved.
+    domains: {},
+    // host -> the JSON of what `domain:<host>` holds as far as this page knows
+    // ('' = no key). Marks a host as loaded, and lets saveDomains write only
+    // the domains that changed.
+    _stored: new Map(),
+    // host -> ids of the attachments that stored record references.
+    _storedAtts: new Map(),
+    _domainLoads: new Map(), // host -> in-flight ensureDomain
+    _attLoads: new Map(),    // conversation id -> in-flight hydrateAttachments
+    _saving: Promise.resolve(),
     async load() {
       this.settings = Object.assign({}, DEFAULT_SETTINGS, await KV.get('settings', {}));
-      this.domains = await KV.get('domains', {});
       // Seed addedModels for users upgrading from a single-model layout so
       // their previously-selected model survives in the chat picker.
       if (!Array.isArray(this.settings.addedModels)) this.settings.addedModels = [];
@@ -391,6 +445,35 @@
         this.settings.addedModels.push({ id: this.settings.model, display: this.settings.model });
       }
       if (this.migrateSettings()) await this.saveSettings();
+      try { await this.migrateLegacyDomains(); } catch (e) { console.warn('[aicx] history migration failed:', e); }
+    },
+    // Splits the pre-v2.10 `domains` key into `domain:<host>` records and
+    // `att:<id>` bodies, then deletes it. Runs at startup so the big key stops
+    // being read on every page at once; after that it is one read of a
+    // missing key. A tab still running an older version may write `domains`
+    // again after the split: a host that already has its own record keeps it
+    // and only takes over the conversations it lacks.
+    async migrateLegacyDomains() {
+      const legacy = await KV.get('domains', null);
+      if (!legacy || typeof legacy !== 'object') return;
+      for (const [host, d] of Object.entries(legacy)) {
+        if (!d || typeof d !== 'object' || this.isDomainEmpty(d)) continue;
+        let rec = d;
+        const existing = await KV.get(DOMAIN_KEY_PREFIX + host, null);
+        if (existing && typeof existing === 'object') {
+          const have = new Set((existing.conversations || []).map((c) => c && c.id));
+          const extra = (d.conversations || []).filter((c) => c && !have.has(c.id));
+          if (!extra.length) continue;
+          rec = Object.assign({}, existing, {
+            conversations: (existing.conversations || []).concat(extra)
+              .sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0))
+          });
+        }
+        const { record, bodies } = this.recordOf(rec);
+        for (const a of bodies) await this._writeAtt(a);
+        await KV.set(DOMAIN_KEY_PREFIX + host, record);
+      }
+      await KV.del('domains');
     },
     // Up to v2.5 one `claudeEffort` applied to every Claude model; it now
     // becomes the default effort of the Claude models already added. Also
@@ -408,20 +491,215 @@
       return true;
     },
     async saveSettings() { await KV.set('settings', this.settings); },
-    async saveDomains() { await KV.set('domains', this.serializeDomains()); },
-    // What is written to storage (and to the Drive backup). Remote Agents
-    // conversations (AgentsMode.isRemote) are reduced to a catalog entry:
-    // their transcript lives in the session on Anthropic's side and is
-    // fetched when opened, so local storage does not grow with usage.
-    serializeDomains() {
+
+    // What `domain:<host>` holds for domain `d`, without touching `d`.
+    //   - Remote Agents conversations (AgentsMode.isRemote) are reduced to a
+    //     catalog entry: their transcript lives in the session on Anthropic's
+    //     side and is fetched when opened, so local storage does not grow
+    //     with usage.
+    //   - Attachments keep their metadata only; the body goes to its own
+    //     `att:<id>` key, read back by hydrateAttachments when needed.
+    // Returns the record, the in-memory attachments that carry a body
+    // (`bodies`), and the ids of every attachment the record references.
+    recordOf(d) {
+      const bodies = [];
+      const ids = new Set();
+      const conversations = (d.conversations || []).map((c) => {
+        if (!c) return c;
+        if (AgentsMode.isRemote(c)) return this.catalogOf(c);
+        if (!(c.messages || []).some((m) => m && m.attachments && m.attachments.length)) return c;
+        return Object.assign({}, c, {
+          messages: c.messages.map((m) => {
+            if (!m || !m.attachments || !m.attachments.length) return m;
+            return Object.assign({}, m, {
+              attachments: m.attachments.map((a) => {
+                if (!a) return a;
+                if (!a.id) a.id = uid();
+                // base64 carries 3 bytes per 4 characters.
+                if (a.dataUrl && !a.size) a.size = Math.round((a.dataUrl.length - a.dataUrl.indexOf(',') - 1) * 0.75);
+                ids.add(a.id);
+                if (a.dataUrl) bodies.push(a);
+                const { dataUrl, _missing, ...ref } = a;
+                return ref;
+              })
+            });
+          })
+        });
+      });
+      return { record: Object.assign({}, d, { conversations }), bodies, ids };
+    },
+    _writeAtt(a) {
+      return KV.set(ATT_KEY_PREFIX + a.id, { name: a.name || '', mimeType: a.mimeType || '', dataUrl: a.dataUrl, savedAt: now() });
+    },
+
+    // Loads `host`'s stored record into `domains`, once per page. Every path
+    // that reads or edits a domain awaits this (or loadAllDomains) first.
+    ensureDomain(host) {
+      host = host || getDomain();
+      if (this._stored.has(host)) return Promise.resolve();
+      let p = this._domainLoads.get(host);
+      if (p) return p;
+      p = (async () => {
+        const rec = await KV.get(DOMAIN_KEY_PREFIX + host, null);
+        if (this._stored.has(host)) return; // set by replaceDomains meanwhile
+        const stored = rec && typeof rec === 'object' ? rec : null;
+        const cur = this.domains[host];
+        if (cur && stored) {
+          // Something created the domain before the load finished. Keep that
+          // object (a caller may hold it) and add what was stored, then let
+          // the next save write the union.
+          console.warn('[aicx] domain used before it was loaded:', host);
+          const have = new Set((cur.conversations || []).map((c) => c && c.id));
+          for (const [k, v] of Object.entries(stored)) {
+            if (k === 'conversations') continue;
+            const mine = cur[k];
+            if (mine === undefined || mine === '' || (Array.isArray(mine) && !mine.length)) cur[k] = v;
+          }
+          cur.conversations = (cur.conversations || []).concat((stored.conversations || []).filter((c) => c && !have.has(c.id)));
+          this._stored.set(host, '');
+        } else {
+          if (stored) this.domains[host] = stored;
+          this._stored.set(host, stored ? JSON.stringify(stored) : '');
+        }
+        this._storedAtts.set(host, stored ? this.recordOf(stored).ids : new Set());
+      })().finally(() => this._domainLoads.delete(host));
+      this._domainLoads.set(host, p);
+      return p;
+    },
+    // Loads every stored domain: the settings panel, the Drive backup and the
+    // retention sweep work across all of them. Hosts already loaded are kept
+    // as they are — a conversation being generated into must stay the same
+    // object.
+    async loadAllDomains() {
+      const keys = await KV.keys(DOMAIN_KEY_PREFIX);
+      await Promise.all(keys.map((k) => this.ensureDomain(k.slice(DOMAIN_KEY_PREFIX.length))));
+    },
+
+    // Writes every loaded domain whose record changed, and deletes the keys
+    // of domains that were removed or emptied. Bodies of new attachments are
+    // written before the record that references them; bodies the record no
+    // longer references are deleted after it. A host this page never loaded
+    // is never written, so a stray in-memory domain can't overwrite stored
+    // history. Saves run one after another so two quick ones can't
+    // interleave their writes.
+    saveDomains() {
+      const run = this._saving.then(() => this._saveDomainsNow());
+      this._saving = run.catch(() => {});
+      return run;
+    },
+    async _saveDomainsNow() {
+      for (const host of new Set([...Object.keys(this.domains), ...this._stored.keys()])) {
+        if (!this._stored.has(host)) {
+          console.warn('[aicx] not saving a domain that was never loaded:', host);
+          continue;
+        }
+        const d = this.domains[host];
+        const prevIds = this._storedAtts.get(host) || new Set();
+        let json = '';
+        let ids = new Set();
+        if (d && !this.isDomainEmpty(d)) {
+          const r = this.recordOf(d);
+          json = JSON.stringify(r.record);
+          ids = r.ids;
+          if (json === this._stored.get(host)) continue;
+          for (const a of r.bodies) if (!prevIds.has(a.id)) await this._writeAtt(a);
+          await KV.set(DOMAIN_KEY_PREFIX + host, r.record);
+        } else {
+          if (!this._stored.get(host)) continue;
+          await KV.del(DOMAIN_KEY_PREFIX + host);
+        }
+        this._stored.set(host, json);
+        this._storedAtts.set(host, ids);
+        for (const id of prevIds) if (!ids.has(id)) await KV.del(ATT_KEY_PREFIX + id);
+      }
+    },
+
+    // Puts the bodies of a conversation's attachments back into memory
+    // (`a.dataUrl`) for display and for re-sending the history to the model.
+    // A body that can't be found is marked `_missing` so it isn't looked up
+    // again; the API builders skip an attachment without a body.
+    // Returns null when every body is already in memory.
+    hydrateAttachments(conv) {
+      if (!conv) return null;
+      const need = [];
+      for (const m of conv.messages || []) {
+        for (const a of (m && m.attachments) || []) if (a && a.id && !a.dataUrl && !a._missing) need.push(a);
+      }
+      if (!need.length) return null;
+      let p = this._attLoads.get(conv.id);
+      if (p) return p;
+      p = Promise.all(need.map(async (a) => {
+        const body = await KV.get(ATT_KEY_PREFIX + a.id, null);
+        if (body && body.dataUrl) a.dataUrl = body.dataUrl;
+        else a._missing = true;
+      })).finally(() => this._attLoads.delete(conv.id));
+      this._attLoads.set(conv.id, p);
+      return p;
+    },
+
+    // Every domain in the shape the Drive backup has always used: one object
+    // with attachment bodies inline, so a backup restores into any version.
+    async exportDomains() {
+      await this.loadAllDomains();
       const out = {};
       for (const [host, d] of Object.entries(this.domains)) {
-        if (!d) continue;
-        out[host] = Object.assign({}, d, {
-          conversations: (d.conversations || []).map((c) => (AgentsMode.isRemote(c) ? this.catalogOf(c) : c))
-        });
+        if (!d || this.isDomainEmpty(d)) continue;
+        const { record, bodies } = this.recordOf(d);
+        const inMemory = new Map(bodies.map((a) => [a.id, a.dataUrl]));
+        // recordOf copied every message that has attachments, so rewriting
+        // them here leaves the live conversations untouched.
+        for (const c of record.conversations) {
+          for (const m of (c && c.messages) || []) {
+            if (!m || !m.attachments || !m.attachments.length) continue;
+            m.attachments = await Promise.all(m.attachments.map(async (ref) => {
+              if (!ref) return ref;
+              const dataUrl = inMemory.get(ref.id) || ((await KV.get(ATT_KEY_PREFIX + ref.id, null)) || {}).dataUrl;
+              return dataUrl ? Object.assign({}, ref, { dataUrl }) : ref;
+            }));
+          }
+        }
+        out[host] = record;
       }
       return out;
+    },
+    // Replaces every domain with `domains` (a Drive restore, in the shape
+    // exportDomains writes) and saves; inline bodies are split out as on any
+    // save.
+    async replaceDomains(domains) {
+      await this.loadAllDomains();
+      const next = (domains && typeof domains === 'object') ? domains : {};
+      for (const host of Object.keys(this.domains)) if (!(host in next)) delete this.domains[host];
+      for (const [host, d] of Object.entries(next)) {
+        if (!d || typeof d !== 'object') continue;
+        if (!Array.isArray(d.conversations)) d.conversations = [];
+        if (!Array.isArray(d.templates)) d.templates = [];
+        this.domains[host] = d;
+        if (!this._stored.has(host)) {
+          this._stored.set(host, '');
+          this._storedAtts.set(host, new Set());
+        }
+      }
+      await this.saveDomains();
+    },
+
+    // Deletes attachment bodies no stored or loaded conversation references
+    // — left behind when two tabs of the same site overwrote each other's
+    // copy of its history. Bodies younger than ORPHAN_ATT_GRACE_MS are
+    // spared: another tab may be about to write the record that uses them.
+    // Expects loadAllDomains to have run.
+    async pruneOrphanAttachments() {
+      const used = new Set();
+      for (const ids of this._storedAtts.values()) for (const id of ids) used.add(id);
+      for (const d of Object.values(this.domains)) if (d) for (const id of this.recordOf(d).ids) used.add(id);
+      let removed = 0;
+      for (const key of await KV.keys(ATT_KEY_PREFIX)) {
+        if (used.has(key.slice(ATT_KEY_PREFIX.length))) continue;
+        const body = await KV.get(key, null);
+        if (body && Number(body.savedAt) > now() - ORPHAN_ATT_GRACE_MS) continue;
+        await KV.del(key);
+        removed++;
+      }
+      return removed;
     },
     catalogOf(c) {
       const a = c.agent || {};
@@ -436,7 +714,8 @@
         }
       };
     },
-    async saveAll() { await this.saveSettings(); await this.saveDomains(); },
+    // The in-memory domain for `host`, created empty if absent. Call it only
+    // after ensureDomain(host) (or loadAllDomains) has resolved.
     getDomain(host) {
       host = host || getDomain();
       if (!this.domains[host]) {
@@ -497,11 +776,13 @@
     // Reopening a months-old chat and continuing it would otherwise delete the
     // very conversation the user is typing into.
     //
-    // Returns the number removed; the caller decides whether to persist and
-    // whether to tell the user.
-    sweepOldConversations(keepIds) {
+    // Loads every domain first (the sweep spans all of them). Returns the
+    // number removed; the caller decides whether to persist and whether to
+    // tell the user.
+    async sweepOldConversations(keepIds) {
       const days = this.retentionDays();
       if (!(days > 0)) return 0;
+      await this.loadAllDomains();
       const cutoff = now() - days * 86400_000;
       const keep = keepIds instanceof Set ? keepIds : new Set(keepIds || []);
       let removed = 0;
@@ -2063,7 +2344,7 @@
         version: 1,
         exportedAt: now(),
         settings: { ...Store.settings, driveToken: '', driveTokenExp: 0, driveFileId: '' },
-        domains: Store.serializeDomains()
+        domains: await Store.exportDomains()
       };
       await this._fetch(`https://www.googleapis.com/upload/drive/v3/files/${id}?uploadType=media`, {
         method: 'PATCH',
@@ -2085,8 +2366,8 @@
       Store.settings = Object.assign({}, DEFAULT_SETTINGS, data.settings, { driveToken, driveTokenExp, driveFileId });
       if (!Array.isArray(Store.settings.addedModels)) Store.settings.addedModels = [];
       Store.migrateSettings();
-      Store.domains = data.domains || {};
-      await Store.saveAll();
+      await Store.saveSettings();
+      await Store.replaceDomains(data.domains || {});
     }
   };
 
@@ -3404,8 +3685,13 @@ textarea { resize: none; }
       try { LazyLibs.load(); } catch {}
       // Defer the precompiled Tailwind stylesheet to the first click too —
       // start it before the await so it runs in parallel with primeRawDoc.
+      // This host's history is read here as well, not at startup: the menu
+      // lists its recent chats, and every panel opens from the menu.
+      const loading = Store.ensureDomain(getDomain()).catch((e) => console.warn('[aicx] history load failed:', e));
       await UI.ensureTailwindLoaded();
-      this.openMenu();
+      await loading;
+      // A second click while the first was still loading opened it already.
+      if (!this.menuEl) this.openMenu();
     },
     closeMenu() {
       if (!this.menuEl) return;
@@ -7226,6 +7512,11 @@ textarea { resize: none; }
       // the feature back on after turning it off — handled below).
       this._lastInjectedUrl = null;
       this.conv = conv;
+      // Attachment bodies are stored apart from the history (Store.recordOf):
+      // fetch this conversation's and repaint once they are in. Until then
+      // they show as file chips.
+      const hydrating = Store.hydrateAttachments(conv);
+      if (hydrating) hydrating.then(() => { if (this.conv === conv && this.els) this.render(); });
       // Effort picked in this panel before its chat exists (undefined = the
       // model's default); moved to conv.effort on the first send.
       this.effortOverride = undefined;
@@ -8226,10 +8517,12 @@ textarea { resize: none; }
       if (m.attachments && m.attachments.length) {
         atts = el('div', { class: `flex flex-wrap gap-2 ${isUser ? 'justify-end' : ''} mb-1` });
         for (const a of m.attachments) {
-          if (a.mimeType && a.mimeType.startsWith('image/')) {
+          // An image whose body is still loading, or could not be found
+          // (Store.hydrateAttachments), falls back to the file chip.
+          if (a.mimeType && a.mimeType.startsWith('image/') && a.dataUrl) {
             atts.appendChild(el('img', { src: a.dataUrl, class: 'max-w-[160px] max-h-[160px] rounded-lg object-cover' }));
           } else {
-            atts.appendChild(el('div', { class: 'text-xs opacity-80 flex items-center gap-1' }, [icon('attach', 'w-3 h-3'), a.name]));
+            atts.appendChild(el('div', { class: 'text-xs opacity-80 flex items-center gap-1' }, [icon('attach', 'w-3 h-3'), a._missing ? `${a.name} (データなし)` : a.name]));
           }
         }
       }
@@ -8345,22 +8638,30 @@ textarea { resize: none; }
       return b;
     },
 
-    // Runs the retention sweep at most once per page load. Deleting history is
-    // not something to do silently, so a non-zero result is surfaced as a
-    // toast; persistence is fire-and-forget because send()'s own save follows
-    // moments later anyway.
-    _sweepHistoryOnce() {
+    // Runs the retention sweep at most once per page load, and at most once
+    // per SWEEP_INTERVAL_MS across all pages: the sweep reads every domain's
+    // history, which is exactly the cost the per-domain storage avoids on an
+    // ordinary send. Not awaited by send(). Deleting history is not
+    // something to do silently, so a non-zero result is surfaced as a toast.
+    // Attachment bodies left behind by tabs overwriting each other are
+    // cleaned up on the same schedule.
+    async _sweepHistoryOnce() {
       if (this._sweptThisSession) return;
       this._sweptThisSession = true;
       try {
+        const last = Number(await KV.get(SWEEP_AT_KEY, 0)) || 0;
+        if (now() - last < SWEEP_INTERVAL_MS) return;
+        await KV.set(SWEEP_AT_KEY, now());
         const keep = new Set();
         if (this.conv) keep.add(this.conv.id);
         for (const id of Runs.keys()) keep.add(id);
-        const removed = Store.sweepOldConversations(keep);
+        const removed = await Store.sweepOldConversations(keep);
         if (removed > 0) {
-          Store.saveDomains().catch(() => {});
+          await Store.saveDomains();
           UI.toast(`${Store.retentionDays()} 日以上前の会話 ${removed} 件を削除しました`, 'info');
         }
+        await Store.loadAllDomains();
+        await Store.pruneOrphanAttachments();
       } catch (e) {
         console.warn('[aicx] history sweep failed:', e);
       }
@@ -8430,7 +8731,7 @@ textarea { resize: none; }
         if (useAgents) {
           // The engine and the model / effort the session will be created
           // with are fixed from here on. `remote`: only a catalog entry is
-          // stored locally (see Store.serializeDomains).
+          // stored locally (see Store.recordOf).
           this.conv.engine = 'agents';
           this.conv.remote = true;
           const kind = AgentsMode.kindOf(null, this.mode);
@@ -8504,7 +8805,7 @@ textarea { resize: none; }
       const selectedText = Selection.get();
       const userMsg = {
         id: uid(), role: 'user', content: text, createdAt: now(),
-        attachments: atts.length ? atts.map(({ id, name, mimeType, dataUrl }) => ({ id, name, mimeType, dataUrl })) : undefined,
+        attachments: atts.length ? atts.map(({ id, name, mimeType, size, dataUrl }) => ({ id, name, mimeType, size, dataUrl })) : undefined,
         selection: selectedText || undefined
       };
       Selection.clear();
@@ -8595,6 +8896,10 @@ textarea { resize: none; }
         // setting mid-run can't move the goalposts under an in-flight loop.
         const maxRounds = UserScriptMode.maxToolRounds();
         let rounds = 0;
+        // Earlier turns' attachments are sent again with the history; their
+        // bodies are stored apart from it (Store.recordOf), so make sure they
+        // are back in memory. Usually done already by ChatPanel.open.
+        await Store.hydrateAttachments(conv);
         while (true) {
           const apiMessages = this._buildApiMessages(conv, pending);
           let acc = '';
@@ -9093,7 +9398,10 @@ textarea { resize: none; }
       { id: 'backup',  label: 'バックアップ' }
     ],
 
-    open() {
+    async open() {
+      // The domain list and the history totals span every domain, which a
+      // page otherwise never loads.
+      try { await Store.loadAllDomains(); } catch (e) { console.warn('[aicx] history load failed:', e); }
       this.close();
 
       const tabBar = el('div', { class: 'flex border-b border-zinc-200 dark:border-zinc-800 shrink-0 overflow-x-auto' });
@@ -9977,7 +10285,7 @@ textarea { resize: none; }
     sectionHistory() {
       const box = el('section', { class: 'space-y-2' });
       box.append(Form.sectionTitle('会話履歴の保持期間'));
-      box.append(el('p', { class: 'text-xs text-zinc-500' }, 'チャットの初回送信時に、最終更新がこの日数より古い会話を自動削除して、Tampermonkey のストレージを節約します。UserScript 作成モードの会話はページの HTML やスクリプト本文を含むため特に容量を使います。'));
+      box.append(el('p', { class: 'text-xs text-zinc-500' }, 'チャットの送信時 (1 日 1 回まで) に、最終更新がこの日数より古い会話を自動削除して、Tampermonkey のストレージを節約します。UserScript 作成モードの会話はページの HTML やスクリプト本文を含むため特に容量を使います。'));
 
       const wrap = el('div');
       const daysInput = Form.input(Store.retentionDays(), (v) => {
@@ -10001,12 +10309,30 @@ textarea { resize: none; }
       // Storage footprint, so the retention number is an informed choice
       // rather than a guess.
       const stat = el('p', { class: 'text-[11px] text-zinc-500' });
+      // History records and attachment bodies are stored apart (see
+      // Store.recordOf), so they are reported apart; an attachment's stored
+      // size is its base64 text, a third larger than the file.
       const paintStat = () => {
-        let convs = 0;
-        for (const d of Object.values(Store.domains)) convs += (d.conversations || []).length;
-        let kb = '?';
-        try { kb = (new Blob([JSON.stringify(Store.domains)]).size / 1024).toFixed(0); } catch {}
-        stat.textContent = `現在: ${Object.keys(Store.domains).length} ドメイン / ${convs} 会話 / 約 ${kb} KB`;
+        let hosts = 0, convs = 0, recBytes = 0, atts = 0, attBytes = 0;
+        for (const d of Object.values(Store.domains)) {
+          if (!d || Store.isDomainEmpty(d)) continue;
+          hosts++;
+          convs += (d.conversations || []).length;
+          try { recBytes += new Blob([JSON.stringify(Store.recordOf(d).record)]).size; } catch {}
+          for (const c of d.conversations || []) {
+            if (!c || AgentsMode.isRemote(c)) continue;
+            for (const m of c.messages || []) {
+              for (const a of (m && m.attachments) || []) {
+                if (!a) continue;
+                atts++;
+                attBytes += (Number(a.size) || 0) * 4 / 3;
+              }
+            }
+          }
+        }
+        const kb = (n) => Math.round(n / 1024).toLocaleString();
+        stat.textContent = `現在: ${hosts} ドメイン / ${convs} 会話 / 履歴 約 ${kb(recBytes)} KB`
+          + (atts ? ` + 添付ファイル ${atts} 件 約 ${kb(attBytes)} KB` : '');
       };
       paintStat();
       box.append(stat);
@@ -10018,7 +10344,7 @@ textarea { resize: none; }
         const keep = new Set(Runs.keys());
         if (ChatPanel.conv) keep.add(ChatPanel.conv.id);
         if (!await UI.confirm(`${d} 日以上更新されていない会話を削除します。続行しますか?`)) return;
-        const removed = Store.sweepOldConversations(keep);
+        const removed = await Store.sweepOldConversations(keep);
         await Store.saveDomains();
         paintStat();
         UI.toast(removed ? `${removed} 件削除しました` : '削除対象はありませんでした', removed ? 'success' : 'info');
@@ -10237,6 +10563,9 @@ textarea { resize: none; }
   // 17. Bootstrap
   // =========================================================================
   async function main() {
+    // Reads the settings only. Conversation history is read when the FAB is
+    // first clicked (Store.ensureDomain), so its size no longer adds to the
+    // load of every page on every site.
     await Store.load();
     // If coming back from OAuth, consume hash
     Drive.consumeOAuthHash();
